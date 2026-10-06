@@ -138,6 +138,8 @@ static NSDictionary *frame(NSDictionary *r) {
             (u[@"clip"]!=NSNull.null&&!rect(u[@"clip"],&c)))return error(@"Invalid window, frame, clip, or duplicate ID");
         double pid=0;
         if(u[@"pid"]&&!identifier(u[@"pid"],INT_MAX,&pid))return error(@"Invalid expected owner PID");
+        CGRect viewport;
+        if(u[@"viewport"]&&!rect(u[@"viewport"],&viewport))return error(@"Invalid interactive viewport");
         [ids addObject:@((uint32_t)v)];
     }
     NSMutableSet *allIDs=[ids mutableCopy];[allIDs unionSet:stickyIDs];
@@ -177,10 +179,21 @@ static NSDictionary *frame(NSDictionary *r) {
             w=[RibbonSavedWindowV3 new];w.wid=wid;w.bounds=b;w.transform=t;w.clip=clip;w.pid=pid;saved[@(wid)]=w;
         }
         CGRect local=CGRectZero;
-        if(u[@"clip"]!=NSNull.null) {rect(u[@"clip"],&c);local=CGRectMake(c.origin.x-f.origin.x,c.origin.y-f.origin.y,c.size.width,c.size.height);}
+        BOOL interactive=u[@"viewport"]!=nil;
+        if(interactive) {
+            // Rust decides when to suspend placement. Read the owner's current
+            // surface; clip it to the leased monitor without moving it back.
+            CGRect bounds,viewport;CGAffineTransform current;
+            if(sky.getBounds(sky.connection(),wid,&bounds)||sky.getTransform(sky.connection(),wid,&current))return error(@"Cannot read interactive surface");
+            if(fabs(current.a-1)>1e-6||fabs(current.b)>1e-6||fabs(current.c)>1e-6||fabs(current.d-1)>1e-6)return error(@"Unsupported interactive transform");
+            rect(u[@"viewport"],&viewport);
+            CGRect shown=CGRectMake(-current.tx,-current.ty,bounds.size.width,bounds.size.height);
+            CGRect visible=CGRectIntersection(shown,viewport);
+            if(!CGRectIsNull(visible)&&!CGRectIsEmpty(visible))local=CGRectMake(visible.origin.x-shown.origin.x,visible.origin.y-shown.origin.y,visible.size.width,visible.size.height);
+        } else if(u[@"clip"]!=NSNull.null) {rect(u[@"clip"],&c);local=CGRectMake(c.origin.x-f.origin.x,c.origin.y-f.origin.y,c.size.width,c.size.height);}
         CFTypeRef region=NULL;CGError er=sky.newRegion(&local,&region);
         CGError ec=er?er:sky.setClip(sky.connection(),wid,region);
-        CGError et=ec?ec:sky.setTransform(sky.connection(),wid,CGAffineTransformMakeTranslation(-f.origin.x,-f.origin.y));
+        CGError et=ec?ec:(interactive?0:sky.setTransform(sky.connection(),wid,CGAffineTransformMakeTranslation(-f.origin.x,-f.origin.y)));
         if(region)sky.releaseRegion(region);
         if(ec||et) {
             if(ownerPID(wid)!=pid){forgetWindow(wid);continue;}
@@ -196,7 +209,7 @@ static NSDictionary *frame(NSDictionary *r) {
 }
 static NSDictionary *handle(id r) {
     if(![r isKindOfClass:NSDictionary.class])return error(@"Expected JSON object");
-    if([r[@"op"] isEqual:@"hello"])return @{@"ok":@YES,@"version":@2,@"capabilities":hasStickyAPI?@[@"sticky"]:@[],@"build":buildName?:@"",@"pid":@(getpid()),@"uid":@(getuid()),@"controlled":@(controlledCount())};
+    if([r[@"op"] isEqual:@"hello"])return @{@"ok":@YES,@"version":@2,@"capabilities":hasStickyAPI?@[@"sticky",@"interactive_clip"]:@[@"interactive_clip"],@"build":buildName?:@"",@"pid":@(getpid()),@"uid":@(getuid()),@"controlled":@(controlledCount())};
     NSString *session=r[@"session"];
     if(![session isKindOfClass:NSString.class]||session.length==0||session.length>128)return error(@"Invalid session");
     if(controller&&![controller isEqual:session])return error(@"Another controller holds the lease");

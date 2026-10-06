@@ -65,6 +65,7 @@ pub fn run(user: String, config: PathBuf, exclude_apps: Vec<String>) -> Result<(
         let backend = status.as_ref().is_ok_and(|s| {
             s.version == 2
                 && s.capabilities.iter().any(|c| c == "sticky")
+                && s.capabilities.iter().any(|c| c == "interactive_clip")
                 && expected.as_ref().is_none_or(|build| *build == s.build)
         });
         if accessibility && backend {

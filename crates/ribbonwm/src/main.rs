@@ -53,6 +53,8 @@ enum Command {
     RequestPermissions,
     /// Inspect all WindowServer windows. Titles may be empty without Screen Recording.
     Windows,
+    /// Running regular apps, without querying Accessibility elements.
+    Applications,
     Displays,
     /// Interactive Rust-driven native-window demo. Arrows navigate; Esc exits.
     Demo {
@@ -208,6 +210,7 @@ fn execute(cli: Cli) -> Result<()> {
             }));
         }
         Command::Windows => return print(ribbon_macos::windows()?),
+        Command::Applications => return print(ribbon_macos::applications()?),
         Command::Displays => return print(ribbon_macos::displays()?),
         Command::Demo {
             test,

@@ -31,6 +31,16 @@ static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
 @implementation TestPanel
 - (BOOL)canBecomeKeyWindow {return NO;}
 @end
+@interface GeometryWindow : NSWindow
+@property double refusedWidth;
+@end
+@implementation GeometryWindow
+- (BOOL)canBecomeKeyWindow {return NO;}
+- (void)setFrame:(NSRect)frame display:(BOOL)display {
+    if(self.refusedWidth>0&&fabs(frame.size.width-self.refusedWidth)<2)frame.size.width+=80;
+    [super setFrame:frame display:display];
+}
+@end
 @interface TestView : NSView
 @property BOOL target;
 @property NSString *surface;
@@ -50,21 +60,26 @@ static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
 }
 @end
 @interface Fixture : NSObject <NSApplicationDelegate>
-@property TestPanel *target;
-@property NSMutableArray<TestPanel *> *backdrops;
+@property NSWindow *target;
+@property NSMutableArray<NSWindow *> *backdrops;
 @property NSDictionary *configuration;
 @property SkyLight sky;
 @property NSRunningApplication *previous;
 @end
 @implementation Fixture
 - (void)stop {
-    [self.target close];for(TestPanel *panel in self.backdrops)[panel close];
+    [self.target close];for(NSWindow *panel in self.backdrops)[panel close];
     if(NSApp.active)[self.previous activateWithOptions:0];
     [NSApp stop:nil];[NSApp postEvent:[NSEvent otherEventWithType:NSEventTypeApplicationDefined
         location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:0 context:nil subtype:0 data1:0 data2:0] atStart:NO];
 }
 - (void)command:(NSDictionary *)command {
     NSString *op=command[@"op"];
+    if([op isEqual:@"refuse-width"]&&[self.configuration[@"geometry_test"] boolValue]) {
+        double width=[command[@"width"] doubleValue];
+        if(!isfinite(width)||width<100||width>2000)return;
+        ((GeometryWindow *)self.target).refusedWidth=width;reply(@{@"refusing":@(width)});return;
+    }
     if([op isEqual:@"quit"]) {[self stop];return;}
     if([op isEqual:@"present"]) {self.target.alphaValue=1;self.target.ignoresMouseEvents=NO;reply(@{@"presented":@YES});return;}
     if([op isEqual:@"state"]) {
@@ -78,6 +93,25 @@ static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
         if(!isfinite(x)||!isfinite(y)||fabs(x)>10000||fabs(y)>10000)return;
         CGError error=self.sky.setTransform(self.sky.connection(),(uint32_t)self.target.windowNumber,CGAffineTransformMakeTranslation(-x,-y));
         reply(@{@"transform_error":@(error)});return;
+    }
+    if([op isEqual:@"resize"]&&[self.configuration[@"geometry_test"] boolValue]) {
+        double width=[command[@"width"] doubleValue],height=[command[@"height"] doubleValue];
+        if(!isfinite(width)||!isfinite(height)||width<100||height<100||width>2000||height>1500)return;
+        NSRect frame=self.target.frame;frame.origin.y+=frame.size.height-height;frame.size=NSMakeSize(width,height);
+        [self.target setFrame:frame display:YES];reply(@{@"resized":@YES});return;
+    }
+    if([op isEqual:@"new"]&&[self.configuration[@"geometry_test"] boolValue]) {
+        NSWindow *panel=[[GeometryWindow alloc] initWithContentRect:NSMakeRect(600,200,400,400)
+            styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskResizable
+            backing:NSBackingStoreBuffered defer:NO];
+        panel.title=@"RibbonWM QA created";panel.hidesOnDeactivate=NO;
+        panel.collectionBehavior=NSWindowCollectionBehaviorMoveToActiveSpace;
+        [panel orderFrontRegardless];[self.backdrops addObject:panel];
+        reply(@{@"created":@(panel.windowNumber)});return;
+    }
+    if([op isEqual:@"close-new"]&&[self.configuration[@"geometry_test"] boolValue]) {
+        for(NSWindow *window in self.backdrops)[window close];
+        [self.backdrops removeAllObjects];reply(@{@"closed_new":@YES});return;
     }
     if([op isEqual:@"click"]||[op isEqual:@"move"]) {
         CGPoint p=CGPointMake([command[@"x"] doubleValue],[command[@"y"] doubleValue]);
@@ -109,11 +143,13 @@ static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
     }
     NSDictionary *origin=self.configuration[@"target"]?:@{@"x":@940,@"y":@360};
     NSUInteger style=[self.configuration[@"geometry_test"] boolValue]?
-        NSWindowStyleMaskTitled|NSWindowStyleMaskResizable|NSWindowStyleMaskNonactivatingPanel:
+        NSWindowStyleMaskTitled|NSWindowStyleMaskResizable:
         NSWindowStyleMaskBorderless|NSWindowStyleMaskNonactivatingPanel;
-    self.target=[[TestPanel alloc] initWithContentRect:NSMakeRect([origin[@"x"] doubleValue],height-[origin[@"y"] doubleValue]-400,400,400) styleMask:style backing:NSBackingStoreBuffered defer:NO];
+    Class kind=[self.configuration[@"geometry_test"] boolValue]?GeometryWindow.class:TestPanel.class;
+    self.target=[[kind alloc] initWithContentRect:NSMakeRect([origin[@"x"] doubleValue],height-[origin[@"y"] doubleValue]-400,400,400) styleMask:style backing:NSBackingStoreBuffered defer:NO];
     self.target.title=@"RibbonWM QA geometry";
-    self.target.level=NSFloatingWindowLevel;self.target.hidesOnDeactivate=NO;self.target.hasShadow=[self.configuration[@"shadow"] boolValue];
+    self.target.level=[self.configuration[@"geometry_test"] boolValue]?NSNormalWindowLevel:NSFloatingWindowLevel;
+    self.target.hidesOnDeactivate=NO;self.target.hasShadow=[self.configuration[@"shadow"] boolValue];
     self.target.collectionBehavior=NSWindowCollectionBehaviorMoveToActiveSpace;
     self.target.alphaValue=0;self.target.ignoresMouseEvents=YES;
     TestView *view=[[TestView alloc] initWithFrame:NSMakeRect(0,0,400,400)];view.target=YES;view.surface=@"target";self.target.contentView=view;
@@ -136,22 +172,34 @@ static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
 }
 @end
 int main(int argc,char **argv) {@autoreleasepool {
+    if(argc==4&&!strcmp(argv[1],"--read-geometry")) {
+        uint32_t wid=(uint32_t)strtoul(argv[2],NULL,10);int pid=atoi(argv[3]);
+        NSRunningApplication *app=[NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+        if(!wid||pid<=0||!app||[app.bundleIdentifier hasPrefix:@"com.openai."]||
+            [app.localizedName hasPrefix:@"ChatGPT"]||[app.localizedName hasPrefix:@"Codex"]||
+            [app.bundleIdentifier isEqual:@"com.apple.systempreferences"])return 1;
+        RibbonRect rect={0};int error=ribbon_window_geometry(wid,pid,&rect);
+        reply(@{@"geometry_error":@(error),@"geometry":@{@"x":@(rect.x),@"y":@(rect.y),@"width":@(rect.width),@"height":@(rect.height)}});return error?1:0;
+    }
     if(argc==2&&!strcmp(argv[1],"--viewport-test")) {
         RibbonRect primary=ribbon_display_viewport((RibbonRect){0,0,1512,982},(RibbonRect){0,0,1512,949},(RibbonRect){0,0,1512,982},33);
         RibbonRect upper=ribbon_display_viewport((RibbonRect){-100,982,1600,900},(RibbonRect){-100,982,1600,900},(RibbonRect){-100,-900,1600,900},33);
         RibbonRect lower=ribbon_display_viewport((RibbonRect){700,-1000,1800,1000},(RibbonRect){710,-960,1780,960},(RibbonRect){700,982,1800,1000},33);
         if(primary.y!=33||primary.height!=949||upper.y!=-867||upper.height!=867||
             lower.x!=710||lower.y!=1015||lower.height!=927)return 1;
+        RibbonRect converted=ribbon_outer_to_ax((RibbonRect){24,57,600,909},(RibbonRect){208,81,501,901},(RibbonRect){208,72,501,910});
+        if(converted.x!=24||converted.y!=66||converted.width!=600||converted.height!=900)return 1;
         puts("PASS: menu bar reservation follows each CG display origin, including monitors above primary");return 0;
     }
     // External focus event for QA: only the explicitly named disposable
     // Alacritty window is eligible, never a user's ordinary terminal or Codex.
     if((argc==4&&(strcmp(argv[1],"--focus-fixture")==0||strcmp(argv[1],"--click-fixture")==0||strcmp(argv[1],"--geometry-fixture")==0))||
-       (argc==6&&(strcmp(argv[1],"--resize-fixture")==0||strcmp(argv[1],"--drag-fixture")==0))||
+       (argc==6&&(strcmp(argv[1],"--resize-fixture")==0||strcmp(argv[1],"--drag-fixture")==0||strcmp(argv[1],"--move-drag-fixture")==0))||
        (argc==8&&strcmp(argv[1],"--restore-fixture")==0)) {
         BOOL click=strcmp(argv[1],"--click-fixture")==0;
         BOOL resize=strcmp(argv[1],"--resize-fixture")==0;
-        BOOL drag=strcmp(argv[1],"--drag-fixture")==0;
+        BOOL moveDrag=strcmp(argv[1],"--move-drag-fixture")==0;
+        BOOL drag=strcmp(argv[1],"--drag-fixture")==0||moveDrag;
         BOOL geometry=strcmp(argv[1],"--geometry-fixture")==0;
         BOOL restore=strcmp(argv[1],"--restore-fixture")==0;
         char *end=NULL;unsigned long wid=strtoul(argv[2],&end,10);
@@ -209,18 +257,22 @@ int main(int argc,char **argv) {@autoreleasepool {
                 dx=strtod(argv[4],&end);if(*end||!isfinite(dx)||fabs(dx)>200||strcmp(argv[5],"0")!=0)return 1;
                 if(ribbon_focused_window((int)pid)!=wid||[clip[0] doubleValue]!=0||fabs([clip[2] doubleValue]-[state[@"frame"][@"width"] doubleValue])>1)return 1;
                 point.x=-[t[4] doubleValue]+[clip[2] doubleValue]-1;
+                if(moveDrag)point=CGPointMake(-[t[4] doubleValue]+[clip[2] doubleValue]/2,-[t[5] doubleValue]+10);
             }
             CGEventRef move=CGEventCreateMouseEvent(NULL,kCGEventMouseMoved,point,kCGMouseButtonLeft);
             CGEventRef down=CGEventCreateMouseEvent(NULL,kCGEventLeftMouseDown,point,kCGMouseButtonLeft);
             CGEventRef up=CGEventCreateMouseEvent(NULL,kCGEventLeftMouseUp,point,kCGMouseButtonLeft);
             CGEventPost(kCGHIDEventTap,move);usleep(100000);CGEventPost(kCGHIDEventTap,down);usleep(50000);
             if(drag) {
+                NSMutableArray *samples=[NSMutableArray array];
                 for(unsigned i=1;i<=10;i++) {
                     CGPoint next=CGPointMake(point.x+dx*i/10,point.y);
                     CGEventRef event=CGEventCreateMouseEvent(NULL,kCGEventLeftMouseDragged,next,kCGMouseButtonLeft);
                     CGEventPost(kCGHIDEventTap,event);CFRelease(event);usleep(50000);
+                    if(moveDrag)[samples addObject:windowState(sky,(uint32_t)wid)];
                 }
                 CGEventSetLocation(up,CGPointMake(point.x+dx,point.y));
+                if(moveDrag)reply(@{@"drag_samples":samples});
             }
             CGEventPost(kCGHIDEventTap,up);
             CFRelease(move);CFRelease(down);CFRelease(up);
@@ -299,6 +351,7 @@ int main(int argc,char **argv) {@autoreleasepool {
         configuration=[NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
         if(![configuration isKindOfClass:NSDictionary.class])return 1;
     } else if(argc!=1)return 1;
-    NSApplication *app=NSApplication.sharedApplication;[app setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    NSApplication *app=NSApplication.sharedApplication;
+    [app setActivationPolicy:[configuration[@"regular"] boolValue]?NSApplicationActivationPolicyRegular:NSApplicationActivationPolicyAccessory];
     Fixture *fixture=[Fixture new];fixture.configuration=configuration;app.delegate=fixture;[app run];return 0;
 }}

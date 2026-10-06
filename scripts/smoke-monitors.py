@@ -82,6 +82,7 @@ def main():
         value = event()
         assert value.get("event") == "click" and value["surface"] == surface, value
         assert abs(value["x"]-local_x) < 2 and abs(value["y"]-local_y) < 2, value
+        time.sleep(0.1)  # Wait for the scheduled mouse-up before altering a clip.
 
     def screenshot(name, region):
         path = ROOT / f"docs/monitor-{name}.png"

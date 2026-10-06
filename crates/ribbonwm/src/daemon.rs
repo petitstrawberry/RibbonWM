@@ -89,13 +89,47 @@ fn display_for<'a>(window: &Window, displays: &'a [Display]) -> Option<&'a Displ
         .filter(|d| window.bounds.intersection(d.frame).is_some())
 }
 fn app_excluded(window: &Window, patterns: &[String]) -> bool {
+    identity_excluded(&window.app, &window.bundle_id, patterns)
+}
+fn identity_excluded(app: &str, bundle_id: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|pattern| {
         if let Some(prefix) = pattern.strip_suffix('*') {
-            window.bundle_id.starts_with(prefix) || window.app.starts_with(prefix)
+            bundle_id.starts_with(prefix) || app.starts_with(prefix)
         } else {
-            window.bundle_id == *pattern || window.app == *pattern
+            bundle_id == *pattern || app == *pattern
         }
     })
+}
+fn refresh_observers(
+    source: &ribbon_macos::EventSource,
+    watching: &mut BTreeSet<i32>,
+    options: &Options,
+) -> Result<()> {
+    let eligible: BTreeSet<i32> = if options.all {
+        ribbon_macos::applications()?
+            .into_iter()
+            .filter(|a| !identity_excluded(&a.app, &a.bundle_id, &options.exclude_apps))
+            .map(|a| a.pid)
+            .collect()
+    } else {
+        ribbon_macos::windows()?
+            .into_iter()
+            .filter(|w| {
+                options.selected.contains(&w.id.0) && !app_excluded(w, &options.exclude_apps)
+            })
+            .map(|w| w.pid)
+            .collect()
+    };
+    for pid in watching.difference(&eligible) {
+        source.unwatch(*pid);
+    }
+    watching.retain(|pid| eligible.contains(pid));
+    for pid in eligible.difference(watching).copied().collect::<Vec<_>>() {
+        if source.watch(pid) {
+            watching.insert(pid);
+        }
+    }
+    Ok(())
 }
 fn normal_window_candidate(window: &Window) -> bool {
     // Display utilities may expose 1x1 normal-layer helper surfaces. They
@@ -170,6 +204,7 @@ fn synchronize(
         }
         if let Some((monitor, space)) = engine.window_context(w.id) {
             if let Some(display) = display_for(&w, displays)
+                && (options.dry_run || !ribbon_macos::left_mouse_down())
                 && (monitor != display.id || space != display.native_space)
             {
                 engine.relocate_window(&display.id, w.id)?;
@@ -603,6 +638,11 @@ pub fn run(options: Options) -> Result<()> {
         bail!("Could not resolve current native Space context");
     }
     let mut sizes: BTreeMap<WindowId, (i32, f64, f64)> = BTreeMap::new();
+    let events = (!options.dry_run).then(ribbon_macos::EventSource::default);
+    let mut watching = BTreeSet::new();
+    if let Some(source) = &events {
+        refresh_observers(source, &mut watching, &options)?;
+    }
     synchronize(&mut engine, &mut geometry, &options, &displays, &mut sizes)?;
     for requested in &options.selected {
         if !geometry.originals.contains_key(&WindowId(*requested)) {
@@ -619,6 +659,8 @@ pub fn run(options: Options) -> Result<()> {
     let mut last_inventory = last_tick;
     let mut last_send = last_tick - Duration::from_secs(1);
     let mut last_focus = last_tick;
+    let mut last_watch_refresh = last_tick;
+    let event_trace = std::env::var_os("RIBBONWM_EVENT_TRACE").is_some();
     let mut last_frame = Vec::new();
     let mut committed: Vec<Placement> = Vec::new();
     let mut quit = false;
@@ -658,7 +700,24 @@ pub fn run(options: Options) -> Result<()> {
         if quit {
             break;
         }
-        if start.duration_since(last_inventory) >= Duration::from_millis(500) {
+        let notifications = events.as_ref().map_or(0, ribbon_macos::EventSource::drain);
+        if event_trace && notifications != 0 {
+            eprintln!("Native events: {notifications}");
+        }
+        if (notifications & ribbon_macos::EventSource::APPS != 0
+            || start.duration_since(last_watch_refresh) >= Duration::from_secs(1))
+            && let Some(source) = &events
+        {
+            refresh_observers(source, &mut watching, &options)?;
+            last_watch_refresh = start;
+        }
+        if notifications
+            & (ribbon_macos::EventSource::WINDOWS
+                | ribbon_macos::EventSource::GEOMETRY
+                | ribbon_macos::EventSource::APPS)
+            != 0
+            || start.duration_since(last_inventory) >= Duration::from_millis(100)
+        {
             let next = ribbon_macos::displays()?;
             let signature = |list: &[Display]| {
                 let mut s: Vec<_> = list
@@ -686,7 +745,9 @@ pub fn run(options: Options) -> Result<()> {
             synchronize(&mut engine, &mut geometry, &options, &displays, &mut sizes)?;
             last_inventory = start;
         }
-        if start.duration_since(last_focus) >= Duration::from_millis(100) {
+        if notifications & ribbon_macos::EventSource::FOCUS != 0
+            || start.duration_since(last_focus) >= Duration::from_millis(100)
+        {
             observe_native_focus(&mut engine, &geometry, &options, true);
             last_focus = start;
         }
@@ -714,6 +775,25 @@ pub fn run(options: Options) -> Result<()> {
                 .map(|(id, w)| (*id, w.pid))
                 .collect();
             let plans = engine.placements();
+            if ribbon_macos::left_mouse_down() {
+                // Owner-driven drag loops change the transform themselves. Keep
+                // the lease and monitor clip, but never overwrite that transform.
+                let viewports = engine
+                    .monitors
+                    .iter()
+                    .map(|(id, m)| (id.clone(), m.viewport))
+                    .collect();
+                backend.interactive_frame(
+                    &plans,
+                    &owners,
+                    &sticky_leases(&geometry),
+                    &viewports,
+                )?;
+                last_tick = Instant::now();
+                last_frame.clear();
+                std::thread::sleep(frame_duration);
+                continue 'frames;
+            }
             let mut geometry_changed = false;
             // Hold the previously committed layout through the entire AX resize
             // batch. Do not publish half of a newly split column between owners.
@@ -732,11 +812,14 @@ pub fn run(options: Options) -> Result<()> {
                 });
             let mut held = plans.clone();
             if pending {
+                let dragging = ribbon_macos::left_mouse_down();
                 for p in &mut held {
                     let w = geometry
                         .originals
                         .get(&p.window)
                         .context("Missing original geometry")?;
+                    let needs_resize =
+                        sizes.get(&p.window) != Some(&(w.pid, p.frame.width, p.frame.height));
                     if let Some(previous) = committed
                         .iter()
                         .find(|old| old.window == p.window && old.native_space == p.native_space)
@@ -747,16 +830,32 @@ pub fn run(options: Options) -> Result<()> {
                         p.frame = w.bounds;
                         p.clip = Some(w.bounds);
                     }
+                    if needs_resize && !dragging {
+                        // AX moves also translate the owner's compositor state.
+                        // Do not expose or hit-test the intermediate surface.
+                        p.clip = None;
+                    }
                 }
                 // Also saves originals before AX changes the owner's transform.
-                backend.frame_with_sticky(&held, &owners, &sticky_leases(&geometry))?;
                 // Do not send AX size writes into an in-progress mouse drag.
                 // Keep the compositor lease alive and reconsider on release.
-                if ribbon_macos::left_mouse_down() {
+                if dragging {
+                    let viewports = engine
+                        .monitors
+                        .iter()
+                        .map(|(id, m)| (id.clone(), m.viewport))
+                        .collect();
+                    backend.interactive_frame(
+                        &plans,
+                        &owners,
+                        &sticky_leases(&geometry),
+                        &viewports,
+                    )?;
                     last_tick = Instant::now();
                     std::thread::sleep(frame_duration);
                     continue 'frames;
                 }
+                backend.frame_with_sticky(&held, &owners, &sticky_leases(&geometry))?;
             }
             let mut lease_tick = Instant::now();
             for p in &plans {
@@ -780,15 +879,7 @@ pub fn run(options: Options) -> Result<()> {
                     let resized = ribbon_macos::resize_window(
                         p.window,
                         w.pid,
-                        resize_anchor(
-                            viewport,
-                            *geometry
-                                .logical_originals
-                                .get(&p.window)
-                                .context("Missing original AX geometry")?,
-                            size.1,
-                            size.2,
-                        ),
+                        resize_anchor(viewport, w.bounds, size.1, size.2),
                     );
                     if let Err(e) = resized {
                         if ribbon_macos::window_owner(p.window) != w.pid {
@@ -796,7 +887,36 @@ pub fn run(options: Options) -> Result<()> {
                             sizes.remove(&p.window);
                             continue 'frames;
                         }
-                        return Err(e);
+                        eprintln!(
+                            "Leaving window {} floating after resize refusal: {e:#}",
+                            p.window.0
+                        );
+                        if let Some(logical) = geometry.logical_originals.get(&p.window)
+                            && let Err(restore) = ribbon_macos::restore_window(w, *logical)
+                        {
+                            eprintln!("Geometry restore after resize refusal: {restore:#}");
+                        }
+                        engine.remove_window(p.window)?;
+                        geometry
+                            .modes
+                            .get_mut(&p.window)
+                            .context("Missing window mode")?
+                            .floating = true;
+                        geometry.resized.remove(&p.window);
+                        sizes.remove(&p.window);
+                        let owners = geometry
+                            .originals
+                            .iter()
+                            .map(|(id, w)| (*id, w.pid))
+                            .collect();
+                        backend.frame_with_sticky(
+                            &engine.placements(),
+                            &owners,
+                            &sticky_leases(&geometry),
+                        )?;
+                        last_frame.clear();
+                        committed.retain(|old| old.window != p.window);
+                        continue 'frames;
                     }
                     sizes.insert(p.window, size);
                     geometry_changed = true;
@@ -822,7 +942,7 @@ pub fn run(options: Options) -> Result<()> {
             )?;
             if geometry_changed
                 || frame != last_frame
-                || start.duration_since(last_send) >= Duration::from_millis(250)
+                || start.duration_since(last_send) >= Duration::from_millis(50)
             {
                 backend.frame_with_sticky(&plans, &owners, &sticky_leases(&geometry))?;
                 last_frame = frame;

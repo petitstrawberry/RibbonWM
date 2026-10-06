@@ -343,55 +343,58 @@ def main(alacritty):
                 time.sleep(0.8)
                 verify()
                 print("PASS:", " ".join(command), flush=True)
-            # Test real OS Space changes, using this user's enabled native hotkey.
-            # The WM has no artificial row or workspace transition in this test.
-            cli("--monitor", monitor_id, "scroll", "213")
-            time.sleep(0.1)
-            before = cli("status")["state"]["monitors"][monitor_id]
-            original_space = before["native_space"]
-            original_layout = before["contexts"][str(original_space)]
-            assert original_layout["scroll"]["position"] > 0
-            live_before={wid:inspect(wid) for wid in original}
-            if fixture:
-                viewport=before["viewport"]
-                fixture.stdin.write(json.dumps(dict(op="move",x=viewport["x"]+50,y=viewport["y"]+100))+"\n")
-                fixture.stdin.flush()
-                assert probe["events"].get(timeout=2).get("moved")
+            if os.environ.get("RIBBON_TEST_SPACES", "1") == "1":
+                # Test real OS Space changes, using this user's enabled native hotkey.
+                # The WM has no artificial row or workspace transition in this test.
+                cli("--monitor", monitor_id, "scroll", "213")
                 time.sleep(0.1)
-            def native_space():
-                return next(d["native_space"] for d in cli("displays") if d["id"] == monitor_id)
-            subprocess.run([str(INSPECT), "--space", "next"], check=True)
-            return_direction = "previous"
-            deadline = time.monotonic() + 4
-            while native_space() == original_space:
-                if time.monotonic() > deadline:
-                    raise RuntimeError("Native next-Space shortcut did not change the Space")
-                time.sleep(0.1)
-            time.sleep(1)
-            away = cli("status")["state"]["monitors"][monitor_id]
-            assert away["native_space"] != original_space
-            assert away["contexts"][str(original_space)]["columns"] == original_layout["columns"]
-            assert cli("backend-status")["controlled"] == COUNT
-            for wid in original:
-                assert inspect(wid)["frame"]==live_before[wid]["frame"]
-                assert inspect(wid)["transform"]==live_before[wid]["transform"]
-                assert inspect(wid)["clip_bounds"]==live_before[wid]["clip_bounds"]
-            print("PASS: native Space change keeps existing sizes, transforms and clips without rebuilding", flush=True)
-            subprocess.run([str(INSPECT), "--space", return_direction], check=True)
-            deadline = time.monotonic() + 4
-            while native_space() != original_space:
-                if time.monotonic() > deadline:
-                    raise RuntimeError("Native previous-Space shortcut did not return")
-                time.sleep(0.1)
-            return_direction = None
-            time.sleep(1)
-            verify()
-            returned = cli("status")["state"]["monitors"][monitor_id]["contexts"][str(original_space)]
-            assert returned["columns"] == original_layout["columns"]
-            assert returned["scroll"]["target"] == original_layout["scroll"]["target"]
-            assert abs(returned["scroll"]["position"] - original_layout["scroll"]["position"]) < 1
-            print("PASS: native Space return restores column order, widths and manual scroll offset", flush=True)
-            print("Retained native Space scroll:",dict(space=original_space,position=returned["scroll"]["position"],target=returned["scroll"]["target"]),flush=True)
+                before = cli("status")["state"]["monitors"][monitor_id]
+                original_space = before["native_space"]
+                original_layout = before["contexts"][str(original_space)]
+                assert original_layout["scroll"]["position"] > 0
+                live_before={wid:inspect(wid) for wid in original}
+                if fixture:
+                    viewport=before["viewport"]
+                    fixture.stdin.write(json.dumps(dict(op="move",x=viewport["x"]+50,y=viewport["y"]+100))+"\n")
+                    fixture.stdin.flush()
+                    assert probe["events"].get(timeout=2).get("moved")
+                    time.sleep(0.1)
+                def native_space():
+                    return next(d["native_space"] for d in cli("displays") if d["id"] == monitor_id)
+                subprocess.run([str(INSPECT), "--space", "next"], check=True)
+                return_direction = "previous"
+                deadline = time.monotonic() + 4
+                while native_space() == original_space:
+                    if time.monotonic() > deadline:
+                        raise RuntimeError("Native next-Space shortcut did not change the Space")
+                    time.sleep(0.1)
+                time.sleep(1)
+                away = cli("status")["state"]["monitors"][monitor_id]
+                assert away["native_space"] != original_space
+                assert away["contexts"][str(original_space)]["columns"] == original_layout["columns"]
+                assert cli("backend-status")["controlled"] == COUNT
+                for wid in original:
+                    assert inspect(wid)["frame"]==live_before[wid]["frame"]
+                    assert inspect(wid)["transform"]==live_before[wid]["transform"]
+                    assert inspect(wid)["clip_bounds"]==live_before[wid]["clip_bounds"]
+                print("PASS: native Space change keeps existing sizes, transforms and clips without rebuilding", flush=True)
+                subprocess.run([str(INSPECT), "--space", return_direction], check=True)
+                deadline = time.monotonic() + 4
+                while native_space() != original_space:
+                    if time.monotonic() > deadline:
+                        raise RuntimeError("Native previous-Space shortcut did not return")
+                    time.sleep(0.1)
+                return_direction = None
+                time.sleep(1)
+                verify()
+                returned = cli("status")["state"]["monitors"][monitor_id]["contexts"][str(original_space)]
+                assert returned["columns"] == original_layout["columns"]
+                assert returned["scroll"]["target"] == original_layout["scroll"]["target"]
+                assert abs(returned["scroll"]["position"] - original_layout["scroll"]["position"]) < 1
+                print("PASS: native Space return restores column order, widths and manual scroll offset", flush=True)
+                print("Retained native Space scroll:",dict(space=original_space,position=returned["scroll"]["position"],target=returned["scroll"]["target"]),flush=True)
+            else:
+                print("SKIP: native Space switching (RIBBON_TEST_SPACES=0)", flush=True)
             cli("quit")
             daemon.wait(timeout=5)
             daemon_log.close()

@@ -8,6 +8,10 @@ static inline RibbonRect ribbon_display_viewport(RibbonRect app,RibbonRect visib
     double bottom=visible.y-app.y;
     return (RibbonRect){cg.x+visible.x-app.x,cg.y+top,visible.width,fmax(1,cg.height-top-bottom)};
 }
+static inline RibbonRect ribbon_outer_to_ax(RibbonRect target,RibbonRect ax,RibbonRect outer) {
+    return (RibbonRect){target.x+ax.x-outer.x,target.y+ax.y-outer.y,
+        target.width+ax.width-outer.width,target.height+ax.height-outer.height};
+}
 typedef struct { uint32_t wid; RibbonRect bounds; } RibbonDemoWindow;
 typedef struct { RibbonRect viewport; RibbonDemoWindow windows[3]; } RibbonDemoInfo;
 typedef struct { uint32_t wid,visible; double dx,dy; RibbonRect clip; } RibbonDemoFrame;
@@ -33,3 +37,9 @@ int ribbon_window_owner(uint32_t wid);
 void ribbon_forget_window(uint32_t wid);
 void ribbon_pointer(double *x,double *y);
 int ribbon_left_mouse_down(void);
+enum { RIBBON_EVENT_WINDOWS=1,RIBBON_EVENT_FOCUS=2,RIBBON_EVENT_GEOMETRY=4,RIBBON_EVENT_APPS=8 };
+int ribbon_watch_application(int pid);
+void ribbon_unwatch_application(int pid);
+void ribbon_watch_ax_element(const void *element,int pid);
+uint32_t ribbon_events(void);
+void ribbon_stop_observing(void);

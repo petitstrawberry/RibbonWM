@@ -65,6 +65,9 @@ def main():
         value = event()
         assert value["event"] == "click" and value["target"] == target, value
         assert abs(value["x"] - local_x) < 2 and abs(value["y"] - (200 if target else 240)) < 2, value
+        # The reported event is mouse-down. Await its scheduled mouse-up before
+        # changing a transform/clip or moving to the next hit-testing probe.
+        time.sleep(0.1)
 
     try:
         ready = event()

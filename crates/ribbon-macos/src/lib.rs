@@ -41,6 +41,12 @@ pub struct Window {
     #[serde(default)]
     pub sticky_known: bool,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Application {
+    pub pid: i32,
+    pub app: String,
+    pub bundle_id: String,
+}
 
 unsafe extern "C" {
     fn ribbon_query_json(kind: i32) -> *mut c_char;
@@ -58,6 +64,10 @@ unsafe extern "C" {
     fn ribbon_forget_window(wid: u32);
     fn ribbon_pointer(x: *mut f64, y: *mut f64);
     fn ribbon_left_mouse_down() -> i32;
+    fn ribbon_watch_application(pid: i32) -> i32;
+    fn ribbon_unwatch_application(pid: i32);
+    fn ribbon_events() -> u32;
+    fn ribbon_stop_observing();
 }
 
 fn query<T: serde::de::DeserializeOwned>(kind: i32) -> Result<T> {
@@ -77,6 +87,36 @@ pub fn displays() -> Result<Vec<Display>> {
 }
 pub fn windows() -> Result<Vec<Window>> {
     query(1)
+}
+pub fn applications() -> Result<Vec<Application>> {
+    query(2)
+}
+#[derive(Default)]
+pub struct EventSource(std::marker::PhantomData<std::rc::Rc<()>>);
+impl EventSource {
+    pub const WINDOWS: u32 = 1;
+    pub const FOCUS: u32 = 2;
+    pub const GEOMETRY: u32 = 4;
+    pub const APPS: u32 = 8;
+    /// Call only for apps that have passed the WM exclusion policy.
+    pub fn watch(&self, pid: i32) -> bool {
+        // SAFETY: registers an observer for a value-only process ID on main.
+        unsafe { ribbon_watch_application(pid) != 0 }
+    }
+    pub fn unwatch(&self, pid: i32) {
+        // SAFETY: removes only a previously registered main-thread observer.
+        unsafe { ribbon_unwatch_application(pid) }
+    }
+    pub fn drain(&self) -> u32 {
+        // SAFETY: bounded main-runloop notification processing, no pointers.
+        unsafe { ribbon_events() }
+    }
+}
+impl Drop for EventSource {
+    fn drop(&mut self) {
+        // SAFETY: releases the main-thread observers owned by this daemon.
+        unsafe { ribbon_stop_observing() }
+    }
 }
 pub fn accessibility_trusted() -> bool {
     // SAFETY: queries permission without displaying a prompt or accepting pointers.

@@ -83,6 +83,17 @@ def main(alacritty):
             assert abs(inspect(a)["frame"]["width"]-native["frame"]["width"]) < 2
             print("PASS: real mouse border drag changes the owner width and the WM adopts it without snapping back:",
                   dict(before=before, after=native["frame"]["width"]), flush=True)
+            start_x = -inspect(a)["transform"][4]
+            result = subprocess.check_output([str(HELPER), "--move-drag-fixture", str(a), str(pa.pid), "110", "0"],
+                                             text=True, timeout=3)
+            samples = json.loads(result.splitlines()[0])["drag_samples"]
+            positions = [-sample["transform"][4] for sample in samples]
+            assert positions[-1] - start_x >= 40, (start_x, positions)
+            assert all(b >= a-2 for a, b in zip(positions, positions[1:])), positions
+            assert max(positions)-min(positions) >= 40, positions
+            print("PASS: actual title-bar drag advances throughout the hold without WM snapping it back:", positions, flush=True)
+            wait(lambda: abs(-inspect(a)["transform"][4] - next(
+                p["frame"]["x"] for p in cli("status")["placements"] if p["window"] == a)) < 2)
             queried = cli("-m", "query", "--displays")
             assert next(d for d in queried if d["uuid"] == primary["id"])["has-focus"]
             print("PASS: display query matches native focus", flush=True)

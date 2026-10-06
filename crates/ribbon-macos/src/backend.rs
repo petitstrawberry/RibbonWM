@@ -33,6 +33,8 @@ struct Update {
     pid: i32,
     frame: Rect,
     clip: Option<Rect>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    viewport: Option<Rect>,
 }
 #[derive(Serialize)]
 struct Request<'a> {
@@ -75,6 +77,7 @@ pub struct Backend {
     armed: Cell<bool>,
     version: Cell<u32>,
     sticky: Cell<bool>,
+    interactive: Cell<bool>,
 }
 impl Backend {
     pub fn connect() -> Result<Self> {
@@ -82,6 +85,7 @@ impl Backend {
             armed: Cell::new(false),
             version: Cell::new(0),
             sticky: Cell::new(false),
+            interactive: Cell::new(false),
             session: format!(
                 "{}-{}-{}",
                 uid(),
@@ -96,6 +100,8 @@ impl Backend {
         b.version.set(status.version);
         b.sticky
             .set(status.capabilities.iter().any(|s| s == "sticky"));
+        b.interactive
+            .set(status.capabilities.iter().any(|s| s == "interactive_clip"));
         Ok(b)
     }
     fn request(
@@ -143,9 +149,9 @@ impl Backend {
         )?)
     }
     pub fn require_live_version(&self) -> Result<()> {
-        if self.version.get() != 2 {
+        if self.version.get() != 2 || !self.interactive.get() {
             bail!(
-                "Reload the Dock backend with nix develop -c sh scripts/load-backend.sh (protocol 2 required)"
+                "Reload the Dock backend with nix develop -c sh scripts/load-backend.sh (protocol 2 and interactive_clip required)"
             );
         }
         Ok(())
@@ -167,6 +173,24 @@ impl Backend {
         owners: &BTreeMap<WindowId, i32>,
         stickies: &[StickyWindow],
     ) -> Result<()> {
+        self.send_frame(placements, owners, stickies, None)
+    }
+    pub fn interactive_frame(
+        &self,
+        placements: &[Placement],
+        owners: &BTreeMap<WindowId, i32>,
+        stickies: &[StickyWindow],
+        viewports: &BTreeMap<String, Rect>,
+    ) -> Result<()> {
+        self.send_frame(placements, owners, stickies, Some(viewports))
+    }
+    fn send_frame(
+        &self,
+        placements: &[Placement],
+        owners: &BTreeMap<WindowId, i32>,
+        stickies: &[StickyWindow],
+        viewports: Option<&BTreeMap<String, Rect>>,
+    ) -> Result<()> {
         self.require_live_version()?;
         if placements.len() > 128 {
             bail!("Payload supports at most 128 controlled windows");
@@ -186,6 +210,11 @@ impl Backend {
                                 .context("Missing expected window owner")?,
                             frame: p.frame,
                             clip: p.clip,
+                            viewport: viewports
+                                .map(|v| {
+                                    v.get(&p.monitor).copied().context("Missing drag viewport")
+                                })
+                                .transpose()?,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,

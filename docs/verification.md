@@ -42,10 +42,19 @@ AX frame. Native display conversion checks menu-bar reservations with positive
 and negative monitor origins. These checks do not prove arbitrary-app restoration
 or root-watcher recovery in the installed service.
 
+The responsiveness update has 52 passing Rust tests, a flake release build,
+native demo input checks and an owned-window payload-handler test. The latter
+verifies that interactive frames preserve ten owner-driven translations, keep
+the actual clip within a retained viewport, and restore placement on release.
+It does not inject into Dock or simulate an AppKit mouse drag. `smoke-events.py`
+checks real AX notifications, creation/resize latency and resize-refusal isolation;
+`smoke-interaction.py` additionally samples an actual title-bar drag. These tests
+must pass against the new loaded backend before claiming desktop drag stability.
+
 ## Known limits
 
 - App minimum/fixed-size negotiation is incomplete. An app refusing an AX resize
-  can terminate the daemon; restore failures have also been observed.
+  is restored best-effort and left floating. Restoration can still fail if an app's constraints change.
 - SIGKILL/watchdog recovery restores compositor state and sticky tags, not AX sizes.
 - Root-watcher recovery after a Dock restart is implemented but not runtime-tested.
 - The latest column-width/mirror actions have automated layout coverage; direct

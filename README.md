@@ -62,6 +62,9 @@ modules = [
         preserve_window_width = true;
         center_content = true;
         focus_alignment = "visible";
+        animation_curve = "ease_in_out";
+        animation_duration = 0.25;
+        cycle_width_ratios = [ 0.38195 0.5 0.61804 ];
         frame_rate = 120;
       };
       excludeApps = [
@@ -121,7 +124,7 @@ nix develop -c cargo run --locked -- run --all --config config/live.toml \
 | `resize WIDTH` / `resize --by DELTA` / `resize --ratio RATIO` | 列幅を変更 |
 | `resize-height HEIGHT` / `resize-height --by DELTA` | スタック行の高さを変更 |
 | `toggle-full-width` | 元の列幅とモニターの使用可能な全幅を往復 |
-| `cycle-width` | 使用可能幅の1/2・2/3・全幅を循環 |
+| `cycle-width` | `cycle_width_ratios` の幅を循環（service既定は約38%・50%・62%） |
 | `mirror columns` / `mirror rows` | 列順・スタック行順を反転。選択ウィンドウを維持 |
 | `center` / `scroll DELTA` | 選択列を中央へ表示・横スクロール |
 | `float on/off/toggle` / `sticky on/off/toggle` | タイルから離す・モニター内のnative Spacesへ表示 |

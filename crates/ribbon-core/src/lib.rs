@@ -53,6 +53,14 @@ pub enum FocusAlignment {
     Visible,
     Center,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnimationCurve {
+    #[default]
+    Spring,
+    EaseOut,
+    EaseInOut,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -61,6 +69,9 @@ pub struct Settings {
     pub gap: f64,
     pub focus_alignment: FocusAlignment,
     pub animation_frequency: f64,
+    pub animation_curve: AnimationCurve,
+    pub animation_duration: f64,
+    pub cycle_width_ratios: Vec<f64>,
     pub frame_rate: u32,
     pub horizontal_margin: f64,
     pub vertical_margin: f64,
@@ -78,6 +89,9 @@ impl Default for Settings {
             gap: 16.0,
             focus_alignment: FocusAlignment::Visible,
             animation_frequency: 14.0,
+            animation_curve: AnimationCurve::Spring,
+            animation_duration: 0.25,
+            cycle_width_ratios: vec![0.5, 2.0 / 3.0, 1.0],
             frame_rate: 60,
             horizontal_margin: 0.0,
             vertical_margin: 0.0,
@@ -98,6 +112,15 @@ impl Settings {
             || !(0.0..=100.0).contains(&self.gap)
             || !self.animation_frequency.is_finite()
             || !(1.0..=100.0).contains(&self.animation_frequency)
+            || !self.animation_duration.is_finite()
+            || !(0.0..=2.0).contains(&self.animation_duration)
+            || self.cycle_width_ratios.is_empty()
+            || self.cycle_width_ratios.len() > 16
+            || self
+                .cycle_width_ratios
+                .iter()
+                .any(|r| !r.is_finite() || !(0.01..=1.0).contains(r))
+            || self.cycle_width_ratios.windows(2).any(|w| w[0] >= w[1])
             || !(1..=240).contains(&self.frame_rate)
             || !self.horizontal_margin.is_finite()
             || !(0.0..=200.0).contains(&self.horizontal_margin)
@@ -211,8 +234,52 @@ pub struct Scroll {
     pub position: f64,
     pub target: f64,
     pub velocity: f64,
+    #[serde(skip)]
+    easing_origin: f64,
+    #[serde(skip)]
+    easing_target: f64,
+    #[serde(skip)]
+    easing_elapsed: f64,
+    #[serde(skip)]
+    easing_active: bool,
 }
 impl Scroll {
+    fn advance_eased(&mut self, dt: f64, duration: f64, curve: AnimationCurve) {
+        if !dt.is_finite() || dt <= 0.0 {
+            return;
+        }
+        if !self.easing_active || self.easing_target != self.target {
+            self.easing_origin = self.position;
+            self.easing_target = self.target;
+            self.easing_elapsed = 0.0;
+            self.easing_active = true;
+        }
+        self.easing_elapsed += dt;
+        let progress = if duration == 0.0 {
+            1.0
+        } else {
+            (self.easing_elapsed / duration).min(1.0)
+        };
+        let distance = self.easing_target - self.easing_origin;
+        let (fraction, slope) = match curve {
+            AnimationCurve::EaseInOut if progress < 0.5 => {
+                (2.0 * progress * progress, 4.0 * progress)
+            }
+            AnimationCurve::EaseInOut => {
+                (1.0 - 2.0 * (1.0 - progress).powi(2), 4.0 * (1.0 - progress))
+            }
+            _ => (1.0 - (1.0 - progress).powi(2), 2.0 * (1.0 - progress)),
+        };
+        self.position = self.easing_origin + distance * fraction;
+        self.velocity = if progress == 1.0 {
+            0.0
+        } else {
+            distance * slope / duration
+        };
+        if progress == 1.0 {
+            self.position = self.target;
+        }
+    }
     fn clamp(&mut self, min: f64, max: f64) {
         self.target = self.target.clamp(min, max);
         // A changed strip width may put the displayed offset outside its new
@@ -445,6 +512,8 @@ impl SpaceLayout {
                 let shift = self.column_x(self.focused_column, settings.gap) - old_x;
                 self.scroll.position += shift;
                 self.scroll.target += shift;
+                self.scroll.easing_origin += shift;
+                self.scroll.easing_target += shift;
             }
         }
         self.remember_focus();
@@ -1021,6 +1090,7 @@ impl Engine {
                 );
                 w.scroll.target = w.scroll.position;
                 w.scroll.velocity = 0.0;
+                w.scroll.easing_active = false;
             }
             Action::Resize { width } => {
                 if !width.is_finite() || !(100.0..=10000.0).contains(width) {
@@ -1050,12 +1120,13 @@ impl Engine {
                         full
                     };
                 } else {
-                    let widths = [full * 0.5, full * (2.0 / 3.0), full];
-                    column.width = widths
-                        .into_iter()
-                        .map(|width| width.max(100.0))
+                    column.width = self
+                        .settings
+                        .cycle_width_ratios
+                        .iter()
+                        .map(|ratio| (full * ratio).max(100.0))
                         .find(|width| *width > column.width + 2.0)
-                        .unwrap_or((full * 0.5).max(100.0));
+                        .unwrap_or((full * self.settings.cycle_width_ratios[0]).max(100.0));
                     column.normal_width = None;
                 }
                 w.reveal_focus(viewport, &self.settings);
@@ -1127,7 +1198,12 @@ impl Engine {
         for m in self.monitors.values_mut().filter(|m| !m.suspended) {
             let viewport = m.viewport;
             let s = m.layout_mut();
-            s.scroll.advance(dt, self.settings.animation_frequency);
+            match self.settings.animation_curve {
+                AnimationCurve::Spring => s.scroll.advance(dt, self.settings.animation_frequency),
+                curve => s
+                    .scroll
+                    .advance_eased(dt, self.settings.animation_duration, curve),
+            }
             let (min, max) = s.scroll_bounds(viewport, &self.settings);
             s.scroll.clamp(min, max);
         }

@@ -8,6 +8,8 @@ let
     horizontal_margin = 20.0; vertical_margin = 20.0;
     preserve_window_width = true; center_content = true;
     focus_alignment = "visible";
+    animation_curve = "ease_in_out"; animation_duration = 0.25;
+    cycle_width_ratios = [ 0.38195 0.5 0.61804 ];
   };
   configFile = format.generate "ribbonwm.toml" (defaultSettings // cfg.settings);
 in {

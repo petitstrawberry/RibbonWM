@@ -812,6 +812,62 @@ fn exact_animation_is_frame_rate_independent() {
     assert!((a.velocity - b.velocity).abs() < 1e-8);
 }
 #[test]
+fn timed_animation_finishes_in_a_quarter_second_at_multiple_refresh_rates() {
+    for hz in [60, 120, 144] {
+        let mut scroll = Scroll {
+            target: 1000.0,
+            ..Scroll::default()
+        };
+        for _ in 0..(hz / 4) {
+            scroll.advance_eased(1.0 / hz as f64, 0.25, AnimationCurve::EaseInOut);
+        }
+        assert!((scroll.position - 1000.0).abs() < 1e-8);
+        scroll.advance_eased(1.0 / hz as f64, 0.25, AnimationCurve::EaseInOut);
+        assert_eq!(scroll.position, 1000.0);
+        assert_eq!(scroll.velocity, 0.0);
+    }
+}
+#[test]
+fn timed_animation_retargets_from_the_displayed_position_without_overshoot() {
+    let mut scroll = Scroll {
+        target: 1000.0,
+        ..Scroll::default()
+    };
+    scroll.advance_eased(0.125, 0.25, AnimationCurve::EaseInOut);
+    assert_eq!(scroll.position, 500.0);
+    scroll.target = -200.0;
+    for _ in 0..30 {
+        scroll.advance_eased(1.0 / 120.0, 0.25, AnimationCurve::EaseInOut);
+        assert!((-200.0..=500.0).contains(&scroll.position));
+    }
+    scroll.advance_eased(0.01, 0.25, AnimationCurve::EaseInOut);
+    assert_eq!(scroll.position, -200.0);
+    scroll.target = 700.0;
+    scroll.advance_eased(0.01, 0.0, AnimationCurve::EaseInOut);
+    assert_eq!(scroll.position, 700.0);
+}
+#[test]
+fn width_presets_and_animation_settings_are_validated() {
+    let mut settings = Settings {
+        cycle_width_ratios: vec![0.38195, 0.5, 0.61804],
+        ..Settings::default()
+    };
+    assert!(settings.validate().is_ok());
+    for ratios in [
+        vec![],
+        vec![0.5, 0.5],
+        vec![0.8, 0.4],
+        vec![f64::NAN],
+        vec![1.1],
+    ] {
+        settings.cycle_width_ratios = ratios;
+        assert!(settings.validate().is_err());
+    }
+    settings.cycle_width_ratios = vec![0.5];
+    settings.animation_duration = f64::INFINITY;
+    assert!(settings.validate().is_err());
+}
+#[test]
 fn invalid_inputs_do_not_poison_geometry() {
     assert!(
         Engine::new(Settings {
