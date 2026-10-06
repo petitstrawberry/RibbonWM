@@ -53,6 +53,11 @@ fn width_cycle_respects_padding_wraps_and_clears_an_old_zoom_restore() {
     e.apply("left", &Action::ToggleFullWidth {}).unwrap();
     e.apply("left", &Action::ToggleFullWidth {}).unwrap();
     assert_eq!(e.monitors["left"].layout().columns[0].width, 900.0);
+    e.apply("left", &Action::ToggleFullWidth {}).unwrap();
+    e.observe_width(WindowId(1), 820.0).unwrap();
+    e.apply("left", &Action::ToggleFullWidth {}).unwrap();
+    e.apply("left", &Action::ToggleFullWidth {}).unwrap();
+    assert_eq!(e.monitors["left"].layout().columns[0].width, 820.0);
 }
 
 #[test]

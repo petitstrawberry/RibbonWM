@@ -72,8 +72,15 @@ try:
         if not ids:
             continue
         cli("focus-window", str(ids[-1]))
-        for command in [("focus", "left"), ("focus", "right"), ("scroll", "120"),
-                        ("resize", "800"), ("stack",), ("focus", "down"), ("unstack",)]:
+        commands = [("scroll", "120"), ("resize", "800"),
+                    ("toggle-full-width",), ("toggle-full-width",),
+                    ("cycle-width",), ("mirror", "columns"), ("mirror", "columns")]
+        if len(ids) > 1:
+            # StackLeft selects the new bottom row, so focus up into its neighbor.
+            commands += [("focus", "left"), ("focus", "right"), ("stack",),
+                         ("mirror", "rows"), ("mirror", "rows"),
+                         ("focus", "up"), ("unstack",)]
+        for command in commands:
             cli("--monitor", monitor_id, *command)
             verify()
     # Restoration of the logical original row through window identity.

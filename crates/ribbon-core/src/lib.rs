@@ -771,6 +771,7 @@ impl Engine {
                     return Ok(false);
                 }
                 c.width = width;
+                c.normal_width = None;
                 s.repair(viewport, &self.settings);
                 return Ok(true);
             }
