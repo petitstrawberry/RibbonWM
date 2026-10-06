@@ -1,0 +1,15 @@
+# Initial settings for managing normal app windows, in logical points.
+column_width = 960.0
+gap = 16.0
+focus_alignment = "visible"
+animation_frequency = 14.0
+frame_rate = 60
+horizontal_margin = 20.0
+vertical_margin = 20.0
+# Optional per-edge overrides, measured inward from the OS usable area.
+# padding_left = 20.0
+# padding_right = 20.0
+# padding_top = 20.0
+# padding_bottom = 20.0
+center_content = true
+preserve_window_width = true

@@ -1,0 +1,6 @@
+# Widths are in logical display points. New columns preserve existing widths.
+column_width = 640.0
+gap = 16.0
+focus_alignment = "visible" # "visible" or "center"
+animation_frequency = 14.0
+frame_rate = 60

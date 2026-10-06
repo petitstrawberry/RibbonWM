@@ -1,0 +1,13 @@
+/target/
+/result
+/result-*
+/native/build/
+/.direnv/
+*.dSYM/
+*.plist
+.DS_Store
+__pycache__/
+# Local desktop evidence can contain app titles and screenshots.
+/docs/*.txt
+/docs/*.png
+/docs/local-verification.md

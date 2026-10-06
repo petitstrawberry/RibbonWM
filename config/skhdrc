@@ -1,0 +1,43 @@
+# Example; put RibbonWM and skhd on PATH, or use their absolute Nix store paths.
+# focus window
+alt - right : ribbonwm -m window --focus east || ribbonwm -m display --focus east
+alt - left : ribbonwm -m window --focus west || ribbonwm -m display --focus west
+alt - up : ribbonwm -m window --focus north || ribbonwm -m display --focus north
+alt - down : ribbonwm -m window --focus south || ribbonwm -m display --focus south
+
+# swap window
+# Cross-monitor window transfer is not implemented. A missing neighbor
+# reports an error without moving the window to an unintended location.
+shift + ctrl + alt - right : ribbonwm -m window --swap east
+shift + ctrl + alt - left : ribbonwm -m window --swap west
+shift + ctrl + alt - up : ribbonwm -m window --swap north
+shift + ctrl + alt - down : ribbonwm -m window --swap south
+
+# move window
+shift + alt - right : ribbonwm -m window --warp east
+shift + alt - left : ribbonwm -m window --warp west
+shift + alt - up : ribbonwm -m window --warp north
+shift + alt - down : ribbonwm -m window --warp south
+
+# toggle float
+# Float restores original geometry; the old centered 4x4 grid is not used.
+alt - t : ribbonwm -m window --toggle float
+shift + alt - t : ribbonwm -m window --toggle sticky
+
+# zoom
+# BSP parent zoom becomes column centering; full-width toggles back.
+alt - d : ribbonwm -m window --center
+alt - f : ribbonwm -m window --toggle zoom-fullscreen
+# Ask the focused app via macOS's standard fullscreen shortcut.
+shift + alt - f : skhd -k "ctrl + cmd - f"
+
+# rotate
+# A horizontal strip has no 90-degree BSP rotation: cycle 1/2, 2/3, 1.
+alt - r : ribbonwm -m window --resize cycle
+shift + alt - m : ribbonwm -m space --mirror x-axis
+alt - m : ribbonwm -m space --mirror y-axis
+
+# stack
+alt - s : ribbonwm -m window --stack next
+alt + ctrl - n : ribbonwm -m window --focus stack.next
+alt + ctrl - p : ribbonwm -m window --focus stack.prev
