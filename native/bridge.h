@@ -42,6 +42,7 @@ int ribbon_window_owner(uint32_t wid);
 void ribbon_forget_window(uint32_t wid);
 void ribbon_pointer(double *x,double *y);
 int ribbon_left_mouse_down(void);
+double ribbon_left_mouse_down_age(void);
 typedef struct { uint64_t identity; double x,y; uint32_t phase; } RibbonTouch;
 typedef struct {
     double dx,dy,x,y,time;
@@ -63,8 +64,9 @@ enum { RIBBON_EVENT_WINDOWS=1,RIBBON_EVENT_FOCUS=2,RIBBON_EVENT_GEOMETRY=4,RIBBO
 int ribbon_watch_application(int pid);
 void ribbon_unwatch_application(int pid);
 void ribbon_watch_ax_element(const void *element,int pid);
+void ribbon_forget_watched_window(uint32_t wid);
 uint32_t ribbon_events(void);
-typedef struct { uint32_t wid; int32_t pid; } RibbonClosedWindow;
+typedef struct { uint32_t wid; int32_t pid; int32_t withdrawn; } RibbonClosedWindow;
 uint32_t ribbon_ax_window_id(const void *element);
 size_t ribbon_take_closed_windows(RibbonClosedWindow *windows,size_t capacity,int refresh);
 void ribbon_stop_observing(void);

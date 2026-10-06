@@ -744,9 +744,9 @@ impl Engine {
                     }
                     s.focused_column = ci;
                     s.focused_row = ri;
-                    s.centered = false;
                     s.remember_focus();
                     if reveal {
+                        s.centered = false;
                         s.reveal_focus(viewport, &self.settings);
                     }
                     return Ok(true);

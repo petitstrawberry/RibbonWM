@@ -6,7 +6,7 @@ static NSMutableDictionary<NSNumber *,id> *observers;
 static NSMutableArray *workspaceObservers;
 static uint32_t pendingEvents;
 static CFMutableDictionaryRef watchedElements;
-static NSMutableDictionary<NSNumber *,NSNumber *> *closedWindows;
+static NSMutableDictionary<NSNumber *,NSDictionary *> *closedWindows;
 static double lastMembershipCheck;
 void ribbon_watch_ax_element(const void *element,int pid) {
     AXObserverRef observer=(__bridge AXObserverRef)observers[@(pid)];
@@ -32,7 +32,7 @@ static void notification(AXObserverRef observer,AXUIElementRef element,CFStringR
             NSDictionary *known=(__bridge NSDictionary *)CFDictionaryGetValue(watchedElements,element);
             if(known) {
                 if(!closedWindows)closedWindows=[NSMutableDictionary dictionary];
-                closedWindows[known[@"wid"]]=known[@"pid"];
+                closedWindows[known[@"wid"]]=@{@"pid":known[@"pid"],@"withdrawn":@NO};
                 CFDictionaryRemoveValue(watchedElements,element);
             }
         }
@@ -108,8 +108,8 @@ size_t ribbon_take_closed_windows(RibbonClosedWindow *windows,size_t capacity,in
                     NSDictionary *known=entries[element];
                     if([known[@"pid"] isEqual:pid]&&![ids containsObject:known[@"wid"]]) {
                         if(!closedWindows)closedWindows=[NSMutableDictionary dictionary];
-                        closedWindows[known[@"wid"]]=pid;
-                        CFDictionaryRemoveValue(watchedElements,(__bridge const void *)element);
+                        if(!closedWindows[known[@"wid"]])
+                            closedWindows[known[@"wid"]]=@{@"pid":pid,@"withdrawn":@YES};
                     }
                 }
             }
@@ -119,10 +119,18 @@ size_t ribbon_take_closed_windows(RibbonClosedWindow *windows,size_t capacity,in
     size_t count=0;
     for(NSNumber *wid in closedWindows.allKeys) {
         if(count==capacity)break;
-        windows[count++]=(RibbonClosedWindow){wid.unsignedIntValue,closedWindows[wid].intValue};
+        NSDictionary *record=closedWindows[wid];
+        windows[count++]=(RibbonClosedWindow){wid.unsignedIntValue,[record[@"pid"] intValue],[record[@"withdrawn"] intValue]};
         [closedWindows removeObjectForKey:wid];
     }
     return count;
+}
+void ribbon_forget_watched_window(uint32_t wid) {
+    if(!watchedElements)return;
+    NSDictionary *entries=(__bridge NSDictionary *)watchedElements;
+    for(id element in entries.allKeys)
+        if([entries[element][@"wid"] unsignedIntValue]==wid)
+            CFDictionaryRemoveValue(watchedElements,(__bridge const void *)element);
 }
 uint32_t ribbon_events(void) { @autoreleasepool {
     initialize();

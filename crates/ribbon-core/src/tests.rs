@@ -166,6 +166,27 @@ fn repeated_native_focus_does_not_undo_manual_scroll_or_space_offset() {
 }
 
 #[test]
+fn automatic_native_focus_preserves_manual_centering_and_its_scroll_bounds() {
+    let mut e = paper_engine();
+    for id in 1..=4 {
+        add(&mut e, id);
+    }
+    e.focus_window(WindowId(1)).unwrap();
+    e.apply("left", &Action::Center {}).unwrap();
+    e.tick(2.0);
+    let before = e.monitors["left"].layout().scroll;
+    assert!(e.monitors["left"].layout().centered);
+    e.observe_focus(WindowId(3), false).unwrap();
+    e.tick(2.0);
+    let after = e.monitors["left"].layout().scroll;
+    assert!(e.monitors["left"].layout().centered);
+    assert_eq!(after.position, before.position);
+    assert_eq!(after.target, before.target);
+    e.focus_window(WindowId(3)).unwrap();
+    assert!(!e.monitors["left"].layout().centered);
+}
+
+#[test]
 fn closing_a_column_left_of_focus_preserves_its_displayed_position() {
     let mut e = paper_engine();
     for id in 1..=5 {

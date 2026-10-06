@@ -134,7 +134,18 @@ fn observe_native_focus(
         .any(|w| w.pid == pid && !app_excluded(w, &options.exclude_apps))
         && let Some(id) = ribbon_macos::focused_window(pid)
     {
-        let _ = engine.observe_focus(id, reveal);
+        // App activation and Space switching select windows automatically.
+        // Observe that selection without overriding the saved viewport. Only a
+        // recent click in the selected window requests native focus reveal;
+        // explicit WM focus commands already reveal through Engine::apply.
+        let click_age = ribbon_macos::left_mouse_down_age();
+        let pointer = ribbon_macos::pointer();
+        let clicked = click_age.is_finite()
+            && (0.0..=0.25).contains(&click_age)
+            && engine.placements().iter().any(|p| {
+                p.window == id && p.clip.is_some_and(|c| c.contains(pointer.0, pointer.1))
+            });
+        let _ = engine.observe_focus(id, reveal && clicked);
     }
 }
 fn forget_closed(engine: &mut Engine, geometry: &mut GeometryLease, id: WindowId) -> Result<()> {
@@ -252,19 +263,13 @@ fn synchronize(
                 || m.suspended != d.native_fullscreen
         })
     });
-    for d in displays {
-        engine.update_monitor(&d.id, d.viewport, d.native_space, d.native_fullscreen)?;
-    }
-    for m in engine.monitors.values_mut() {
-        if !displays.iter().any(|d| d.id == m.id) {
-            m.suspended = true;
-        }
-    }
+    update_contexts(engine, displays)?;
     for id in geometry.originals.keys().copied().collect::<Vec<_>>() {
         let old = geometry.originals.get(&id);
         if !inventory
             .iter()
             .any(|w| w.id == id && old.is_none_or(|o| o.pid == w.pid))
+            && (options.dry_run || old.is_none_or(|w| ribbon_macos::window_owner(id) != w.pid))
         {
             forget_closed(engine, geometry, id)?;
         }
@@ -278,6 +283,11 @@ fn synchronize(
             continue;
         }
         if geometry.modes.get(&w.id).is_some_and(|m| !m.wants_tile()) {
+            if let Some(original) = geometry.originals.get_mut(&w.id)
+                && original.pid == w.pid
+            {
+                original.native_spaces = w.native_spaces;
+            }
             continue;
         }
         if let Some((monitor, space)) = engine.window_context(w.id) {
@@ -289,6 +299,7 @@ fn synchronize(
             }
             if !options.dry_run
                 && w.onscreen
+                && let Some(surface) = w.surface_bounds.filter(|r| r.valid())
                 && let Some(&(pid, width, height)) = sizes.get(&w.id)
                 && pid == w.pid
             {
@@ -302,18 +313,18 @@ fn synchronize(
                 if let Some(plan) = plan {
                     let mut accepted = (pid, width, height);
                     if (plan.frame.width - width).abs() <= 2.0
-                        && (w.bounds.width - width).abs() > 2.0
-                        && (100.0..=10000.0).contains(&w.bounds.width)
+                        && (surface.width - width).abs() > 2.0
+                        && (100.0..=10000.0).contains(&surface.width)
                     {
-                        engine.observe_width(w.id, w.bounds.width)?;
-                        accepted.1 = w.bounds.width;
+                        engine.observe_width(w.id, surface.width)?;
+                        accepted.1 = surface.width;
                     }
                     if (plan.frame.height - height).abs() <= 2.0
-                        && (w.bounds.height - height).abs() > 2.0
-                        && w.bounds.height >= 100.0
+                        && (surface.height - height).abs() > 2.0
+                        && surface.height >= 100.0
                     {
-                        let _ = engine.resize_row(&plan.monitor, w.id, w.bounds.height);
-                        accepted.2 = w.bounds.height;
+                        let _ = engine.resize_row(&plan.monitor, w.id, surface.height);
+                        accepted.2 = surface.height;
                     }
                     sizes.insert(w.id, accepted);
                 }
@@ -362,6 +373,33 @@ fn synchronize(
     }
     observe_native_focus(engine, geometry, options, reveal_focus && !context_changed);
     Ok(())
+}
+
+fn update_contexts(engine: &mut Engine, displays: &[Display]) -> Result<()> {
+    for d in displays {
+        engine.update_monitor(&d.id, d.viewport, d.native_space, d.native_fullscreen)?;
+    }
+    for m in engine.monitors.values_mut() {
+        if !displays.iter().any(|d| d.id == m.id) {
+            m.suspended = true;
+        }
+    }
+    Ok(())
+}
+
+fn inactive_window(engine: &Engine, geometry: &GeometryLease, id: WindowId) -> bool {
+    if let Some((mid, sid)) = engine.window_context(id) {
+        let m = &engine.monitors[mid];
+        return m.native_space != sid || m.suspended;
+    }
+    geometry.originals.get(&id).is_some_and(|w| {
+        !geometry.modes.get(&id).is_some_and(|mode| mode.sticky)
+            && !w.native_spaces.is_empty()
+            && !engine
+                .monitors
+                .values()
+                .any(|m| !m.suspended && w.native_spaces.contains(&m.native_space))
+    })
 }
 
 fn monitor_for(engine: &Engine, requested: Option<String>) -> Result<String> {
@@ -836,19 +874,6 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
             .as_ref()
             .is_some_and(ribbon_macos::input::InputSource::active);
         let notifications = events.as_ref().map_or(0, ribbon_macos::EventSource::drain);
-        if let Some(source) = &events {
-            for closed in source.closed_windows(!animating) {
-                let id = WindowId(closed.wid);
-                if geometry
-                    .originals
-                    .get(&id)
-                    .is_some_and(|w| w.pid == closed.pid)
-                {
-                    forget_closed(&mut engine, &mut geometry, id)?;
-                    sizes.remove(&id);
-                }
-            }
-        }
         if event_trace && notifications != 0 {
             eprintln!("Native events: {notifications}");
         }
@@ -890,9 +915,37 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                     "Display geometry changed; releasing windows. Restart run to use the new display geometry"
                 );
             }
+            if next.iter().any(|d| {
+                engine.monitors.get(&d.id).is_some_and(|m| {
+                    m.native_space != d.native_space || m.suspended != d.native_fullscreen
+                })
+            }) {
+                inventory.invalidate();
+            }
             displays = next;
+            // Activate the native context before processing focus/destruction,
+            // without waiting for asynchronous window metadata.
+            update_contexts(&mut engine, &displays)?;
             inventory.request()?;
             last_inventory = start;
+        }
+        if let Some(source) = &events {
+            for closed in source.closed_windows(!animating) {
+                let id = WindowId(closed.wid);
+                // Some apps expose AXWindows only on their active Space.
+                // A withdrawn-list entry does not prove an inactive window closed.
+                if closed.withdrawn != 0 && inactive_window(&engine, &geometry, id) {
+                    continue;
+                }
+                if geometry
+                    .originals
+                    .get(&id)
+                    .is_some_and(|w| w.pid == closed.pid)
+                {
+                    forget_closed(&mut engine, &mut geometry, id)?;
+                    sizes.remove(&id);
+                }
+            }
         }
         if let Some(windows) = inventory.poll()? {
             let reveal = !input
@@ -1188,6 +1241,67 @@ mod tests {
     use ribbon_core::{NativeSpaceId, Rect};
 
     #[test]
+    fn withdrawn_windows_remain_known_on_inactive_spaces_for_tiles_and_floats() {
+        let viewport = Rect {
+            x: 0.0,
+            y: 33.0,
+            width: 1512.0,
+            height: 949.0,
+        };
+        let mut engine = Engine::new(Settings::default()).unwrap();
+        engine
+            .update_monitor("main", viewport, NativeSpaceId(3), false)
+            .unwrap();
+        let id = WindowId(1);
+        engine.add_window("main", id, Some(800.0)).unwrap();
+        let mut geometry = GeometryLease {
+            modes: BTreeMap::new(),
+            originals: BTreeMap::new(),
+            logical_originals: BTreeMap::new(),
+            resized: BTreeSet::new(),
+        };
+        geometry.originals.insert(
+            id,
+            Window {
+                id,
+                pid: 1,
+                app: "Owned test".into(),
+                bundle_id: String::new(),
+                title: String::new(),
+                layer: 0,
+                onscreen: false,
+                bounds: viewport,
+                surface_bounds: Some(viewport),
+                native_spaces: vec![NativeSpaceId(3)],
+                sticky: false,
+                sticky_known: true,
+            },
+        );
+        assert!(!inactive_window(&engine, &geometry, id));
+        engine
+            .update_monitor("main", viewport, NativeSpaceId(7), false)
+            .unwrap();
+        assert!(inactive_window(&engine, &geometry, id));
+        engine.remove_window(id).unwrap();
+        geometry.modes.insert(
+            id,
+            WindowMode {
+                floating: true,
+                sticky: false,
+                ..WindowMode::default()
+            },
+        );
+        assert!(inactive_window(&engine, &geometry, id));
+        geometry.modes.get_mut(&id).unwrap().sticky = true;
+        assert!(!inactive_window(&engine, &geometry, id));
+        geometry.modes.get_mut(&id).unwrap().sticky = false;
+        engine
+            .update_monitor("main", viewport, NativeSpaceId(3), false)
+            .unwrap();
+        assert!(!inactive_window(&engine, &geometry, id));
+    }
+
+    #[test]
     fn inventory_does_not_adopt_geometry_sampled_before_a_completed_ax_write() {
         let (request, requests) = mpsc::sync_channel(1);
         let (results, result) = mpsc::channel();
@@ -1286,6 +1400,7 @@ mod tests {
                 width: 729.0,
                 height: 900.0,
             },
+            surface_bounds: None,
             native_spaces: vec![NativeSpaceId(3)],
             sticky: false,
             sticky_known: true,

@@ -36,6 +36,9 @@ pub struct Window {
     pub layer: i32,
     pub onscreen: bool,
     pub bounds: Rect,
+    /// Untransformed surface geometry; presentation bounds can be clipped/scaled.
+    #[serde(default)]
+    pub surface_bounds: Option<Rect>,
     pub native_spaces: Vec<NativeSpaceId>,
     #[serde(default)]
     pub sticky: bool,
@@ -75,6 +78,7 @@ unsafe extern "C" {
     fn ribbon_forget_window(wid: u32);
     fn ribbon_pointer(x: *mut f64, y: *mut f64);
     fn ribbon_left_mouse_down() -> i32;
+    fn ribbon_left_mouse_down_age() -> f64;
     fn ribbon_watch_application(pid: i32) -> i32;
     fn ribbon_unwatch_application(pid: i32);
     fn ribbon_events() -> u32;
@@ -114,6 +118,7 @@ pub struct EventSource(std::marker::PhantomData<std::rc::Rc<()>>);
 pub struct ClosedWindow {
     pub wid: u32,
     pub pid: i32,
+    pub withdrawn: i32,
 }
 impl EventSource {
     pub const WINDOWS: u32 = 1;
@@ -181,6 +186,10 @@ pub fn pointer() -> (f64, f64) {
 pub fn left_mouse_down() -> bool {
     // SAFETY: read-only global button state; no app UI or input injection.
     unsafe { ribbon_left_mouse_down() != 0 }
+}
+pub fn left_mouse_down_age() -> f64 {
+    // SAFETY: value-only query of the combined session's last button event.
+    unsafe { ribbon_left_mouse_down_age() }
 }
 pub fn resize_window(id: WindowId, pid: i32, logical_frame: Rect) -> Result<()> {
     if !logical_frame.valid() {

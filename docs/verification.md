@@ -89,6 +89,28 @@ a grant are not used.
 
 ## Known limits
 
+The Space-retention regression uses four selected, owned Alacritty windows and
+one unmanaged owned app. The previous installed release reproducibly changed a
+manual scroll position from 1130 to -24 after native activation returned from
+the unmanaged app. With that assertion skipped to isolate Space behavior, its
+cached source Space lost all four columns while on the adjacent desktop. The
+updated daemon passed three real native Space round trips with reordered
+columns, preserved widths and manual offsets, plus unmanaged-app return and a
+real click that still reveals its selected column. Testing is on one built-in
+display and desktop Spaces; this is not full arbitrary-app or fullscreen proof.
+
+Disappearance from CG inventory is no longer sufficient to discard a window
+still owned in WindowServer. AX withdrawal records are distinguished from
+destruction and ignored for inactive contexts, retaining the observer identity
+until Rust actually forgets the window. Current native contexts are adopted
+before closure/focus processing, and asynchronous snapshots from the old context
+are rejected. Resize adoption uses untransformed SkyLight surface bounds instead
+of presentation bounds. Automatically observed focus preserves viewport and
+manual-centering bounds; recent clicks inside the selected clip and explicit WM
+commands can reveal it. App-internal keyboard focus changes update selection
+without automatic viewport reveal. The two new policy regressions bring the
+Rust suite to 64 tests.
+
 The optional gesture implementation has 61 passing Rust tests, including touch
 identity reordering, staggered finger lift, exact optional modifier matching,
 horizontal/vertical intent, duplicate-stream suppression, native momentum,

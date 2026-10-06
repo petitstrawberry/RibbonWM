@@ -12,6 +12,7 @@ static CGError (*axWindowId)(AXUIElementRef,uint32_t *);
 static NSMutableDictionary<NSNumber *,NSDictionary *> *windowCache;
 static CGError (*windowOwner)(int,uint32_t,int *);
 static CGError (*connectionPID)(int,pid_t *);
+static CGError (*surfaceBounds)(int,uint32_t,CGRect *);
 static RibbonStickyAPI stickyAPI;
 static bool hasStickyAPI;
 // Behavior reference: yabai's AX_ENHANCED_UI_WORKAROUND. Preserve the owner's
@@ -45,6 +46,7 @@ static void resolve(void) {
         spaceType=dlsym(h,"SLSSpaceGetType");windowSpaces=dlsym(h,"SLSCopySpacesForWindows");
         axWindowId=dlsym(RTLD_DEFAULT,"_AXUIElementGetWindow");
         windowOwner=dlsym(h,"SLSGetWindowOwner");connectionPID=dlsym(h,"SLSConnectionGetPID");
+        surfaceBounds=dlsym(h,"SLSGetWindowBounds");
         hasStickyAPI=loadStickyAPI(&stickyAPI);
     });
 }
@@ -97,10 +99,12 @@ char *ribbon_query_json(int kind) { @autoreleasepool {
             CFArrayRef spaces=connection&&windowSpaces?windowSpaces(connection(),7,(__bridge CFArrayRef)@[@(wid)]):NULL;
             bool sticky=false;
             bool stickyKnown=hasStickyAPI&&connection&&readSticky(&stickyAPI,connection(),wid,&sticky);
+            CGRect surface;
+            id physical=surfaceBounds&&connection&&!surfaceBounds(connection(),wid,&surface)?rectJSON(surface):(id)NSNull.null;
             [rows addObject:@{@"id":@(wid),@"pid":w[(id)kCGWindowOwnerPID]?:@0,@"app":w[(id)kCGWindowOwnerName]?:@"",
                 @"title":w[(id)kCGWindowName]?:@"",@"layer":w[(id)kCGWindowLayer]?:@0,@"onscreen":[w[(id)kCGWindowIsOnscreen] boolValue]?@YES:@NO,
                 @"bundle_id":bundle,
-                @"bounds":rectJSON(b),@"native_spaces":spaces?(__bridge NSArray *)spaces:@[],
+                @"bounds":rectJSON(b),@"surface_bounds":physical,@"native_spaces":spaces?(__bridge NSArray *)spaces:@[],
                 @"sticky":@(sticky),@"sticky_known":@(stickyKnown)}];
             if(spaces)CFRelease(spaces);
         }
@@ -398,10 +402,14 @@ int ribbon_window_owner(uint32_t wid) { @autoreleasepool {
 } }
 void ribbon_forget_window(uint32_t wid) { @autoreleasepool {
     resolve();[windowCache removeObjectForKey:@(wid)];
+    ribbon_forget_watched_window(wid);
 } }
 void ribbon_pointer(double *x,double *y) {
     CGEventRef e=CGEventCreate(NULL);CGPoint p=CGEventGetLocation(e);*x=p.x;*y=p.y;CFRelease(e);
 }
 int ribbon_left_mouse_down(void) {
     return CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState,kCGMouseButtonLeft);
+}
+double ribbon_left_mouse_down_age(void) {
+    return CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateCombinedSessionState,kCGEventLeftMouseDown);
 }
