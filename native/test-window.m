@@ -105,6 +105,7 @@ static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
             styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskResizable
             backing:NSBackingStoreBuffered defer:NO];
         panel.title=@"RibbonWM QA created";panel.hidesOnDeactivate=NO;
+        panel.releasedWhenClosed=NO;panel.animationBehavior=NSWindowAnimationBehaviorNone;
         panel.collectionBehavior=NSWindowCollectionBehaviorMoveToActiveSpace;
         [panel orderFrontRegardless];[self.backdrops addObject:panel];
         reply(@{@"created":@(panel.windowNumber)});return;
@@ -148,6 +149,7 @@ static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
     Class kind=[self.configuration[@"geometry_test"] boolValue]?GeometryWindow.class:TestPanel.class;
     self.target=[[kind alloc] initWithContentRect:NSMakeRect([origin[@"x"] doubleValue],height-[origin[@"y"] doubleValue]-400,400,400) styleMask:style backing:NSBackingStoreBuffered defer:NO];
     self.target.title=@"RibbonWM QA geometry";
+    self.target.releasedWhenClosed=NO;self.target.animationBehavior=NSWindowAnimationBehaviorNone;
     self.target.level=[self.configuration[@"geometry_test"] boolValue]?NSNormalWindowLevel:NSFloatingWindowLevel;
     self.target.hidesOnDeactivate=NO;self.target.hasShadow=[self.configuration[@"shadow"] boolValue];
     self.target.collectionBehavior=NSWindowCollectionBehaviorMoveToActiveSpace;
@@ -172,6 +174,33 @@ static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
 }
 @end
 int main(int argc,char **argv) {@autoreleasepool {
+    if(argc==5&&!strcmp(argv[1],"--sample-surface")) {
+        uint32_t wid=(uint32_t)strtoul(argv[2],NULL,10);int pid=atoi(argv[3]);
+        double seconds=strtod(argv[4],NULL);if(!wid||pid<=0||!isfinite(seconds)||seconds<=0||seconds>10)return 1;
+        BOOL own=NO;CFArrayRef list=CGWindowListCopyWindowInfo(kCGWindowListOptionAll,kCGNullWindowID);
+        for(NSDictionary *row in (__bridge NSArray *)list)if([row[(id)kCGWindowNumber] unsignedIntValue]==wid&&
+            [row[(id)kCGWindowOwnerPID] intValue]==pid&&[row[(id)kCGWindowName] hasPrefix:@"RibbonWM QA "])own=YES;
+        if(list)CFRelease(list);if(!own)return 1;
+        SkyLight sky;if(!loadSkyLight(&sky))return 1;
+        NSMutableArray *samples=[NSMutableArray array];double until=ribbon_input_time()+seconds;
+        reply(@{@"sampling":@YES});
+        while(ribbon_input_time()<until) {
+            if(ribbon_window_owner(wid)!=pid)return 1;
+            [samples addObject:windowState(sky,wid)];usleep(5000);
+        }
+        reply(@{@"samples":samples});return 0;
+    }
+    if(argc==2&&!strcmp(argv[1],"--gesture-ready")) {
+        ribbon_probe_show("実ウィンドウでOption＋2本指スクロールを試します\n\n「計測開始」を押すと、検証用端末5枚を\n並べて管理を開始します。\n他のアプリは管理しません。\n\n開始後は5分間試せます。\nボタンを押すまで待機します。");
+        double until=ribbon_input_time()+600;
+        while(ribbon_input_time()<until) {
+            uint32_t action=ribbon_probe_action();
+            if(action&2){ribbon_probe_close();return 2;}
+            if(action&1){ribbon_probe_close();reply(@{@"start":@YES});return 0;}
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode,0.01,true);
+        }
+        ribbon_probe_close();return 2;
+    }
     if(argc==4&&!strcmp(argv[1],"--read-geometry")) {
         uint32_t wid=(uint32_t)strtoul(argv[2],NULL,10);int pid=atoi(argv[3]);
         NSRunningApplication *app=[NSRunningApplication runningApplicationWithProcessIdentifier:pid];
@@ -194,12 +223,13 @@ int main(int argc,char **argv) {@autoreleasepool {
     // External focus event for QA: only the explicitly named disposable
     // Alacritty window is eligible, never a user's ordinary terminal or Codex.
     if((argc==4&&(strcmp(argv[1],"--focus-fixture")==0||strcmp(argv[1],"--click-fixture")==0||strcmp(argv[1],"--geometry-fixture")==0))||
-       (argc==6&&(strcmp(argv[1],"--resize-fixture")==0||strcmp(argv[1],"--drag-fixture")==0||strcmp(argv[1],"--move-drag-fixture")==0))||
+       (argc==6&&(strcmp(argv[1],"--resize-fixture")==0||strcmp(argv[1],"--drag-fixture")==0||strcmp(argv[1],"--move-drag-fixture")==0||strcmp(argv[1],"--scroll-fixture")==0))||
        (argc==8&&strcmp(argv[1],"--restore-fixture")==0)) {
         BOOL click=strcmp(argv[1],"--click-fixture")==0;
         BOOL resize=strcmp(argv[1],"--resize-fixture")==0;
         BOOL moveDrag=strcmp(argv[1],"--move-drag-fixture")==0;
         BOOL drag=strcmp(argv[1],"--drag-fixture")==0||moveDrag;
+        BOOL scroll=strcmp(argv[1],"--scroll-fixture")==0;
         BOOL geometry=strcmp(argv[1],"--geometry-fixture")==0;
         BOOL restore=strcmp(argv[1],"--restore-fixture")==0;
         char *end=NULL;unsigned long wid=strtoul(argv[2],&end,10);
@@ -217,7 +247,7 @@ int main(int argc,char **argv) {@autoreleasepool {
         for(NSDictionary *row in (__bridge NSArray *)list) {
             if([row[(id)kCGWindowNumber] unsignedIntValue]==wid&&[row[(id)kCGWindowOwnerPID] intValue]==pid&&
                 [row[(id)kCGWindowName] hasPrefix:@"RibbonWM QA "]&&
-                (!(click||drag)||[row[(id)kCGWindowIsOnscreen] boolValue])) {fixture=YES;break;}
+                (!(click||drag||scroll)||[row[(id)kCGWindowIsOnscreen] boolValue])) {fixture=YES;break;}
         }
         if(list)CFRelease(list);
         if(!fixture){reply(@{@"error":@"Not a named fixture window"});return 1;}
@@ -241,7 +271,7 @@ int main(int argc,char **argv) {@autoreleasepool {
             int result=ribbon_resize_window((uint32_t)wid,(int)pid,(RibbonRect){frame.origin.x,frame.origin.y,width,height});
             reply(@{@"resize_error":@(result),@"state":windowState(sky,(uint32_t)wid)});return result?1:0;
         }
-        if(click||drag) {
+        if(click||drag||scroll) {
             SkyLight sky;if(!loadSkyLight(&sky))return 1;
             NSDictionary *state=windowState(sky,(uint32_t)wid);
             NSArray *t=state[@"transform"],*clip=state[@"clip_bounds"];
@@ -252,6 +282,25 @@ int main(int argc,char **argv) {@autoreleasepool {
             // do not activate it first, so this exercises OS-driven focus.
             CGPoint point=CGPointMake(-[t[4] doubleValue]+[clip[0] doubleValue]+[clip[2] doubleValue]/2,
                                       -[t[5] doubleValue]+[clip[1] doubleValue]+[clip[3] doubleValue]/2);
+            if(scroll) {
+                long direct=strtol(argv[4],&end,10);if(*end||labs(direct)>1000)return 1;
+                long tail=strtol(argv[5],&end,10);if(*end||labs(tail)>1000)return 1;
+                if(ribbon_focused_window((int)pid)!=wid)return 1;
+                CGEventRef move=CGEventCreateMouseEvent(NULL,kCGEventMouseMoved,point,kCGMouseButtonLeft);
+                CGEventPost(kCGHIDEventTap,move);CFRelease(move);usleep(100000);
+                int phases[]={kCGScrollPhaseBegan,kCGScrollPhaseEnded,0,0};
+                int momenta[]={0,0,kCGMomentumScrollPhaseBegin,kCGMomentumScrollPhaseEnd};
+                long deltas[]={direct,0,tail,0};
+                for(int i=0;i<4;i++) {
+                    CGEventRef event=CGEventCreateScrollWheelEvent(NULL,kCGScrollEventUnitPixel,2,0,(int32_t)deltas[i]);
+                    CGEventSetLocation(event,point);CGEventSetFlags(event,i==0?kCGEventFlagMaskAlternate:0);
+                    CGEventSetIntegerValueField(event,kCGScrollWheelEventIsContinuous,1);
+                    CGEventSetIntegerValueField(event,kCGScrollWheelEventScrollPhase,phases[i]);
+                    CGEventSetIntegerValueField(event,kCGScrollWheelEventMomentumPhase,momenta[i]);
+                    CGEventPost(kCGHIDEventTap,event);CFRelease(event);usleep(80000);
+                }
+                reply(@{@"posted_scroll":@(direct),@"posted_momentum":@(tail)});return 0;
+            }
             double dx=0;
             if(drag) {
                 dx=strtod(argv[4],&end);if(*end||!isfinite(dx)||fabs(dx)>200||strcmp(argv[5],"0")!=0)return 1;

@@ -1,5 +1,12 @@
 fn main() {
-    for file in ["demo.m", "query.m", "events.m", "bridge.h", "skylight.h"] {
+    for file in [
+        "demo.m",
+        "query.m",
+        "events.m",
+        "input.m",
+        "bridge.h",
+        "skylight.h",
+    ] {
         println!("cargo:rerun-if-changed=../../native/{file}");
     }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
@@ -20,6 +27,7 @@ fn main() {
             "../../native/demo.m",
             "../../native/query.m",
             "../../native/events.m",
+            "../../native/input.m",
         ])
         .flag("-fobjc-arc")
         .flag("-Wno-deprecated-declarations")

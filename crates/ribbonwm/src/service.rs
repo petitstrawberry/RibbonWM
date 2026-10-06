@@ -59,6 +59,10 @@ pub fn run(user: String, config: PathBuf, exclude_apps: Vec<String>) -> Result<(
         eprintln!("Requesting Accessibility permission from macOS");
         ribbon_macos::request_accessibility_permission();
     }
+    if settings.gesture_scroll && !ribbon_macos::input::trusted() {
+        eprintln!("Requesting Input Monitoring permission for configured gestures");
+        ribbon_macos::input::request_permission();
+    }
     loop {
         let accessibility = ribbon_macos::accessibility_trusted();
         let status = ribbon_macos::backend::Backend::connect().and_then(|b| b.status());

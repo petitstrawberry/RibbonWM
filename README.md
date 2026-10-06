@@ -97,6 +97,53 @@ modules = [
 ログは `~/Library/Logs/RibbonWM/wm.log` と `/var/log/ribbonwm-backend.log`。
 `ribbonwm quit` は正常終了し、そのまま停止します。異常終了はlaunchdが再起動します。
 
+## トラックパッドの横スクロール（実験的）
+
+Nix の `services.ribbonwm.settings` または TOML で設定します。
+修飾キーを省略するとキーなしです。標準では無効で、指の本数は3本です。
+
+```toml
+gesture_scroll = true
+gesture_fingers = 2        # 2 / 3 / 4
+gesture_modifier = "alt"   # 推奨: Option＋2本指。alt / ctrl / super / shift
+gesture_sensitivity = 1.0 # 0.1〜5.0
+gesture_reverse = false
+gesture_momentum = true
+```
+
+通常のアプリの横スクロールと競合させないため、Option＋2本指を推奨します。
+修飾キーは開始時に判定し、指やキーを離した後のmacOSの慣性も同じスクロールへ
+引き継ぎます。キーなしにする場合は `gesture_modifier` を省略してください。
+
+2本指モードはmacOSの精密スクロールイベントを使います。イベントに指の本数は
+入らないため、Magic Mouse等の同じ精密スクロール形式も対象になります。
+3・4本指モードはタッチのidentityを追跡し、指が動いている間は直接追従します。
+横方向の意図が確定するまでは入力を通し、縦方向・指定外の本数・通常のホイールは
+通します。開始したモニターとSpaceを固定し、Space変更・画面構成変更・
+マウスドラッグで中断します。除外アプリが前面の間とネイティブ全画面では無効です。
+
+慣性はmacOSの `NSEvent.momentumPhase` が届いた場合だけ使い、独自の減速を
+重ねません。手元の3本指計測では慣性イベントが届かず、2本指では届きました。
+4本指は未確認です。
+届かなければ指を離した時点で止まります。無効にした場合は捕捉した慣性を
+アプリへ漏らさず捨てます。
+
+同じ指の本数をSpacesの横移動にも割り当てると競合します。例えばRibbonWMを
+3本、macOSの「フルスクリーンアプリケーション間をスワイプ」を4本に分けます。
+OS側の設定は自動変更しません。2本指モードはアプリの横スクロール／ページ移動と
+競合し得ます。縦のMission ControlやSpacesとの共存も物理ジェスチャーでの確認が必要です。
+
+有効にしたサービスはプログラムから「入力監視」の許可を要求します。
+未許可でもキーボード操作によるWMは起動し、許可後にジェスチャーだけ再試行します。
+明示的な要求は `ribbonwm request-permissions --input-monitoring`、状態は `doctor`。
+設定変更はサービス再起動で反映します。
+
+`ribbonwm gesture-monitor --seconds 30 --fingers 2` は主画面へ計測ウィンドウを出します。
+「計測開始」を押してから記録し、結果は閉じるまで表示します。入力を消費せず、
+配置も変えずにtouch / scroll のphase、momentum、接触数、横スクロール判定を
+JSON行で記録します。`--fingers 3` / `4` も指定できます。
+これは3・4本指でネイティブ慣性が届くかを調べるための観測用コマンドです。
+
 ## 手動live起動
 
 既存WMを停止して、バックエンドをロードします。初回はsudo認証が必要です。

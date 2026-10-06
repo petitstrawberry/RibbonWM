@@ -31,7 +31,7 @@
             relative = pkgs.lib.removePrefix "${toString ./.}/" (toString path);
           in toString path == toString ./.
             || builtins.elem relative [ "Cargo.toml" "Cargo.lock" "LICENSE" "crates" "native"
-              "native/demo.m" "native/query.m" "native/events.m" "native/bridge.h" "native/skylight.h"
+              "native/demo.m" "native/query.m" "native/events.m" "native/input.m" "native/bridge.h" "native/skylight.h"
               "native/Makefile" "native/payload.m" "native/loader.m"
               "native/vendor" "native/vendor/yabai-LICENSE.txt" "scripts"
               "scripts/backend-service.py" ]

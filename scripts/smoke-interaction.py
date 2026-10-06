@@ -27,10 +27,16 @@ def cli(*args):
 
 def main(alacritty):
     assert os.environ.get("IN_NIX_SHELL")
-    assert cli("status")["mode"] == "live"
+    isolated = "--isolated" in sys.argv[2:]
+    if isolated:
+        assert not Path(f"/tmp/ribbonwm-{os.getuid()}/wm.sock").exists()
+        assert cli("backend-status")["controlled"] == 0
+    else:
+        assert cli("status")["mode"] == "live"
     displays = cli("displays")
     primary = next(d for d in displays if d["primary"])
     processes = []
+    daemon = None
 
     def wait(predicate, timeout=8):
         deadline = time.monotonic() + timeout
@@ -47,6 +53,7 @@ def main(alacritty):
 
     with tempfile.TemporaryDirectory(prefix="ribbon-interaction-") as temporary:
         def spawn(display, index):
+            nonlocal daemon
             x = round((display["viewport"]["x"] + 100) * display["scale"])
             y = round((display["viewport"]["y"] + 100) * display["scale"])
             p = subprocess.Popen([alacritty, "--title", f"RibbonWM QA Interaction {index}",
@@ -56,8 +63,24 @@ def main(alacritty):
                                   "--terminal-child", str(index), str(Path(temporary) / f"input-{index}.json")],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             processes.append(p)
+            if isolated:
+                def discovered():
+                    return next((w for w in cli("windows") if w["pid"] == p.pid and w["onscreen"]
+                                 and w["layer"] == 0 and w["title"].startswith("RibbonWM QA Interaction ")), None)
+                own = wait(discovered)
+                config = Path(temporary) / "config.toml"
+                config.write_text("padding_top=24.0\npadding_bottom=24.0\npadding_left=24.0\npadding_right=24.0\n"
+                                  "gap=6.0\npreserve_window_width=true\ncenter_content=true\nframe_rate=120\n")
+                with open(ROOT / "docs/interaction-daemon.txt", "w") as log:
+                    daemon = subprocess.Popen([str(ROOT / "target/debug/ribbonwm"), "run", "--windows", str(own["id"]),
+                                               "--config", str(config), "--exclude-app", "com.openai.*",
+                                               "--exclude-app", "ChatGPT*", "--exclude-app", "com.apple.systempreferences"],
+                                              stdout=log, stderr=log)
             def enrolled():
-                managed = cli("status")["original_geometry"]
+                try:
+                    managed = cli("status")["original_geometry"]
+                except RuntimeError:
+                    return None
                 return next((w for w in cli("windows") if w["pid"] == p.pid and w["onscreen"] and w["layer"] == 0
                              and w["title"].startswith("RibbonWM QA ") and str(w["id"]) in managed), None)
             window = wait(enrolled)
@@ -94,16 +117,33 @@ def main(alacritty):
             print("PASS: actual title-bar drag advances throughout the hold without WM snapping it back:", positions, flush=True)
             wait(lambda: abs(-inspect(a)["transform"][4] - next(
                 p["frame"]["x"] for p in cli("status")["placements"] if p["window"] == a)) < 2)
+            sampler = subprocess.Popen([str(HELPER), "--sample-surface", str(a), str(pa.pid), "1.5"],
+                                       stdout=subprocess.PIPE, text=True)
+            assert json.loads(sampler.stdout.readline())["sampling"]
+            for width in (700, 850, 650):
+                cli("--monitor", primary["id"], "resize", str(width))
+                wait(lambda: abs(inspect(a)["frame"]["width"] - width) < 2)
+            samples = json.loads(sampler.stdout.readline())["samples"]
+            sampler.wait(timeout=3)
+            assert all(s["clip_error"] == 0 and s["clip_bounds"][2] > 0 and s["clip_bounds"][3] > 0 for s in samples)
+            print(f"PASS: three commanded resizes retain visible drawing/input clips ({len(samples)} samples)", flush=True)
             queried = cli("-m", "query", "--displays")
             assert next(d for d in queried if d["uuid"] == primary["id"])["has-focus"]
             print("PASS: display query matches native focus", flush=True)
         finally:
+            if isolated and daemon and daemon.poll() is None:
+                cli("quit")
+                daemon.wait(timeout=8)
             for p in processes:
                 if p.poll() is None:
                     p.terminate()
                     p.wait(timeout=5)
-        wait(lambda: str(a) not in cli("status")["original_geometry"])
-        print("PASS: interaction fixture closed; live WM remains running", flush=True)
+        if isolated:
+            assert cli("backend-status")["controlled"] == 0
+            print("PASS: isolated interaction test restores geometry and releases all leases", flush=True)
+        else:
+            wait(lambda: str(a) not in cli("status")["original_geometry"])
+            print("PASS: interaction fixture closed; live WM remains running", flush=True)
 
 
 if __name__ == "__main__":

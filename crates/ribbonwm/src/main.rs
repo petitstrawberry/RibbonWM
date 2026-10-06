@@ -50,7 +50,17 @@ enum Command {
     /// Permission, display context and optional Dock backend diagnostics. Does not prompt.
     Doctor,
     /// Ask macOS for Accessibility permission for this process. Approval is asynchronous.
-    RequestPermissions,
+    RequestPermissions {
+        #[arg(long, help = "Also request Input Monitoring for trackpad gestures")]
+        input_monitoring: bool,
+    },
+    /// Observe trackpad packets without consuming gestures or moving windows.
+    GestureMonitor {
+        #[arg(long, default_value_t = 15.0)]
+        seconds: f64,
+        #[arg(long, default_value_t = 3)]
+        fingers: u32,
+    },
     /// Inspect all WindowServer windows. Titles may be empty without Screen Recording.
     Windows,
     /// Running regular apps, without querying Accessibility elements.
@@ -162,6 +172,7 @@ fn doctor() -> Result<()> {
     print(
         json!({"name":"RibbonWM","version":env!("CARGO_PKG_VERSION"),"executable":std::env::current_exe()?,
         "expected_backend":ribbon_macos::backend::expected_build()?,"accessibility":ribbon_macos::accessibility_trusted(),
+        "input_monitoring":ribbon_macos::input::trusted(),
         "displays":ribbon_macos::displays()?,"backend":backend,
         "workspace_policy":"one horizontal scroll layout per native macOS Space and monitor",
         "live_verification":"See docs/verification.md for actual runtime coverage"}),
@@ -196,16 +207,25 @@ fn execute(cli: Cli) -> Result<()> {
             })?);
         }
         Command::Doctor => return doctor(),
-        Command::RequestPermissions => {
+        Command::GestureMonitor { seconds, fingers } => {
+            return ribbon_macos::input::monitor(seconds, fingers);
+        }
+        Command::RequestPermissions { input_monitoring } => {
             let requested = !ribbon_macos::accessibility_trusted();
             let accessibility = if requested {
                 ribbon_macos::request_accessibility_permission()
             } else {
                 true
             };
+            let input_requested = input_monitoring && !ribbon_macos::input::trusted();
+            if input_requested {
+                ribbon_macos::input::request_permission();
+            }
             return print(json!({
                 "accessibility": accessibility,
                 "prompt_requested": requested,
+                "input_monitoring": ribbon_macos::input::trusted(),
+                "input_prompt_requested": input_requested,
                 "executable": std::env::current_exe()?,
             }));
         }

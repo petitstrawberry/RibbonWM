@@ -61,6 +61,25 @@ pub enum AnimationCurve {
     EaseOut,
     EaseInOut,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollModifier {
+    #[default]
+    Alt,
+    Ctrl,
+    Super,
+    Shift,
+}
+impl ScrollModifier {
+    pub fn event_mask(self) -> u64 {
+        match self {
+            Self::Alt => 1 << 19,
+            Self::Ctrl => 1 << 18,
+            Self::Super => 1 << 20,
+            Self::Shift => 1 << 17,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -72,6 +91,12 @@ pub struct Settings {
     pub animation_curve: AnimationCurve,
     pub animation_duration: f64,
     pub cycle_width_ratios: Vec<f64>,
+    pub gesture_scroll: bool,
+    pub gesture_modifier: Option<ScrollModifier>,
+    pub gesture_fingers: u32,
+    pub gesture_sensitivity: f64,
+    pub gesture_reverse: bool,
+    pub gesture_momentum: bool,
     pub frame_rate: u32,
     pub horizontal_margin: f64,
     pub vertical_margin: f64,
@@ -92,6 +117,12 @@ impl Default for Settings {
             animation_curve: AnimationCurve::Spring,
             animation_duration: 0.25,
             cycle_width_ratios: vec![0.5, 2.0 / 3.0, 1.0],
+            gesture_scroll: false,
+            gesture_modifier: None,
+            gesture_fingers: 3,
+            gesture_sensitivity: 1.0,
+            gesture_reverse: false,
+            gesture_momentum: true,
             frame_rate: 60,
             horizontal_margin: 0.0,
             vertical_margin: 0.0,
@@ -121,6 +152,9 @@ impl Settings {
                 .iter()
                 .any(|r| !r.is_finite() || !(0.01..=1.0).contains(r))
             || self.cycle_width_ratios.windows(2).any(|w| w[0] >= w[1])
+            || !self.gesture_sensitivity.is_finite()
+            || !(0.1..=5.0).contains(&self.gesture_sensitivity)
+            || !(2..=4).contains(&self.gesture_fingers)
             || !(1..=240).contains(&self.frame_rate)
             || !self.horizontal_margin.is_finite()
             || !(0.0..=200.0).contains(&self.horizontal_margin)

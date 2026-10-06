@@ -115,6 +115,11 @@ int ribbon_ax_request_permission(void) { @autoreleasepool {
     NSDictionary *options=@{(__bridge NSString *)kAXTrustedCheckOptionPrompt:@YES};
     return AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
 } }
+uint32_t ribbon_ax_window_id(const void *element) {
+    resolve();uint32_t wid=0;
+    if(axWindowId&&element&&!axWindowId((AXUIElementRef)element,&wid))return wid;
+    return 0;
+}
 static AXUIElementRef findAXWindow(uint32_t wid,int expected_pid,pid_t *pid) {
     resolve();if(!axWindowId)return NULL;
     // IncludingWindow alone omits windows on an inactive native Space. Resolve
@@ -159,7 +164,7 @@ int ribbon_window_geometry(uint32_t wid,int expected_pid,RibbonRect *rect) { @au
     if(!window)return kAXErrorInvalidUIElement;
     AXError error=axGeometry(window,rect);CFRelease(window);return error;
 } }
-static int settleWindow(AXUIElementRef window,uint32_t wid,RibbonRect rect,RibbonRect outer,BOOL exactPosition) {
+static int settleWindow(AXUIElementRef window,uint32_t wid,RibbonRect rect,RibbonRect outer,BOOL exactPosition,RibbonGeometryProgress progress,void *context) {
     // AX replies can precede the owner's WindowServer move transaction. That
     // transaction translates the current transform relatively: resetting the
     // compositor before it arrives would apply the original offset twice.
@@ -167,6 +172,7 @@ static int settleWindow(AXUIElementRef window,uint32_t wid,RibbonRect rect,Ribbo
     double deadline=NSProcessInfo.processInfo.systemUptime+0.5,stable=0;
     CGAffineTransform previous={0};BOOL havePrevious=NO;
     do {
+        if(progress&&progress(context))return kAXErrorFailure;
         CGRect bounds;CGAffineTransform transform;
         CGError eb=sky.getBounds(sky.connection(),wid,&bounds),et=sky.getTransform(sky.connection(),wid,&transform);
         if(eb||et)return kAXErrorCannotComplete;
@@ -199,9 +205,10 @@ static int settleWindow(AXUIElementRef window,uint32_t wid,RibbonRect rect,Ribbo
         wid,rect.x,rect.y,rect.width,rect.height,finalBounds.origin.x,finalBounds.origin.y,finalBounds.size.width,finalBounds.size.height);
     return kAXErrorCannotComplete;
 }
-static AXError acceptedSize(AXUIElementRef window,CGSize expected,CGSize *accepted) {
+static AXError acceptedSize(AXUIElementRef window,CGSize expected,CGSize *accepted,RibbonGeometryProgress progress,void *context) {
     double deadline=NSProcessInfo.processInfo.systemUptime+0.25;
     for(;;) {
+        if(progress&&progress(context))return kAXErrorFailure;
         CFTypeRef actual=NULL;AXError error=AXUIElementCopyAttributeValue(window,kAXSizeAttribute,&actual);
         if(!error&&(!actual||!AXValueGetValue(actual,kAXValueCGSizeType,accepted)))error=kAXErrorFailure;
         if(actual)CFRelease(actual);
@@ -211,7 +218,7 @@ static AXError acceptedSize(AXUIElementRef window,CGSize expected,CGSize *accept
         usleep(5000);
     }
 }
-static int resizeWindow(uint32_t wid,int expected_pid,RibbonRect target,BOOL logicalTarget) { @autoreleasepool {
+static int resizeWindow(uint32_t wid,int expected_pid,RibbonRect target,BOOL logicalTarget,RibbonGeometryProgress progress,void *context) { @autoreleasepool {
     pid_t pid=0;AXUIElementRef w=findAXWindow(wid,expected_pid,&pid);if(!w)return kAXErrorInvalidUIElement;
     __attribute__((objc_precise_lifetime)) RibbonAXFrameGuard *guard=[[RibbonAXFrameGuard alloc] initWithPID:pid];
     (void)guard;
@@ -232,11 +239,12 @@ static int resizeWindow(uint32_t wid,int expected_pid,RibbonRect target,BOOL log
     AXError error=0;
     if(fabs(ax.x-position.x)>2||fabs(ax.y-position.y)>2)error=AXUIElementSetAttributeValue(w,kAXPositionAttribute,p);
     CFRelease(p);
+    if(!error&&progress&&progress(context))error=kAXErrorFailure;
     CGSize size=CGSizeMake(rect.width,rect.height);AXValueRef value=AXValueCreate(kAXValueCGSizeType,&size);
     if(!error&&(fabs(ax.width-size.width)>2||fabs(ax.height-size.height)>2))error=AXUIElementSetAttributeValue(w,kAXSizeAttribute,value);
     CFRelease(value);
     CGSize accepted=CGSizeZero;
-    if(!error)error=acceptedSize(w,size,&accepted);
+    if(!error)error=acceptedSize(w,size,&accepted,progress,context);
     double dw=fabs(accepted.width-size.width),dh=fabs(accepted.height-size.height);
     if(error==kAXErrorCannotComplete&&accepted.width>=100&&accepted.height>=100&&dw<=32&&dh<=32&&(dw>2||dh>2)) {
         // Some owners ignore small changes at a maximized edge. Make a bounded
@@ -245,12 +253,13 @@ static int resizeWindow(uint32_t wid,int expected_pid,RibbonRect target,BOOL log
         CGSize inward=CGSizeMake(dw>2?MAX(100,size.width-40):size.width,dh>2?MAX(100,size.height-40):size.height);
         value=AXValueCreate(kAXValueCGSizeType,&inward);
         error=AXUIElementSetAttributeValue(w,kAXSizeAttribute,value);CFRelease(value);
-        if(!error)error=acceptedSize(w,inward,&accepted);
+        if(!error)error=acceptedSize(w,inward,&accepted,progress,context);
         p=AXValueCreate(kAXValueCGPointType,&position);
         if(!error)error=AXUIElementSetAttributeValue(w,kAXPositionAttribute,p);CFRelease(p);
+        if(!error&&progress&&progress(context))error=kAXErrorFailure;
         value=AXValueCreate(kAXValueCGSizeType,&size);
         if(!error)error=AXUIElementSetAttributeValue(w,kAXSizeAttribute,value);CFRelease(value);
-        if(!error)error=acceptedSize(w,size,&accepted);
+        if(!error)error=acceptedSize(w,size,&accepted,progress,context);
     }
     // Position writes can overwrite an owner-side pending resize with its old
     // frame. Re-anchor only after the new size has actually been accepted.
@@ -260,18 +269,21 @@ static int resizeWindow(uint32_t wid,int expected_pid,RibbonRect target,BOOL log
     if(!error&&(fabs(after.x-position.x)>2||fabs(after.y-position.y)>2))error=AXUIElementSetAttributeValue(w,kAXPositionAttribute,p);
     CFRelease(p);
     if(error)fprintf(stderr,"Window %u AX resize failed (%d): requested=(%.1f,%.1f), accepted=(%.1f,%.1f)\n",wid,error,size.width,size.height,accepted.width,accepted.height);
-    if(!error)error=settleWindow(w,wid,rect,outer,NO);
+    if(!error)error=settleWindow(w,wid,rect,outer,NO,progress,context);
     CFRelease(w);return error;
 } }
 int ribbon_resize_window(uint32_t wid,int expected_pid,RibbonRect rect) {
-    int error=resizeWindow(wid,expected_pid,rect,NO);
+    return ribbon_resize_window_observed(wid,expected_pid,rect,NULL,NULL);
+}
+int ribbon_resize_window_observed(uint32_t wid,int expected_pid,RibbonRect rect,RibbonGeometryProgress progress,void *context) {
+    int error=resizeWindow(wid,expected_pid,rect,NO,progress,context);
     // Owner-side chrome can change its inset during the first resize. Measure
     // it again once; a genuine minimum-size refusal still remains an error.
-    if(error==kAXErrorCannotComplete)error=resizeWindow(wid,expected_pid,rect,NO);
+    if(error==kAXErrorCannotComplete)error=resizeWindow(wid,expected_pid,rect,NO,progress,context);
     return error;
 }
 int ribbon_restore_window(uint32_t wid,int expected_pid,RibbonRect rect) { @autoreleasepool {
-    int resized=resizeWindow(wid,expected_pid,rect,YES);if(resized)return resized;
+    int resized=resizeWindow(wid,expected_pid,rect,YES,NULL,NULL);if(resized)return resized;
     pid_t pid=0;AXUIElementRef w=findAXWindow(wid,expected_pid,&pid);if(!w)return kAXErrorInvalidUIElement;
     // Reapply the exact original position only after the size has settled, so
     // AppKit doesn't constrain it against the larger managed size.
@@ -282,7 +294,7 @@ int ribbon_restore_window(uint32_t wid,int expected_pid,RibbonRect rect) { @auto
     SkyLight sky;CGRect b=CGRectZero;
     if(!ep&&(!loadSkyLight(&sky)||sky.getBounds(sky.connection(),wid,&b)))ep=kAXErrorFailure;
     RibbonRect outer={b.origin.x,b.origin.y,b.size.width,b.size.height};
-    CFRelease(p);if(!ep)ep=settleWindow(w,wid,rect,outer,YES);
+    CFRelease(p);if(!ep)ep=settleWindow(w,wid,rect,outer,YES,NULL,NULL);
     CFRelease(w);return ep;
 } }
 int ribbon_focus_window(uint32_t wid,int expected_pid) { @autoreleasepool {

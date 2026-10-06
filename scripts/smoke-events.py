@@ -20,7 +20,7 @@ def main():
     assert os.environ.get("IN_NIX_SHELL")
     assert not Path(f"/tmp/ribbonwm-{os.getuid()}/wm.sock").exists()
     fixture = subprocess.Popen([str(HELPER), "--fixture", json.dumps(dict(
-        regular=True, geometry_test=True, target=dict(x=300, y=150), backdrops=[], lifetime=30))],
+        regular=True, geometry_test=True, target=dict(x=300, y=150), backdrops=[], lifetime=120))],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
     daemon = None
 
@@ -71,6 +71,7 @@ def main():
                 daemon = subprocess.Popen(args, stdout=log, stderr=log,
                                           env=dict(os.environ, RIBBONWM_EVENT_TRACE="1"))
                 initial = wait(lambda s: any(p["window"] == wid for p in s["placements"]))
+                monitor = next(p["monitor"] for p in initial["placements"] if p["window"] == wid)
                 height = next(p["frame"]["height"] for p in initial["placements"] if p["window"] == wid)
                 time.sleep(.2)
                 start = time.monotonic()
@@ -92,11 +93,23 @@ def main():
                     assert native["clip_bounds"][3] > 0, native
                 print(f"PASS: new-window enrollment {creation_latency:.3f}s; manual width adoption {resize_latency:.3f}s", flush=True)
                 print("PASS: only owned windows managed; rendered tops stay below the menu bar plus padding", flush=True)
+                # Observe the actual WindowServer clip while a WM-driven resize
+                # waits for AX. The old implementation deliberately blanked it.
+                sampler = subprocess.Popen([str(HELPER), "--sample-surface", str(new), str(pid), "1.5"],
+                                           stdout=subprocess.PIPE, text=True)
+                assert json.loads(sampler.stdout.readline())["sampling"]
+                cli("--monitor", monitor, "resize", "760")
+                observed = json.loads(sampler.stdout.readline())["samples"]
+                sampler.wait(timeout=3)
+                assert sampler.returncode == 0 and len(observed) >= 30
+                assert all(s["clip_error"] == 0 and s["clip_bounds"][2] > 0 and s["clip_bounds"][3] > 0 for s in observed), observed
+                wait(lambda s: any(p["window"] == new and abs(p["frame"]["width"]-760)<2 for p in s["placements"]))
+                print(f"PASS: WM resize remains visible in {len(observed)} WindowServer clip samples", flush=True)
                 assert command("refuse-width", width=500)["refusing"] == 500
                 assert command("close-new").get("closed_new")
                 wait(lambda s: len(s["placements"]) == 1)
-                cli("resize", "500")
-                failed = wait(lambda s: s["window_modes"][str(wid)]["floating"])
+                cli("--monitor", monitor, "resize", "500")
+                failed = wait(lambda s: s["window_modes"].get(str(wid), {}).get("floating"), timeout=15)
                 assert not failed["placements"]
                 assert daemon.poll() is None
                 assert command("new").get("created")

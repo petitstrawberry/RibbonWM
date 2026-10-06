@@ -16,3 +16,11 @@ vertical_margin = 20.0
 # padding_bottom = 20.0
 center_content = true
 preserve_window_width = true
+# Optional horizontal trackpad scrolling; modifier omitted means no key required.
+# Reserve a different finger count for macOS Spaces in System Settings.
+gesture_scroll = false
+gesture_fingers = 3 # 2 = native precise scroll, 3/4 = touch contacts
+# gesture_modifier = "alt" # alt / ctrl / super / shift
+gesture_sensitivity = 1.0
+gesture_reverse = false
+gesture_momentum = true # consume native momentum only; never synthesize it

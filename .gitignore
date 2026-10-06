@@ -11,3 +11,4 @@ __pycache__/
 /docs/*.txt
 /docs/*.png
 /docs/local-verification.md
+docs/*-trace.jsonl

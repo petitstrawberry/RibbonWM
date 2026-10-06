@@ -10,6 +10,8 @@ let
     focus_alignment = "visible";
     animation_curve = "ease_in_out"; animation_duration = 0.25;
     cycle_width_ratios = [ 0.38195 0.5 0.61804 ];
+    gesture_scroll = false; gesture_fingers = 3;
+    gesture_sensitivity = 1.0; gesture_reverse = false; gesture_momentum = true;
   };
   configFile = format.generate "ribbonwm.toml" (defaultSettings // cfg.settings);
 in {

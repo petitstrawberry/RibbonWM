@@ -6,6 +6,7 @@ compile_error!(
 
 pub mod backend;
 pub mod demo;
+pub mod input;
 
 use anyhow::{Context, Result, bail};
 use ribbon_core::{NativeSpaceId, Rect, WindowId};
@@ -54,6 +55,13 @@ unsafe extern "C" {
     fn ribbon_ax_trusted() -> i32;
     fn ribbon_ax_request_permission() -> i32;
     fn ribbon_resize_window(wid: u32, pid: i32, rect: Rect) -> i32;
+    fn ribbon_resize_window_observed(
+        wid: u32,
+        pid: i32,
+        rect: Rect,
+        progress: extern "C" fn(*mut c_void) -> i32,
+        context: *mut c_void,
+    ) -> i32;
     fn ribbon_window_geometry(wid: u32, pid: i32, rect: *mut Rect) -> i32;
     fn ribbon_restore_window(wid: u32, pid: i32, rect: Rect) -> i32;
     fn ribbon_focus_window(wid: u32, pid: i32) -> i32;
@@ -67,6 +75,7 @@ unsafe extern "C" {
     fn ribbon_watch_application(pid: i32) -> i32;
     fn ribbon_unwatch_application(pid: i32);
     fn ribbon_events() -> u32;
+    fn ribbon_take_closed_windows(windows: *mut ClosedWindow, capacity: usize) -> usize;
     fn ribbon_stop_observing();
 }
 
@@ -93,6 +102,12 @@ pub fn applications() -> Result<Vec<Application>> {
 }
 #[derive(Default)]
 pub struct EventSource(std::marker::PhantomData<std::rc::Rc<()>>);
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ClosedWindow {
+    pub wid: u32,
+    pub pid: i32,
+}
 impl EventSource {
     pub const WINDOWS: u32 = 1;
     pub const FOCUS: u32 = 2;
@@ -110,6 +125,12 @@ impl EventSource {
     pub fn drain(&self) -> u32 {
         // SAFETY: bounded main-runloop notification processing, no pointers.
         unsafe { ribbon_events() }
+    }
+    pub fn closed_windows(&self) -> Vec<ClosedWindow> {
+        let mut windows = [ClosedWindow::default(); 256];
+        // SAFETY: native writes at most capacity initialized value-only records.
+        let count = unsafe { ribbon_take_closed_windows(windows.as_mut_ptr(), windows.len()) };
+        windows[..count].to_vec()
     }
 }
 impl Drop for EventSource {
@@ -144,6 +165,62 @@ pub fn resize_window(id: WindowId, pid: i32, logical_frame: Rect) -> Result<()> 
     }
     // SAFETY: native code resolves an AX window by ID; arguments contain no pointers.
     let code = unsafe { ribbon_resize_window(id.0, pid, logical_frame) };
+    if code != 0 {
+        bail!("Accessibility resize for window {} failed ({code})", id.0);
+    }
+    Ok(())
+}
+/// Keep the compositor lease visible while the owner accepts AX geometry.
+/// Native glue reports progress synchronously; the caller owns placement policy.
+pub fn resize_window_observed(
+    id: WindowId,
+    pid: i32,
+    frame: Rect,
+    mut progress: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    if !frame.valid() {
+        bail!("Invalid window dimensions");
+    }
+    struct Progress<'a> {
+        callback: &'a mut dyn FnMut() -> Result<()>,
+        error: Option<anyhow::Error>,
+    }
+    extern "C" fn tick(context: *mut c_void) -> i32 {
+        // SAFETY: native glue invokes this only synchronously with the live
+        // Progress below. A panic must never unwind through Objective-C.
+        let state = unsafe { &mut *context.cast::<Progress<'_>>() };
+        if state.error.is_some() {
+            return 1;
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut state.callback)) {
+            Ok(Ok(())) => 0,
+            Ok(Err(error)) => {
+                state.error = Some(error);
+                1
+            }
+            Err(_) => {
+                state.error = Some(anyhow::anyhow!("Geometry progress callback panicked"));
+                1
+            }
+        }
+    }
+    let mut state = Progress {
+        callback: &mut progress,
+        error: None,
+    };
+    // SAFETY: the callback context lives through this synchronous native call.
+    let code = unsafe {
+        ribbon_resize_window_observed(
+            id.0,
+            pid,
+            frame,
+            tick,
+            (&mut state as *mut Progress<'_>).cast(),
+        )
+    };
+    if let Some(error) = state.error {
+        return Err(error.context("Compositor update during AX resize failed"));
+    }
     if code != 0 {
         bail!("Accessibility resize for window {} failed ({code})", id.0);
     }

@@ -1,7 +1,7 @@
 use crate::ipc::{self, Request, SocketLease};
 use crate::modes::{ModeKind, WindowMode};
 use anyhow::{Context, Result, bail};
-use ribbon_core::{Engine, Placement, Rect, Settings, WindowId};
+use ribbon_core::{Action, Engine, Placement, Rect, Settings, WindowId};
 use ribbon_macos::{
     Display, Window,
     backend::{Backend, StickyWindow},
@@ -164,6 +164,7 @@ fn synchronize(
     options: &Options,
     displays: &[Display],
     sizes: &mut BTreeMap<WindowId, (i32, f64, f64)>,
+    reveal_focus: bool,
 ) -> Result<()> {
     // Only a cached destination has a saved offset; initial discovery should
     // reveal the native active window normally.
@@ -191,7 +192,7 @@ fn synchronize(
             forget_closed(engine, geometry, id)?;
         }
     }
-    observe_native_focus(engine, geometry, options, !context_changed);
+    observe_native_focus(engine, geometry, options, reveal_focus && !context_changed);
     // CG inventories are in stacking order; window IDs give deterministic
     // creation order when several windows arrive between discovery polls.
     inventory.sort_by_key(|w| w.id);
@@ -282,7 +283,7 @@ fn synchronize(
         }
         geometry.originals.insert(w.id, w);
     }
-    observe_native_focus(engine, geometry, options, !context_changed);
+    observe_native_focus(engine, geometry, options, reveal_focus && !context_changed);
     Ok(())
 }
 
@@ -643,7 +644,14 @@ pub fn run(options: Options) -> Result<()> {
     if let Some(source) = &events {
         refresh_observers(source, &mut watching, &options)?;
     }
-    synchronize(&mut engine, &mut geometry, &options, &displays, &mut sizes)?;
+    synchronize(
+        &mut engine,
+        &mut geometry,
+        &options,
+        &displays,
+        &mut sizes,
+        true,
+    )?;
     for requested in &options.selected {
         if !geometry.originals.contains_key(&WindowId(*requested)) {
             bail!(
@@ -664,6 +672,9 @@ pub fn run(options: Options) -> Result<()> {
     let mut last_frame = Vec::new();
     let mut committed: Vec<Placement> = Vec::new();
     let mut quit = false;
+    let mut input = None;
+    let mut last_input_attempt = last_tick - Duration::from_secs(5);
+    let mut gesture_frontmost = (-1, true);
     eprintln!(
         "RibbonWM {}: {} windows; socket {}",
         if options.dry_run { "dry run" } else { "live" },
@@ -672,6 +683,30 @@ pub fn run(options: Options) -> Result<()> {
     );
     'frames: while running.load(Ordering::Relaxed) && !quit {
         let start = Instant::now();
+        if !options.dry_run
+            && engine.settings.gesture_scroll
+            && input.is_none()
+            && start.duration_since(last_input_attempt) >= Duration::from_secs(5)
+        {
+            last_input_attempt = start;
+            if ribbon_macos::input::trusted() {
+                match ribbon_macos::input::InputSource::start(&engine.settings) {
+                    Ok(source) => input = Some(source),
+                    Err(e) => eprintln!("Gestures unavailable: {e:#}"),
+                }
+            } else {
+                eprintln!(
+                    "Gestures waiting for Input Monitoring permission; keyboard WM remains active"
+                );
+            }
+        }
+        if let Some(source) = &mut input {
+            let blocked = gesture_blocked(&options, &mut gesture_frontmost);
+            if let Err(e) = source.update(&engine.settings, gesture_targets(&engine, blocked)) {
+                eprintln!("Gestures suspended: {e:#}");
+                input = None;
+            }
+        }
         // At most eight clients per frame. Each client's total read deadline is bounded.
         for _ in 0..8 {
             match socket.listener.accept() {
@@ -701,6 +736,19 @@ pub fn run(options: Options) -> Result<()> {
             break;
         }
         let notifications = events.as_ref().map_or(0, ribbon_macos::EventSource::drain);
+        if let Some(source) = &events {
+            for closed in source.closed_windows() {
+                let id = WindowId(closed.wid);
+                if geometry
+                    .originals
+                    .get(&id)
+                    .is_some_and(|w| w.pid == closed.pid)
+                {
+                    forget_closed(&mut engine, &mut geometry, id)?;
+                    sizes.remove(&id);
+                }
+            }
+        }
         if event_trace && notifications != 0 {
             eprintln!("Native events: {notifications}");
         }
@@ -742,14 +790,48 @@ pub fn run(options: Options) -> Result<()> {
                 );
             }
             displays = next;
-            synchronize(&mut engine, &mut geometry, &options, &displays, &mut sizes)?;
+            let reveal = !input
+                .as_ref()
+                .is_some_and(ribbon_macos::input::InputSource::active);
+            synchronize(
+                &mut engine,
+                &mut geometry,
+                &options,
+                &displays,
+                &mut sizes,
+                reveal,
+            )?;
             last_inventory = start;
         }
         if notifications & ribbon_macos::EventSource::FOCUS != 0
             || start.duration_since(last_focus) >= Duration::from_millis(100)
         {
-            observe_native_focus(&mut engine, &geometry, &options, true);
+            let reveal = !input
+                .as_ref()
+                .is_some_and(ribbon_macos::input::InputSource::active);
+            observe_native_focus(&mut engine, &geometry, &options, reveal);
             last_focus = start;
+        }
+        if let Some(source) = &mut input {
+            // A native Space notification may have changed targets in this batch.
+            let blocked = gesture_blocked(&options, &mut gesture_frontmost);
+            if let Err(e) = source.update(&engine.settings, gesture_targets(&engine, blocked)) {
+                eprintln!("Gestures suspended: {e:#}");
+                source.cancel();
+            }
+            if ribbon_macos::left_mouse_down() {
+                source.cancel();
+            }
+            for delta in source.drain() {
+                if engine
+                    .monitors
+                    .get(&delta.monitor)
+                    .is_some_and(|m| !m.suspended && m.native_space == delta.space)
+                {
+                    // No focus call, spring or synthesized momentum on this route.
+                    engine.apply(&delta.monitor, &Action::Scroll { delta: delta.delta })?;
+                }
+            }
         }
         // Do not recenter underneath the pointer during a border drag. Keep
         // adopting native sizes, then animate the final target after release.
@@ -818,8 +900,6 @@ pub fn run(options: Options) -> Result<()> {
                         .originals
                         .get(&p.window)
                         .context("Missing original geometry")?;
-                    let needs_resize =
-                        sizes.get(&p.window) != Some(&(w.pid, p.frame.width, p.frame.height));
                     if let Some(previous) = committed
                         .iter()
                         .find(|old| old.window == p.window && old.native_space == p.native_space)
@@ -829,11 +909,6 @@ pub fn run(options: Options) -> Result<()> {
                     } else {
                         p.frame = w.bounds;
                         p.clip = Some(w.bounds);
-                    }
-                    if needs_resize && !dragging {
-                        // AX moves also translate the owner's compositor state.
-                        // Do not expose or hit-test the intermediate surface.
-                        p.clip = None;
                     }
                 }
                 // Also saves originals before AX changes the owner's transform.
@@ -876,10 +951,11 @@ pub fn run(options: Options) -> Result<()> {
                         .get(&p.monitor)
                         .context("Missing monitor")?
                         .viewport;
-                    let resized = ribbon_macos::resize_window(
+                    let resized = ribbon_macos::resize_window_observed(
                         p.window,
                         w.pid,
                         resize_anchor(viewport, w.bounds, size.1, size.2),
+                        || backend.frame_with_sticky(&held, &owners, &sticky_leases(&geometry)),
                     );
                     if let Err(e) = resized {
                         if ribbon_macos::window_owner(p.window) != w.pid {
@@ -955,6 +1031,38 @@ pub fn run(options: Options) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn gesture_blocked(options: &Options, cached: &mut (i32, bool)) -> bool {
+    // Metadata-only exclusion, before AX. Protected apps never become an input
+    // test surface or receive an intercepted gesture through this daemon.
+    let pid = ribbon_macos::frontmost_pid();
+    if cached.0 != pid {
+        *cached = (
+            pid,
+            ribbon_macos::applications().map_or(true, |apps| {
+                apps.iter().any(|a| {
+                    a.pid == pid && identity_excluded(&a.app, &a.bundle_id, &options.exclude_apps)
+                })
+            }),
+        );
+    }
+    cached.1
+}
+fn gesture_targets(engine: &Engine, blocked: bool) -> Vec<ribbon_macos::input::Target> {
+    if blocked || ribbon_macos::left_mouse_down() {
+        return Vec::new();
+    }
+    engine
+        .monitors
+        .values()
+        .filter(|m| !m.suspended && !m.layout().columns.is_empty())
+        .map(|m| ribbon_macos::input::Target {
+            monitor: m.id.clone(),
+            space: m.native_space,
+            viewport: m.viewport,
+        })
+        .collect()
 }
 
 #[cfg(test)]
