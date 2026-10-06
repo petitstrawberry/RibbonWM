@@ -53,6 +53,9 @@ unsafe extern "C" {
     fn ribbon_query_json(kind: i32) -> *mut c_char;
     fn ribbon_free(pointer: *mut c_void);
     fn ribbon_ax_trusted() -> i32;
+    fn ribbon_wait_for_events(seconds: f64);
+    fn ribbon_permission_host_initialize();
+    fn ribbon_owned_probe_accessible(pid: i32) -> i32;
     fn ribbon_ax_request_permission() -> i32;
     fn ribbon_resize_window(wid: u32, pid: i32, rect: Rect) -> i32;
     fn ribbon_resize_window_observed(
@@ -75,7 +78,11 @@ unsafe extern "C" {
     fn ribbon_watch_application(pid: i32) -> i32;
     fn ribbon_unwatch_application(pid: i32);
     fn ribbon_events() -> u32;
-    fn ribbon_take_closed_windows(windows: *mut ClosedWindow, capacity: usize) -> usize;
+    fn ribbon_take_closed_windows(
+        windows: *mut ClosedWindow,
+        capacity: usize,
+        refresh: i32,
+    ) -> usize;
     fn ribbon_stop_observing();
 }
 
@@ -126,10 +133,12 @@ impl EventSource {
         // SAFETY: bounded main-runloop notification processing, no pointers.
         unsafe { ribbon_events() }
     }
-    pub fn closed_windows(&self) -> Vec<ClosedWindow> {
+    pub fn closed_windows(&self, refresh: bool) -> Vec<ClosedWindow> {
         let mut windows = [ClosedWindow::default(); 256];
         // SAFETY: native writes at most capacity initialized value-only records.
-        let count = unsafe { ribbon_take_closed_windows(windows.as_mut_ptr(), windows.len()) };
+        let count = unsafe {
+            ribbon_take_closed_windows(windows.as_mut_ptr(), windows.len(), refresh as i32)
+        };
         windows[..count].to_vec()
     }
 }
@@ -142,6 +151,20 @@ impl Drop for EventSource {
 pub fn accessibility_trusted() -> bool {
     // SAFETY: queries permission without displaying a prompt or accepting pointers.
     unsafe { ribbon_ax_trusted() != 0 }
+}
+/// Keep native permission/workspace notifications flowing while idle.
+pub fn wait_for_events(seconds: f64) {
+    // SAFETY: value-only, bounded main-thread run-loop wait.
+    unsafe { ribbon_wait_for_events(seconds) }
+}
+pub fn initialize_permission_host() {
+    // SAFETY: initializes this owned accessory process without any window.
+    unsafe { ribbon_permission_host_initialize() }
+}
+/// Probe only a child spawned and retained by the calling service.
+pub fn owned_probe_accessible(pid: i32) -> bool {
+    // SAFETY: read-only AX request to the caller's own separate host process.
+    unsafe { ribbon_owned_probe_accessible(pid) != 0 }
 }
 /// Ask macOS to inform the user if this process lacks Accessibility permission.
 /// The prompt is asynchronous; the return value reports the current trust only.

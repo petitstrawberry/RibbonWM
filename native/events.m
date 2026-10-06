@@ -86,12 +86,12 @@ void ribbon_unwatch_application(int pid) {
             CFDictionaryRemoveValue(watchedElements,(__bridge const void *)element);
     }
 }
-size_t ribbon_take_closed_windows(RibbonClosedWindow *windows,size_t capacity) {
+size_t ribbon_take_closed_windows(RibbonClosedWindow *windows,size_t capacity,int refresh) {
     // A retained NSWindow can be closed/withdrawn without destroying its AX
     // element or WindowServer surface. Reconcile successful AX window lists
     // for the already-authorized observed PIDs; a failed query proves nothing.
     double now=NSProcessInfo.processInfo.systemUptime;
-    if(watchedElements&&now-lastMembershipCheck>=1) {
+    if(refresh&&watchedElements&&now-lastMembershipCheck>=1) {
         lastMembershipCheck=now;
         for(NSNumber *pid in observers.allKeys) {
             AXUIElementRef app=AXUIElementCreateApplication(pid.intValue);

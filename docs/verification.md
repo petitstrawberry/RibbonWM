@@ -51,6 +51,42 @@ checks real AX notifications, creation/resize latency and resize-refusal isolati
 `smoke-interaction.py` additionally samples an actual title-bar drag. These tests
 must pass against the new loaded backend before claiming desktop drag stability.
 
+## Keyboard latency and permission waiting
+
+`scripts/smoke-scroll-latency.py` samples actual WindowServer transforms every
+2ms while alternating focus between the first and last of four owned Alacritty
+windows. It waits for initial AX sizing to finish before measuring. On the
+single built-in display, six baseline motions with the installed release and
+0.25s ease-in-out had median completion 251.03ms and 74.48 transform updates/s.
+The updated debug build with 0.10s ease-out completed in 108.92ms with median
+99.84 updates/s. First movement was 46.77ms versus 35.08ms. These measure
+command-process launch through compositor updates, not display refresh or
+physical key delivery; they do not establish sustained 120fps.
+
+Read-only CG/SkyLight inventory is now requested on one worker, with at most one
+pending snapshot; AX and layout/compositor changes remain on the main thread.
+Snapshots begun before an AX write are rejected, and notifications received
+during a pending query coalesce into one subsequent query.
+An earlier attempt to defer inventory throughout animation failed the creation
+latency budget (0.653s) and was replaced by the worker. The final event test
+passed creation enrollment 0.300s, manual width adoption 0.172s, menu-bar padding,
+520 nonempty resize clip samples, resize-refusal recovery and cleanup. The
+interaction regression passed border dragging 800 to 910 points, ten successive
+title-bar translations and 497 nonempty clip samples across three resizes.
+All 62 Rust tests, formatting, Clippy, native build and transformed/clipped/hidden
+input demo passed.
+
+Permission waiting pumps the native run loop with a deadline timer even before
+there are observer sources. A retained, windowless accessory child permits an
+actual AXWindows read when the trust preflight is stale. An owned-host probe
+passed from a trusted CLI and was denied from an untrusted temporary LaunchAgent.
+System-wide attribute-name enumeration was found to succeed without permission
+and is deliberately not used as authorization. The service resumes directly in
+the same process after a successful gate; a real grant during this new wait has
+not yet been verified. Input tap creation is retried without trusting a cached
+preflight false. Permission database edits and automatic service relaunch after
+a grant are not used.
+
 ## Known limits
 
 The optional gesture implementation has 61 passing Rust tests, including touch

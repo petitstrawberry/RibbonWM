@@ -174,6 +174,11 @@ static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
 }
 @end
 int main(int argc,char **argv) {@autoreleasepool {
+    if((argc==2||argc==3)&&!strcmp(argv[1],"--permission-only")) {
+        NSMutableDictionary *state=[@{@"cached":@(AXIsProcessTrusted()),@"live":@(ribbon_ax_trusted()),@"pid":@(getpid())} mutableCopy];
+        if(argc==3)state[@"owned_access"]=@(ribbon_owned_probe_accessible(atoi(argv[2])));
+        reply(state);return 0;
+    }
     if(argc==5&&!strcmp(argv[1],"--sample-surface")) {
         uint32_t wid=(uint32_t)strtoul(argv[2],NULL,10);int pid=atoi(argv[3]);
         double seconds=strtod(argv[4],NULL);if(!wid||pid<=0||!isfinite(seconds)||seconds<=0||seconds>10)return 1;
@@ -186,7 +191,15 @@ int main(int argc,char **argv) {@autoreleasepool {
         reply(@{@"sampling":@YES});
         while(ribbon_input_time()<until) {
             if(ribbon_window_owner(wid)!=pid)return 1;
-            [samples addObject:windowState(sky,wid)];usleep(5000);
+            CGRect bounds=CGRectZero,clip=CGRectZero;CGAffineTransform transform={0};CFTypeRef region=NULL;
+            CGError eb=sky.getBounds(sky.connection(),wid,&bounds),et=sky.getTransform(sky.connection(),wid,&transform);
+            CGError ec=sky.copyClip(sky.connection(),wid,&region);
+            CGError (*regionBounds)(CFTypeRef,CGRect *)=dlsym(RTLD_DEFAULT,"CGSGetRegionBounds");
+            if(!ec&&region&&regionBounds)ec=regionBounds(region,&clip);
+            if(region)sky.releaseRegion(region);
+            [samples addObject:@{@"time":@(ribbon_input_time()),@"errors":@[@(et),@(eb)],
+                @"transform":@[@(transform.a),@(transform.b),@(transform.c),@(transform.d),@(transform.tx),@(transform.ty)],
+                @"clip_error":@(ec),@"clip_bounds":@[@(clip.origin.x),@(clip.origin.y),@(clip.size.width),@(clip.size.height)]}];usleep(2000);
         }
         reply(@{@"samples":samples});return 0;
     }

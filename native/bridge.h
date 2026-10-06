@@ -25,6 +25,9 @@ int ribbon_demo_run(const RibbonCallbacks *,int test,double seconds,double left,
 char *ribbon_query_json(int kind);
 void ribbon_free(void *);
 int ribbon_ax_trusted(void);
+void ribbon_wait_for_events(double seconds);
+void ribbon_permission_host_initialize(void);
+int ribbon_owned_probe_accessible(int pid);
 int ribbon_ax_request_permission(void);
 int ribbon_resize_window(uint32_t wid,int expected_pid,RibbonRect rect);
 typedef int (*RibbonGeometryProgress)(void *);
@@ -63,5 +66,5 @@ void ribbon_watch_ax_element(const void *element,int pid);
 uint32_t ribbon_events(void);
 typedef struct { uint32_t wid; int32_t pid; } RibbonClosedWindow;
 uint32_t ribbon_ax_window_id(const void *element);
-size_t ribbon_take_closed_windows(RibbonClosedWindow *windows,size_t capacity);
+size_t ribbon_take_closed_windows(RibbonClosedWindow *windows,size_t capacity,int refresh);
 void ribbon_stop_observing(void);

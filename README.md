@@ -62,8 +62,8 @@ modules = [
         preserve_window_width = true;
         center_content = true;
         focus_alignment = "visible";
-        animation_curve = "ease_in_out";
-        animation_duration = 0.25;
+        animation_curve = "ease_out";
+        animation_duration = 0.10;
         cycle_width_ratios = [ 0.38195 0.5 0.61804 ];
         frame_rate = 120;
       };
@@ -96,6 +96,13 @@ modules = [
 
 ログは `~/Library/Logs/RibbonWM/wm.log` と `/var/log/ribbonwm-backend.log`。
 `ribbonwm quit` は正常終了し、そのまま停止します。異常終了はlaunchdが再起動します。
+
+サービスは権限待ちでも終了せず、ネイティブのイベントを処理しながら待ちます。
+許可後は同じプロセスで管理を開始します。AXの信頼状態が古い場合は、画面や
+ウィンドウを出さない専用の子プロセスに対する実際のAX読み取りで確認します。
+ジェスチャー用のイベントタップも作成を再試行し、後からの許可に追従します。
+アニメーションの秒数は `ribbonwm config animation_duration 0.10` で実行中にも
+変更できます。`0` で即時移動です。永続設定はNix/TOMLへ書いてください。
 
 ## トラックパッドの横スクロール（実験的）
 

@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,82 @@ struct GeometryLease {
     originals: BTreeMap<WindowId, Window>,
     logical_originals: BTreeMap<WindowId, Rect>,
     resized: BTreeSet<WindowId>,
+}
+/// Read-only WindowServer metadata runs away from the frame loop. AX, AppKit
+/// notifications, policy and compositor commits stay on the controlling thread.
+struct WindowInventory {
+    request: Option<mpsc::SyncSender<u64>>,
+    result: mpsc::Receiver<(u64, Result<Vec<Window>>)>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    pending: bool,
+    generation: u64,
+    dirty: bool,
+}
+impl WindowInventory {
+    fn start() -> Self {
+        let (request, requests) = mpsc::sync_channel(1);
+        let (results, result) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            while let Ok(generation) = requests.recv() {
+                if results.send((generation, ribbon_macos::windows())).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            request: Some(request),
+            result,
+            worker: Some(worker),
+            pending: false,
+            generation: 0,
+            dirty: false,
+        }
+    }
+    fn request(&mut self) -> Result<()> {
+        if !self.pending {
+            self.request
+                .as_ref()
+                .context("Inventory stopped")?
+                .send(self.generation)?;
+            self.pending = true;
+            self.dirty = false;
+        } else {
+            self.dirty = true;
+        }
+        Ok(())
+    }
+    fn poll(&mut self) -> Result<Option<Vec<Window>>> {
+        let snapshot = match self.result.try_recv() {
+            Ok((generation, result)) => {
+                self.pending = false;
+                if generation == self.generation {
+                    Some(result?)
+                } else {
+                    self.dirty = true;
+                    None
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => bail!("Inventory worker stopped"),
+        };
+        if self.dirty && !self.pending {
+            self.request()?;
+        }
+        Ok(snapshot)
+    }
+    fn invalidate(&mut self) {
+        // A snapshot taken before an AX write must not undo its accepted size.
+        self.generation = self.generation.wrapping_add(1);
+        self.dirty = true;
+    }
+}
+impl Drop for WindowInventory {
+    fn drop(&mut self) {
+        self.request.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 impl Drop for GeometryLease {
     fn drop(&mut self) {
@@ -164,8 +241,9 @@ fn synchronize(
     options: &Options,
     displays: &[Display],
     sizes: &mut BTreeMap<WindowId, (i32, f64, f64)>,
-    reveal_focus: bool,
+    snapshot: (Vec<Window>, bool),
 ) -> Result<()> {
+    let (mut inventory, reveal_focus) = snapshot;
     // Only a cached destination has a saved offset; initial discovery should
     // reveal the native active window normally.
     let context_changed = displays.iter().any(|d| {
@@ -182,7 +260,6 @@ fn synchronize(
             m.suspended = true;
         }
     }
-    let mut inventory = ribbon_macos::windows()?;
     for id in geometry.originals.keys().copied().collect::<Vec<_>>() {
         let old = geometry.originals.get(&id);
         if !inventory
@@ -561,6 +638,7 @@ fn handle(
                     "padding_top" => settings.padding_top = Some(v),
                     "padding_bottom" => settings.padding_bottom = Some(v),
                     "column_width" => settings.column_width = v,
+                    "animation_duration" => settings.animation_duration = v,
                     _ => bail!("Unknown setting: {name}"),
                 }
                 engine.update_settings(settings)?;
@@ -572,14 +650,20 @@ fn handle(
                 "padding_top" => engine.settings.top_margin(),
                 "padding_bottom" => engine.settings.bottom_margin(),
                 "column_width" => engine.settings.column_width,
+                "animation_duration" => engine.settings.animation_duration,
                 _ => bail!("Unknown setting: {name}"),
             };
             return Ok(json!({"ok":true,"value":value}));
         }
         Request::Apply { monitor, action } => {
             let monitor = monitor_for(engine, monitor)?;
+            let before = engine.focused_window(&monitor);
+            let explicit_focus = matches!(action, Action::Focus { .. });
             engine.apply(&monitor, &action)?;
-            if !dry_run && let Some(id) = engine.focused_window(&monitor) {
+            if !dry_run
+                && let Some(id) = engine.focused_window(&monitor)
+                && (explicit_focus || Some(id) != before)
+            {
                 let w = geometry
                     .originals
                     .get(&id)
@@ -611,11 +695,18 @@ fn handle(
     Ok(json!({"ok":true}))
 }
 pub fn run(options: Options) -> Result<()> {
+    run_impl(options, false)
+}
+/// Service gate has already verified live AX access from this same process.
+pub fn run_ready(options: Options) -> Result<()> {
+    run_impl(options, true)
+}
+fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
     options.settings.validate()?;
     if !options.all && options.selected.is_empty() {
         bail!("Select explicit --windows IDs or opt in with --all");
     }
-    if !options.dry_run && !ribbon_macos::accessibility_trusted() {
+    if !options.dry_run && !permission_confirmed && !ribbon_macos::accessibility_trusted() {
         bail!("Accessibility permission is required for live mode; run doctor first");
     }
     let socket = SocketLease::bind()?;
@@ -650,7 +741,7 @@ pub fn run(options: Options) -> Result<()> {
         &options,
         &displays,
         &mut sizes,
-        true,
+        (ribbon_macos::windows()?, true),
     )?;
     for requested in &options.selected {
         if !geometry.originals.contains_key(&WindowId(*requested)) {
@@ -669,12 +760,14 @@ pub fn run(options: Options) -> Result<()> {
     let mut last_focus = last_tick;
     let mut last_watch_refresh = last_tick;
     let event_trace = std::env::var_os("RIBBONWM_EVENT_TRACE").is_some();
+    let frame_trace = std::env::var_os("RIBBONWM_FRAME_TRACE").is_some();
     let mut last_frame = Vec::new();
     let mut committed: Vec<Placement> = Vec::new();
     let mut quit = false;
     let mut input = None;
     let mut last_input_attempt = last_tick - Duration::from_secs(5);
     let mut gesture_frontmost = (-1, true);
+    let mut inventory = WindowInventory::start();
     eprintln!(
         "RibbonWM {}: {} windows; socket {}",
         if options.dry_run { "dry run" } else { "live" },
@@ -689,15 +782,11 @@ pub fn run(options: Options) -> Result<()> {
             && start.duration_since(last_input_attempt) >= Duration::from_secs(5)
         {
             last_input_attempt = start;
-            if ribbon_macos::input::trusted() {
-                match ribbon_macos::input::InputSource::start(&engine.settings) {
-                    Ok(source) => input = Some(source),
-                    Err(e) => eprintln!("Gestures unavailable: {e:#}"),
-                }
-            } else {
-                eprintln!(
-                    "Gestures waiting for Input Monitoring permission; keyboard WM remains active"
-                );
+            // Tap creation is the live OS authorization check; a cached
+            // preflight false must not prevent a later permission grant.
+            match ribbon_macos::input::InputSource::start(&engine.settings) {
+                Ok(source) => input = Some(source),
+                Err(e) => eprintln!("Gestures unavailable: {e:#}"),
             }
         }
         if let Some(source) = &mut input {
@@ -713,6 +802,10 @@ pub fn run(options: Options) -> Result<()> {
                 Ok((mut stream, _)) => {
                     let response = ipc::receive(&mut stream)
                         .and_then(|r| {
+                            let native_geometry = matches!(r, Request::SetMode { .. });
+                            if native_geometry {
+                                inventory.invalidate();
+                            }
                             handle(
                                 &mut engine,
                                 r,
@@ -735,9 +828,16 @@ pub fn run(options: Options) -> Result<()> {
         if quit {
             break;
         }
+        let after_ipc = Instant::now();
+        let animating = engine.monitors.values().any(|m| {
+            let scroll = &m.layout().scroll;
+            !m.suspended && (scroll.position - scroll.target).abs() > 0.01
+        }) || input
+            .as_ref()
+            .is_some_and(ribbon_macos::input::InputSource::active);
         let notifications = events.as_ref().map_or(0, ribbon_macos::EventSource::drain);
         if let Some(source) = &events {
-            for closed in source.closed_windows() {
+            for closed in source.closed_windows(!animating) {
                 let id = WindowId(closed.wid);
                 if geometry
                     .originals
@@ -753,12 +853,13 @@ pub fn run(options: Options) -> Result<()> {
             eprintln!("Native events: {notifications}");
         }
         if (notifications & ribbon_macos::EventSource::APPS != 0
-            || start.duration_since(last_watch_refresh) >= Duration::from_secs(1))
+            || (!animating && start.duration_since(last_watch_refresh) >= Duration::from_secs(1)))
             && let Some(source) = &events
         {
             refresh_observers(source, &mut watching, &options)?;
             last_watch_refresh = start;
         }
+        let after_events = Instant::now();
         if notifications
             & (ribbon_macos::EventSource::WINDOWS
                 | ribbon_macos::EventSource::GEOMETRY
@@ -790,6 +891,10 @@ pub fn run(options: Options) -> Result<()> {
                 );
             }
             displays = next;
+            inventory.request()?;
+            last_inventory = start;
+        }
+        if let Some(windows) = inventory.poll()? {
             let reveal = !input
                 .as_ref()
                 .is_some_and(ribbon_macos::input::InputSource::active);
@@ -799,9 +904,8 @@ pub fn run(options: Options) -> Result<()> {
                 &options,
                 &displays,
                 &mut sizes,
-                reveal,
+                (windows, reveal),
             )?;
-            last_inventory = start;
         }
         if notifications & ribbon_macos::EventSource::FOCUS != 0
             || start.duration_since(last_focus) >= Duration::from_millis(100)
@@ -812,6 +916,7 @@ pub fn run(options: Options) -> Result<()> {
             observe_native_focus(&mut engine, &geometry, &options, reveal);
             last_focus = start;
         }
+        let after_inventory = Instant::now();
         if let Some(source) = &mut input {
             // A native Space notification may have changed targets in this batch.
             let blocked = gesture_blocked(&options, &mut gesture_frontmost);
@@ -839,6 +944,7 @@ pub fn run(options: Options) -> Result<()> {
             engine.tick(start.duration_since(last_tick).as_secs_f64());
         }
         last_tick = start;
+        let before_backend = Instant::now();
         if let Some(backend) = &backend {
             for id in geometry.originals.keys().copied().collect::<Vec<_>>() {
                 if geometry
@@ -957,6 +1063,7 @@ pub fn run(options: Options) -> Result<()> {
                         resize_anchor(viewport, w.bounds, size.1, size.2),
                         || backend.frame_with_sticky(&held, &owners, &sticky_leases(&geometry)),
                     );
+                    inventory.invalidate();
                     if let Err(e) = resized {
                         if ribbon_macos::window_owner(p.window) != w.pid {
                             forget_closed(&mut engine, &mut geometry, p.window)?;
@@ -1026,6 +1133,16 @@ pub fn run(options: Options) -> Result<()> {
                 last_send = Instant::now();
             }
         }
+        if frame_trace {
+            eprintln!(
+                "Frame timing: {}",
+                json!({"ipc_ms":after_ipc.duration_since(start).as_secs_f64()*1000.0,
+                "events_ms":after_events.duration_since(after_ipc).as_secs_f64()*1000.0,
+                "inventory_ms":after_inventory.duration_since(after_events).as_secs_f64()*1000.0,
+                "input_ms":before_backend.duration_since(after_inventory).as_secs_f64()*1000.0,
+                "backend_ms":before_backend.elapsed().as_secs_f64()*1000.0,"notifications":notifications,"animating":animating})
+            );
+        }
         if let Some(remaining) = frame_duration.checked_sub(start.elapsed()) {
             std::thread::sleep(remaining);
         }
@@ -1069,6 +1186,39 @@ fn gesture_targets(engine: &Engine, blocked: bool) -> Vec<ribbon_macos::input::T
 mod tests {
     use super::*;
     use ribbon_core::{NativeSpaceId, Rect};
+
+    #[test]
+    fn inventory_does_not_adopt_geometry_sampled_before_a_completed_ax_write() {
+        let (request, requests) = mpsc::sync_channel(1);
+        let (results, result) = mpsc::channel();
+        let mut inventory = WindowInventory {
+            request: Some(request),
+            result,
+            worker: None,
+            pending: false,
+            generation: 0,
+            dirty: false,
+        };
+        inventory.request().unwrap();
+        let old = requests.recv().unwrap();
+        inventory.invalidate(); // A WM resize completes while CG is reading.
+        results.send((old, Ok(Vec::new()))).unwrap();
+        assert!(inventory.poll().unwrap().is_none());
+        let current = requests.recv().unwrap();
+        assert_ne!(old, current);
+        results.send((current, Ok(Vec::new()))).unwrap();
+        assert!(inventory.poll().unwrap().is_some());
+
+        inventory.request().unwrap();
+        let pending = requests.recv().unwrap();
+        inventory.request().unwrap(); // A creation event arrives during a query.
+        inventory.request().unwrap();
+        assert!(requests.try_recv().is_err());
+        results.send((pending, Ok(Vec::new()))).unwrap();
+        assert!(inventory.poll().unwrap().is_some());
+        assert_eq!(requests.recv().unwrap(), pending);
+        assert!(requests.try_recv().is_err());
+    }
 
     #[test]
     fn resize_anchor_preserves_valid_secondary_menu_bar_offsets_and_bounds_large_resizes() {

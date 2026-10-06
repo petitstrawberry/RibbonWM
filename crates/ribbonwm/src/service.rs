@@ -6,7 +6,49 @@ use std::fs::{DirBuilder, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::process::{Child, Command, Stdio};
+
+struct PermissionProbe(Child);
+impl PermissionProbe {
+    fn spawn() -> Result<Self> {
+        Ok(Self(
+            Command::new(std::env::current_exe()?)
+                .arg("permission-host")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()?,
+        ))
+    }
+    fn accessible(&mut self) -> bool {
+        matches!(self.0.try_wait(), Ok(None))
+            && ribbon_macos::owned_probe_accessible(self.0.id() as i32)
+    }
+}
+impl Drop for PermissionProbe {
+    fn drop(&mut self) {
+        self.0.stdin.take();
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+pub fn permission_host() -> Result<()> {
+    ribbon_macos::initialize_permission_host();
+    loop {
+        let mut fd = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized descriptor; nonblocking check for parent EOF.
+        if unsafe { libc::poll(&mut fd, 1, 0) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if fd.revents != 0 {
+            return Ok(());
+        }
+        ribbon_macos::wait_for_events(0.1);
+    }
+}
 
 pub fn run(user: String, config: PathBuf, exclude_apps: Vec<String>) -> Result<()> {
     // SAFETY: getuid has no arguments. This preflight runs on the main thread.
@@ -63,8 +105,16 @@ pub fn run(user: String, config: PathBuf, exclude_apps: Vec<String>) -> Result<(
         eprintln!("Requesting Input Monitoring permission for configured gestures");
         ribbon_macos::input::request_permission();
     }
+    let mut last_readiness = None;
+    let mut probe = None;
     loop {
-        let accessibility = ribbon_macos::accessibility_trusted();
+        let mut accessibility = ribbon_macos::accessibility_trusted();
+        if !accessibility {
+            if probe.is_none() {
+                probe = Some(PermissionProbe::spawn()?);
+            }
+            accessibility = probe.as_mut().is_some_and(PermissionProbe::accessible);
+        }
         let status = ribbon_macos::backend::Backend::connect().and_then(|b| b.status());
         let backend = status.as_ref().is_ok_and(|s| {
             s.version == 2
@@ -75,16 +125,24 @@ pub fn run(user: String, config: PathBuf, exclude_apps: Vec<String>) -> Result<(
         if accessibility && backend {
             break;
         }
-        eprintln!(
-            "Waiting: Accessibility={accessibility}, sticky backend={backend}; grant Accessibility to {}",
-            std::env::current_exe()?.display()
-        );
-        if !backend {
-            eprintln!("Backend preflight: {status:?}; expected {expected:?}");
+        if last_readiness != Some((accessibility, backend)) {
+            eprintln!(
+                "Waiting: Accessibility={accessibility}, sticky backend={backend}; grant Accessibility to {}",
+                std::env::current_exe()?.display()
+            );
+            if !backend {
+                eprintln!("Backend preflight: {status:?}; expected {expected:?}");
+            }
+            last_readiness = Some((accessibility, backend));
         }
-        std::thread::sleep(Duration::from_secs(5));
+        ribbon_macos::wait_for_events(0.25);
     }
-    crate::daemon::run(crate::daemon::Options {
+    drop(probe);
+    eprintln!(
+        "Permissions/backend ready in service pid {}; continuing without relaunch",
+        std::process::id()
+    );
+    crate::daemon::run_ready(crate::daemon::Options {
         selected: Vec::new(),
         all: true,
         exclude_apps,

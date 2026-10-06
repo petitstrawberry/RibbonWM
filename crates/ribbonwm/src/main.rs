@@ -24,6 +24,9 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Internal, windowless host for a live permission check.
+    #[command(hide = true)]
+    PermissionHost,
     /// Login service: wait for permissions/backend, then manage the desktop.
     Service {
         #[arg(long)]
@@ -229,6 +232,7 @@ fn execute(cli: Cli) -> Result<()> {
                 "executable": std::env::current_exe()?,
             }));
         }
+        Command::PermissionHost => return service::permission_host(),
         Command::Windows => return print(ribbon_macos::windows()?),
         Command::Applications => return print(ribbon_macos::applications()?),
         Command::Displays => return print(ribbon_macos::displays()?),

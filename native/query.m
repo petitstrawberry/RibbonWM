@@ -110,7 +110,34 @@ char *ribbon_query_json(int kind) { @autoreleasepool {
     char *result=malloc(json.length+1);if(!result)return NULL;memcpy(result,json.bytes,json.length);result[json.length]=0;return result;
 } }
 void ribbon_free(void *pointer) {free(pointer);}
-int ribbon_ax_trusted(void) {return AXIsProcessTrusted();}
+int ribbon_ax_trusted(void) { @autoreleasepool {
+    // Refresh without reopening the asynchronous permission prompt.
+    NSDictionary *options=@{(__bridge NSString *)kAXTrustedCheckOptionPrompt:@NO};
+    return AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
+} }
+void ribbon_permission_host_initialize(void) {
+    [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    [NSApp finishLaunching];
+}
+int ribbon_owned_probe_accessible(int pid) { @autoreleasepool {
+    if(pid<=0)return 0;
+    AXUIElementRef app=AXUIElementCreateApplication(pid);CFTypeRef windows=NULL;
+    AXUIElementSetMessagingTimeout(app,0.05);
+    AXError error=AXUIElementCopyAttributeValue(app,kAXWindowsAttribute,&windows);
+    BOOL accessible=!error&&windows&&CFGetTypeID(windows)==CFArrayGetTypeID();
+    if(windows)CFRelease(windows);CFRelease(app);return accessible;
+} }
+static void permission_wait_timer(CFRunLoopTimerRef timer,void *context) {(void)timer;(void)context;}
+void ribbon_wait_for_events(double seconds) {
+    double duration=fmin(1,fmax(0,seconds));
+    CFRunLoopRef loop=CFRunLoopGetCurrent();
+    // A service waiting before AppKit/AX observers exist can have no sources.
+    // Keep the run loop alive until the deadline instead of spinning on Finished.
+    CFRunLoopTimerRef timer=CFRunLoopTimerCreate(NULL,CFAbsoluteTimeGetCurrent()+duration,0,0,0,permission_wait_timer,NULL);
+    CFRunLoopAddTimer(loop,timer,kCFRunLoopDefaultMode);
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode,duration,true);
+    CFRunLoopRemoveTimer(loop,timer,kCFRunLoopDefaultMode);CFRelease(timer);
+}
 int ribbon_ax_request_permission(void) { @autoreleasepool {
     NSDictionary *options=@{(__bridge NSString *)kAXTrustedCheckOptionPrompt:@YES};
     return AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
@@ -314,7 +341,7 @@ int ribbon_frontmost_pid(void) { @autoreleasepool {
     // Rust owns the main loop rather than NSApplication.run. NSWorkspace's
     // cached frontmost application needs its pending notifications delivered;
     // otherwise it keeps reporting the app that was active at startup.
-    CFRunLoopRunInMode(kCFRunLoopDefaultMode,0.001,false);
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode,0,true);
     return workspace.frontmostApplication.processIdentifier;
 } }
 uint32_t ribbon_focused_window(int expected_pid) { @autoreleasepool {
