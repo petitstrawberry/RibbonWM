@@ -26,6 +26,30 @@ static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
         @"clip_error":@(ec),@"clip_bounds":@[@(clip.origin.x),@(clip.origin.y),@(clip.size.width),@(clip.size.height)],
         @"frame":@{@"x":@(b.origin.x),@"y":@(b.origin.y),@"width":@(b.size.width),@"height":@(b.size.height)}};
 }
+static NSDictionary *associatedState(SkyLight sky,uint32_t wid) {
+    void *h=dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",RTLD_NOW);
+    CFArrayRef (*associated)(int,uint32_t)=dlsym(h,"SLSCopyAssociatedWindows");
+    CFTypeRef (*query)(int,CFArrayRef,int)=dlsym(h,"SLSWindowQueryWindows");
+    CFTypeRef (*iterator)(CFTypeRef)=dlsym(h,"SLSWindowQueryResultCopyWindows");
+    bool (*advance)(CFTypeRef)=dlsym(h,"SLSWindowIteratorAdvance");
+    uint32_t (*getID)(CFTypeRef)=dlsym(h,"SLSWindowIteratorGetWindowID");
+    uint32_t (*parent)(CFTypeRef)=dlsym(h,"SLSWindowIteratorGetParentID");
+    if(!associated||!query||!iterator||!advance||!getID||!parent)return @{@"unavailable":@YES};
+    CFArrayRef ids=associated(sky.connection(),wid);
+    NSMutableArray *rows=[NSMutableArray array];
+    if(ids) {
+        CFTypeRef q=query(sky.connection(),ids,(int)CFArrayGetCount(ids));
+        CFTypeRef i=q?iterator(q):NULL;
+        while(i&&advance(i)) {
+            uint32_t id=getID(i);
+            NSMutableDictionary *row=[windowState(sky,id) mutableCopy];
+            row[@"wid"]=@(id);row[@"parent"]=@(parent(i));row[@"pid"]=@(ribbon_window_owner(id));
+            [rows addObject:row];
+        }
+        if(i)CFRelease(i);if(q)CFRelease(q);CFRelease(ids);
+    }
+    return @{@"wid":@(wid),@"associated":rows};
+}
 @interface TestPanel : NSPanel
 @end
 @implementation TestPanel
@@ -174,6 +198,36 @@ static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
 }
 @end
 int main(int argc,char **argv) {@autoreleasepool {
+    if(argc==3&&!strcmp(argv[1],"--associated")) {
+        uint32_t wid=(uint32_t)strtoul(argv[2],NULL,10);SkyLight sky;
+        if(!wid||!loadSkyLight(&sky))return 1;
+        reply(associatedState(sky,wid));return 0;
+    }
+    if(argc==5&&!strcmp(argv[1],"--trace-window")) {
+        // Diagnostic only: observe the exact owner without AX, input synthesis,
+        // compositor writes, enrollment, or changing the production service.
+        uint32_t wid=(uint32_t)strtoul(argv[2],NULL,10);int pid=atoi(argv[3]);
+        double seconds=strtod(argv[4],NULL);
+        NSRunningApplication *app=[NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+        if(!wid||pid<=0||!app||ribbon_window_owner(wid)!=pid||
+            [app.bundleIdentifier hasPrefix:@"com.openai."]||[app.localizedName hasPrefix:@"ChatGPT"]||
+            [app.localizedName hasPrefix:@"Codex"]||[app.bundleIdentifier isEqual:@"com.apple.systempreferences"]||
+            !isfinite(seconds)||seconds<=0||seconds>180)return 1;
+        SkyLight sky;if(!loadSkyLight(&sky))return 1;
+        double until=ribbon_input_time()+seconds;
+        reply(@{@"tracing":@YES,@"wid":@(wid),@"pid":@(pid)});
+        while(ribbon_input_time()<until) {@autoreleasepool {
+            if(ribbon_window_owner(wid)!=pid)return 1;
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode,0,true);
+            RibbonMouseState mouse=ribbon_mouse_state();double x=0,y=0;ribbon_pointer(&x,&y);
+            NSMutableDictionary *state=[windowState(sky,wid) mutableCopy];
+            state[@"time"]=@(ribbon_input_time());
+            state[@"mouse"]=@{@"down":@(ribbon_left_mouse_down()),@"dragged":@(mouse.dragged),
+                @"press_x":@(mouse.x),@"press_y":@(mouse.y),@"window":@(mouse.window),@"x":@(x),@"y":@(y)};
+            reply(state);usleep(2000);
+        }}
+        return 0;
+    }
     if(argc==2&&!strcmp(argv[1],"--overview-state")) {reply(@{@"active":@(ribbon_mission_control_active())});return 0;}
     if(argc==2&&!strcmp(argv[1],"--overview-exit")) {
         if(!ribbon_mission_control_active())return 1;

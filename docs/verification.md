@@ -224,3 +224,24 @@ Current runtime hardware is one built-in display. These owned-fixture checks do
 not establish every application's behavior or updated multi-display behavior.
 Abrupt termination still falls back to compositor snapshots and does not
 reliably recover owner geometry; it is not covered by the normal-exit guarantee.
+
+## Native drag feedback and attached surfaces
+
+Live OrbStack diagnosis found a first drag transaction moving presentation by
+372 points while the pointer advanced roughly 0.1 point. Subsequent samples
+showed alternating owner translations and absolute WM pointer corrections.
+Metadata also confirmed a separate WindowServer child surface left at its
+physical position while its parent was compositor-translated, matching a
+misplaced macOS capture indicator. These observations invalidate a general
+desktop-stability claim based only on earlier Alacritty drag tests.
+
+The update removes repeated pointer corrections, anchors fully visible windows
+at rest, avoids new AX geometry writes during mouse interaction, and moves
+explicit same-owner child surfaces with their parent. A Rust regression covers
+one correction followed by owner control. The native payload-handler test uses
+a real AppKit parent and attached child: normal translation, clipped interactive
+movement, full overview, finish, and owner movement before overview all pass.
+Native overview uses current physical geometry instead of an obsolete absolute
+translation. This is an owned-surface test, not Dock injection or proof of
+arbitrary-application drag stability. The new live backend still needs desktop
+verification; the recorded broken service was kept running throughout diagnosis.

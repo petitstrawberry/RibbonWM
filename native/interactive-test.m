@@ -20,11 +20,22 @@ int main(void) { @autoreleasepool {
     [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
     uint32_t wid=(uint32_t)window.windowNumber;
     check(wid>0&&ownerPID(wid)==getpid(),"actual surface belongs to this test process");
+    NSWindow *child=[[NSWindow alloc] initWithContentRect:NSMakeRect(320,320,66,20)
+        styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
+    child.releasedWhenClosed=NO;[window addChildWindow:child ordered:NSWindowAbove];[child orderFrontRegardless];
+    [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+    uint32_t childID=(uint32_t)child.windowNumber;CGRect parentBounds,childBounds;
+    sky.getBounds(sky.connection(),wid,&parentBounds);sky.getBounds(sky.connection(),childID,&childBounds);
+    CGFloat dx=childBounds.origin.x-parentBounds.origin.x,dy=childBounds.origin.y-parentBounds.origin.y;
     CGAffineTransform original;check(!sky.getTransform(sky.connection(),wid,&original),"snapshot original transform");
     NSMutableDictionary *update=[@{@"wid":@(wid),@"pid":@(getpid()),@"frame":rectangle(200,200,400,400),
-        @"clip":rectangle(200,200,400,400)} mutableCopy];
+        @"clip":rectangle(200,200,400,400),@"clip_viewport":rectangle(100,100,900,700)} mutableCopy];
     NSDictionary *request=@{@"session":@"owned-interactive-test",@"updates":@[update]};
     check([frame(request)[@"ok"] boolValue],"normal placement accepted");
+    check(saved.count==2&&saved[@(childID)].root==wid,"only an explicit attached surface joins its root lease");
+    CGAffineTransform childTransform;sky.getTransform(sky.connection(),childID,&childTransform);
+    check(fabs(childTransform.tx+200+dx)<1&&fabs(childTransform.ty+200+dy)<1,
+        "attached surface keeps its native offset at the transformed parent");
     update[@"viewport"]=rectangle(100,100,900,700);
     CGError (*regionBounds)(CFTypeRef,CGRect *)=dlsym(RTLD_DEFAULT,"CGSGetRegionBounds");
     for(int i=0;i<10;i++) {
@@ -38,6 +49,8 @@ int main(void) { @autoreleasepool {
         check(!sky.copyClip(sky.connection(),wid,&clip)&&clip&&regionBounds&&!regionBounds(clip,&bounds),"read actual interactive clip");
         sky.releaseRegion(clip);
         check(fabs(bounds.size.width-fmax(0,1000-x))<1&&bounds.origin.x==0,"interactive clip stays inside retained viewport");
+        sky.getTransform(sky.connection(),childID,&childTransform);
+        check(fabs(childTransform.tx+x+dx)<1&&fabs(childTransform.ty+220+dy)<1,"child follows the owner during a clipped native drag");
     }
     update[@"drag_frame"]=rectangle(240,260,400,400);
     check([frame(request)[@"ok"] boolValue],"pointer drag frame corrects an owner translation offset");
@@ -57,17 +70,28 @@ int main(void) { @autoreleasepool {
     CFTypeRef full=NULL;CGRect fullBounds=CGRectZero;
     check(!sky.copyClip(sky.connection(),wid,&full)&&!regionBounds(full,&fullBounds),"read exposed full clip");
     sky.releaseRegion(full);
-    check(fullBounds.size.width==400&&fullBounds.size.height==400&&saved.count==1,"overview exposes complete real surface and retains snapshot");
+    check(fullBounds.size.width==400&&fullBounds.size.height==400&&saved.count==2,"overview exposes complete real surface and retains snapshot");
     sky.getTransform(sky.connection(),wid,&released);
     check(CGAffineTransformEqualToTransform(original,released),"overview returns native transform");
     update[@"clip"]=rectangle(200,200,400,400);
     check([frame(request)[@"ok"] boolValue],"layout resumes after overview");
     NSMutableDictionary *bad=[update mutableCopy];bad[@"pid"]=@(getpid()+1);
-    check(![finish(@{@"updates":@[bad]})[@"ok"] boolValue]&&saved.count==1,"release rejects a changed owner before writing");
+    check(![finish(@{@"updates":@[bad]})[@"ok"] boolValue]&&saved.count==2,"release rejects a changed owner before writing");
     update[@"frame"]=rectangle(240,260,400,400);
     check([finish(request)[@"ok"] boolValue]&&saved.count==0,"stop commits desktop geometry and removes the lease");
     check(!restoreAll(),"post-stop cleanup has no obsolete snapshot to apply");
     sky.getTransform(sky.connection(),wid,&released);
     check(released.tx==-240&&released.ty==-260,"post-stop cleanup preserves the released position");
-    [window close];return 0;
+    sky.getTransform(sky.connection(),childID,&childTransform);
+    check(fabs(childTransform.tx+240+dx)<1&&fabs(childTransform.ty+260+dy)<1,"finish releases the attached surface at the parent's final position");
+    check([frame(request)[@"ok"] boolValue],"lease family again before a native owner move");
+    [window setFrameOrigin:NSMakePoint(350,350)];
+    [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+    sky.getBounds(sky.connection(),wid,&parentBounds);
+    check([overview()[@"ok"] boolValue],"overview accepts owner geometry changed during the lease");
+    sky.getTransform(sky.connection(),wid,&released);
+    check(fabs(released.tx+parentBounds.origin.x)<1&&fabs(released.ty+parentBounds.origin.y)<1,
+        "overview uses current native position rather than an obsolete absolute snapshot");
+    check([finish(request)[@"ok"] boolValue]&&saved.count==0,"release moved family without stale child snapshots");
+    [window removeChildWindow:child];[child close];[window close];return 0;
 } }

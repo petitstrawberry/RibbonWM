@@ -15,6 +15,7 @@
 @property CGAffineTransform transform;
 @property CFTypeRef clip;
 @property pid_t pid;
+@property uint32_t root;
 @end
 @implementation RibbonSavedWindowV3
 @end
@@ -37,14 +38,30 @@ static pid_t ownerPID(uint32_t wid) {
     int cid=0;pid_t pid=0;
     return getOwner(sky.connection(),wid,&cid)||connectionPID(cid,&pid)?0:pid;
 }
+static BOOL validSurfaceBounds(CGRect b) {
+    return isfinite(b.origin.x)&&isfinite(b.origin.y)&&isfinite(b.size.width)&&isfinite(b.size.height)
+        &&b.size.width>0&&b.size.height>0;
+}
 
 static unsigned restoreWindows(NSSet<NSNumber *> *retained) {
     unsigned failed=0;
     for (RibbonSavedWindowV3 *w in saved.allValues) {
         if ([retained containsObject:@(w.wid)]) continue;
         if (ownerPID(w.wid)==w.pid) {
-            CGError et=sky.setTransform(sky.connection(),w.wid,w.transform);
-            CGError ec=sky.setClip(sky.connection(),w.wid,w.clip);
+            CGRect b;
+            if(sky.getBounds(sky.connection(),w.wid,&b)||!validSurfaceBounds(b)){failed++;continue;}
+            // A lease may have started with a stale translated surface. The
+            // current owner bounds are the native desktop position; replaying
+            // that old absolute transform can send a moved window off-screen.
+            CGAffineTransform native=CGAffineTransformMakeTranslation(-b.origin.x,-b.origin.y);
+            CGError et=sky.setTransform(sky.connection(),w.wid,native);
+            CFTypeRef clip=w.clip,replacement=NULL;
+            if(fabs(b.size.width-w.bounds.size.width)>2||fabs(b.size.height-w.bounds.size.height)>2) {
+                CGRect full=CGRectMake(0,0,b.size.width,b.size.height);
+                if(sky.newRegion(&full,&replacement)){failed++;continue;}clip=replacement;
+            }
+            CGError ec=sky.setClip(sky.connection(),w.wid,clip);
+            if(replacement)sky.releaseRegion(replacement);
             if(et||ec) {failed++;NSLog(@"[RibbonWM] restore wid=%u transform=%d clip=%d",w.wid,et,ec);continue;}
         }
         sky.releaseRegion(w.clip);[saved removeObjectForKey:@(w.wid)];
@@ -99,6 +116,81 @@ static bool stickyDescriptor(id u) {
         identifier(u[@"pid"],INT_MAX,&pid)&&
         [u[@"enabled"] isKindOfClass:NSNumber.class]&&CFGetTypeID((__bridge CFTypeRef)u[@"enabled"])==CFBooleanGetTypeID();
 }
+// WindowServer's explicit parent relationship includes AppKit child surfaces
+// and macOS capture indicators. PID equality alone is not a relationship.
+static NSDictionary<NSNumber *,NSValue *> *familyBounds(uint32_t root,pid_t pid) {
+    static CFArrayRef (*associated)(int,uint32_t);
+    static CFTypeRef (*query)(int,CFArrayRef,int),(*iterator)(CFTypeRef);
+    static bool (*advance)(CFTypeRef);
+    static uint32_t (*getID)(CFTypeRef),(*parentID)(CFTypeRef);
+    static dispatch_once_t once;
+    dispatch_once(&once,^{
+        void *h=dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",RTLD_NOW);
+        associated=dlsym(h,"SLSCopyAssociatedWindows");query=dlsym(h,"SLSWindowQueryWindows");
+        iterator=dlsym(h,"SLSWindowQueryResultCopyWindows");advance=dlsym(h,"SLSWindowIteratorAdvance");
+        getID=dlsym(h,"SLSWindowIteratorGetWindowID");parentID=dlsym(h,"SLSWindowIteratorGetParentID");
+    });
+    if(!associated||!query||!iterator||!advance||!getID||!parentID)return nil;
+    CFArrayRef ids=associated(sky.connection(),root);
+    if(!ids)return @{};
+    if(CFArrayGetCount(ids)>512){CFRelease(ids);return nil;}
+    CFTypeRef q=query(sky.connection(),ids,(int)CFArrayGetCount(ids)),i=q?iterator(q):NULL;
+    NSMutableDictionary *parents=[NSMutableDictionary dictionary],*result=[NSMutableDictionary dictionary];
+    while(i&&advance(i)) {
+        uint32_t child=getID(i);
+        if(child&&child!=root&&ownerPID(child)==pid)parents[@(child)]=@(parentID(i));
+    }
+    if(i)CFRelease(i);if(q)CFRelease(q);CFRelease(ids);
+    NSMutableSet *reached=[NSMutableSet setWithObject:@(root)];BOOL added=YES;
+    while(added) {
+        added=NO;
+        for(NSNumber *child in parents.allKeys) {
+            if([reached containsObject:child]||![reached containsObject:parents[child]])continue;
+            CGRect b;
+            if(sky.getBounds(sky.connection(),child.unsignedIntValue,&b)||
+                !isfinite(b.origin.x)||!isfinite(b.origin.y)||!isfinite(b.size.width)||!isfinite(b.size.height)||
+                b.size.width<=0||b.size.height<=0)continue;
+            result[child]=[NSValue valueWithRect:b];[reached addObject:child];added=YES;
+        }
+    }
+    return result;
+}
+static NSDictionary *rectObject(CGRect r) {
+    return @{@"x":@(r.origin.x),@"y":@(r.origin.y),@"width":@(r.size.width),@"height":@(r.size.height)};
+}
+static NSArray *expandFamilies(NSArray *roots) {
+    NSMutableArray *updates=[NSMutableArray array];NSMutableSet *rootIDs=[NSMutableSet set];
+    for(NSDictionary *u in roots)[rootIDs addObject:u[@"wid"]];
+    for(NSDictionary *u in roots) {
+        uint32_t root=[u[@"wid"] unsignedIntValue];pid_t pid=ownerPID(root);
+        NSMutableDictionary *main=[u mutableCopy];main[@"group_root"]=@(root);[updates addObject:main];
+        if(!pid||(u[@"pid"]&&pid!=[u[@"pid"] intValue]))continue;
+        NSDictionary *family=familyBounds(root,pid);if(!family)return nil;
+        if(!family.count)continue;
+        CGRect physical,shown;CGAffineTransform t;
+        if(sky.getBounds(sky.connection(),root,&physical)||!validSurfaceBounds(physical))return nil;
+        rect(u[@"frame"],&shown);
+        if(u[@"viewport"]&&!u[@"drag_frame"]) {
+            if(sky.getTransform(sky.connection(),root,&t))return nil;
+            shown.origin=CGPointMake(-t.tx,-t.ty);
+        } else if(u[@"drag_frame"])rect(u[@"drag_frame"],&shown);
+        CGRect viewport;BOOL hasViewport=rect(u[@"clip_viewport"]?:u[@"viewport"],&viewport);
+        for(NSNumber *child in family) {
+            if([rootIDs containsObject:child])continue;
+            CGRect b=[family[child] rectValue];
+            CGRect f=CGRectMake(shown.origin.x+b.origin.x-physical.origin.x,
+                shown.origin.y+b.origin.y-physical.origin.y,b.size.width,b.size.height);
+            CGRect c=hasViewport?CGRectIntersection(f,viewport):f;
+            id clip=(u[@"clip"]==NSNull.null||CGRectIsNull(c)||CGRectIsEmpty(c))?NSNull.null:rectObject(c);
+            NSMutableDictionary *derived=[@{@"wid":child,@"pid":@(pid),@"group_root":@(root),
+                @"frame":rectObject(f),@"clip":clip} mutableCopy];
+            if(u[@"viewport"]) {derived[@"viewport"]=u[@"viewport"];derived[@"drag_frame"]=rectObject(f);}
+            if(hasViewport)derived[@"clip_viewport"]=rectObject(viewport);
+            [updates addObject:derived];if(updates.count>512)return nil;
+        }
+    }
+    return updates;
+}
 static NSDictionary *setSticky(NSDictionary *u,NSString *session) {
     if(!hasStickyAPI)return error(@"Sticky API unavailable");
     if(!stickyDescriptor(u))return error(@"Invalid sticky descriptor");
@@ -140,12 +232,16 @@ static NSDictionary *frame(NSDictionary *r) {
         if(u[@"pid"]&&!identifier(u[@"pid"],INT_MAX,&pid))return error(@"Invalid expected owner PID");
         CGRect viewport;
         if(u[@"viewport"]&&!rect(u[@"viewport"],&viewport))return error(@"Invalid interactive viewport");
+        if(u[@"clip_viewport"]&&!rect(u[@"clip_viewport"],&viewport))return error(@"Invalid group viewport");
         CGRect dragFrame;
         if(u[@"drag_frame"]&&(!u[@"viewport"]||!rect(u[@"drag_frame"],&dragFrame)))return error(@"Invalid pointer drag frame");
         [ids addObject:@((uint32_t)v)];
     }
+    updates=expandFamilies(updates);
+    if(!updates)return error(@"Cannot resolve bounded owner window families");
+    for(NSDictionary *u in updates)[ids addObject:u[@"wid"]];
     NSMutableSet *allIDs=[ids mutableCopy];[allIDs unionSet:stickyIDs];
-    if(allIDs.count>128)return error(@"At most 128 total windows");
+    if(allIDs.count>512)return error(@"At most 512 surfaces including children");
     if(restoreSticky(stickyIDs))return error(@"Could not restore removed sticky lease");
     for(NSDictionary *u in stickies) {
         if(ownerPID([u[@"wid"] unsignedIntValue])!=[u[@"pid"] intValue])continue;
@@ -178,7 +274,8 @@ static NSDictionary *frame(NSDictionary *r) {
             if(fabs(t.a-1)>1e-6||fabs(t.b)>1e-6||fabs(t.c)>1e-6||fabs(t.d-1)>1e-6||!isfinite(t.tx)||!isfinite(t.ty)) {
                 sky.releaseRegion(clip);return error(@"Window already has a custom transform");
             }
-            w=[RibbonSavedWindowV3 new];w.wid=wid;w.bounds=b;w.transform=t;w.clip=clip;w.pid=pid;saved[@(wid)]=w;
+            w=[RibbonSavedWindowV3 new];w.wid=wid;w.bounds=b;w.transform=t;w.clip=clip;w.pid=pid;
+            w.root=[u[@"group_root"] unsignedIntValue];saved[@(wid)]=w;
         }
         CGRect local=CGRectZero;
         BOOL interactive=u[@"viewport"]!=nil;
@@ -223,7 +320,8 @@ static NSDictionary *overview(void) {
         CGError er=sky.newRegion(&full,&region);
         CGError ec=er?er:sky.setClip(sky.connection(),w.wid,region);
         if(region)sky.releaseRegion(region);
-        CGError et=ec?ec:sky.setTransform(sky.connection(),w.wid,w.transform);
+        CGAffineTransform native=CGAffineTransformMakeTranslation(-b.origin.x,-b.origin.y);
+        CGError et=ec?ec:sky.setTransform(sky.connection(),w.wid,native);
         if(ec||et)return error(@"Cannot expose full window");
     }
     lastUpdate=NSProcessInfo.processInfo.systemUptime;
@@ -241,6 +339,8 @@ static NSDictionary *releaseFrames(NSDictionary *r,BOOL all) {
         if(old&&old.pid!=(int)pid)return error(@"Release requires a matching lease");
         [ids addObject:@((uint32_t)wid)];
     }
+    updates=expandFamilies(updates);
+    if(!updates)return error(@"Cannot resolve released window families");
     // Commit the usable desktop frame rather than returning to an obsolete
     // startup transform/clip. Rust has settled the corresponding AX geometry.
     NSMutableSet *finished=[NSMutableSet set];
@@ -266,7 +366,7 @@ static NSDictionary *releaseFrames(NSDictionary *r,BOOL all) {
 static NSDictionary *finish(NSDictionary *r) {return releaseFrames(r,YES);}
 static NSDictionary *handle(id r) {
     if(![r isKindOfClass:NSDictionary.class])return error(@"Expected JSON object");
-    if([r[@"op"] isEqual:@"hello"])return @{@"ok":@YES,@"version":@2,@"capabilities":hasStickyAPI?@[@"sticky",@"interactive_clip",@"overview",@"finish",@"pointer_drag"]:@[@"interactive_clip",@"overview",@"finish",@"pointer_drag"],@"build":buildName?:@"",@"pid":@(getpid()),@"uid":@(getuid()),@"controlled":@(controlledCount())};
+    if([r[@"op"] isEqual:@"hello"])return @{@"ok":@YES,@"version":@2,@"capabilities":hasStickyAPI?@[@"sticky",@"interactive_clip",@"overview",@"finish",@"pointer_drag",@"window_groups"]:@[@"interactive_clip",@"overview",@"finish",@"pointer_drag",@"window_groups"],@"build":buildName?:@"",@"pid":@(getpid()),@"uid":@(getuid()),@"controlled":@(controlledCount())};
     NSString *session=r[@"session"];
     if(![session isKindOfClass:NSString.class]||session.length==0||session.length>128)return error(@"Invalid session");
     if(controller&&![controller isEqual:session])return error(@"Another controller holds the lease");

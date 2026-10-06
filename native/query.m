@@ -290,6 +290,9 @@ static int resizeWindow(uint32_t wid,int expected_pid,RibbonRect target,BOOL log
     RibbonRect outer=logicalTarget?(RibbonRect){target.x+native.x-ax.x,target.y+native.y-ax.y,
         target.width+native.width-ax.width,target.height+native.height-ax.height}:target;
     if(!isfinite(rect.x)||!isfinite(rect.y)||!isfinite(rect.width)||!isfinite(rect.height)||rect.width<=0||rect.height<=0){CFRelease(w);return kAXErrorIllegalArgument;}
+    // A press can arrive while an earlier AX request is settling. Never issue
+    // a new position/size write into the owner's native mouse interaction.
+    if(ribbon_left_mouse_down()){CFRelease(w);return kAXErrorCannotComplete;}
     // AppKit constrains a resize against the logical frame's current position.
     // Anchor it inside its monitor before sizing; the compositor owns the visual position.
     CGPoint position=CGPointMake(rect.x,rect.y);AXValueRef p=AXValueCreate(kAXValueCGPointType,&position);
@@ -298,6 +301,7 @@ static int resizeWindow(uint32_t wid,int expected_pid,RibbonRect target,BOOL log
     CFRelease(p);
     if(!error&&progress&&progress(context))error=kAXErrorFailure;
     CGSize size=CGSizeMake(rect.width,rect.height);AXValueRef value=AXValueCreate(kAXValueCGSizeType,&size);
+    if(!error&&ribbon_left_mouse_down())error=kAXErrorCannotComplete;
     if(!error&&(fabs(ax.width-size.width)>2||fabs(ax.height-size.height)>2))error=AXUIElementSetAttributeValue(w,kAXSizeAttribute,value);
     CFRelease(value);
     CGSize accepted=CGSizeZero;

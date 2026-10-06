@@ -37,6 +37,8 @@ struct Update {
     viewport: Option<Rect>,
     #[serde(skip_serializing_if = "Option::is_none")]
     drag_frame: Option<Rect>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clip_viewport: Option<Rect>,
 }
 #[derive(Serialize)]
 struct Request<'a> {
@@ -101,7 +103,8 @@ impl Backend {
         b.lifecycle.set(
             status.capabilities.iter().any(|c| c == "overview")
                 && status.capabilities.iter().any(|c| c == "finish")
-                && status.capabilities.iter().any(|c| c == "pointer_drag"),
+                && status.capabilities.iter().any(|c| c == "pointer_drag")
+                && status.capabilities.iter().any(|c| c == "window_groups"),
         );
         if !matches!(status.version, 1 | 2) || status.uid != uid() {
             bail!("Unexpected payload version or user");
@@ -160,7 +163,7 @@ impl Backend {
     pub fn require_live_version(&self) -> Result<()> {
         if self.version.get() != 2 || !self.interactive.get() || !self.lifecycle.get() {
             bail!(
-                "Reload the Dock backend with nix develop -c sh scripts/load-backend.sh (protocol 2, interactive_clip, overview, finish and pointer_drag required)"
+                "Reload the Dock backend with nix develop -c sh scripts/load-backend.sh (protocol 2, interactive_clip, overview, finish, pointer_drag and window_groups required)"
             );
         }
         Ok(())
@@ -182,7 +185,16 @@ impl Backend {
         owners: &BTreeMap<WindowId, i32>,
         stickies: &[StickyWindow],
     ) -> Result<()> {
-        self.send_frame(placements, owners, stickies, None)
+        self.send_frame(placements, owners, stickies, None, None)
+    }
+    pub fn frame_with_sticky_in_viewports(
+        &self,
+        placements: &[Placement],
+        owners: &BTreeMap<WindowId, i32>,
+        stickies: &[StickyWindow],
+        viewports: &BTreeMap<String, Rect>,
+    ) -> Result<()> {
+        self.send_frame(placements, owners, stickies, None, Some(viewports))
     }
     pub fn interactive_frame(
         &self,
@@ -198,6 +210,7 @@ impl Backend {
             owners,
             stickies,
             Some((viewports, window, drag_frame)),
+            Some(viewports),
         )
     }
     fn send_frame(
@@ -206,6 +219,7 @@ impl Backend {
         owners: &BTreeMap<WindowId, i32>,
         stickies: &[StickyWindow],
         viewports: Option<(&BTreeMap<String, Rect>, WindowId, Option<Rect>)>,
+        clip_viewports: Option<&BTreeMap<String, Rect>>,
     ) -> Result<()> {
         self.require_live_version()?;
         if placements.len() > 128 {
@@ -235,6 +249,7 @@ impl Backend {
                             drag_frame: viewports
                                 .filter(|(_, id, _)| *id == p.window)
                                 .and_then(|(_, _, f)| f),
+                            clip_viewport: clip_viewports.and_then(|v| v.get(&p.monitor).copied()),
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
@@ -267,6 +282,7 @@ impl Backend {
                 clip: Some(placement.frame),
                 viewport: None,
                 drag_frame: None,
+                clip_viewport: None,
             }]),
             None,
             None,
@@ -284,6 +300,7 @@ impl Backend {
                     clip: Some(p.frame),
                     viewport: None,
                     drag_frame: None,
+                    clip_viewport: None,
                 })
             })
             .collect::<Result<Vec<_>>>()?;

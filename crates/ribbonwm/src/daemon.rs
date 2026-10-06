@@ -39,6 +39,7 @@ struct MouseCapture {
     current: Option<Rect>,
     shown: Option<Rect>,
     changed: bool,
+    corrected: bool,
     resizing: bool,
     left_edge: bool,
     top_edge: bool,
@@ -79,7 +80,12 @@ fn chrome_hit(frame: Rect, point: (f64, f64)) -> bool {
         || y >= frame.y + frame.height - 8.0
 }
 impl MouseCapture {
-    fn update(&mut self, engine: &Engine, geometry: &GeometryLease) -> Option<WindowId> {
+    fn update(
+        &mut self,
+        engine: &Engine,
+        geometry: &GeometryLease,
+        committed: &[Placement],
+    ) -> Option<WindowId> {
         let sample = ribbon_macos::mouse_state();
         if !ribbon_macos::left_mouse_down() {
             *self = Self::default();
@@ -111,7 +117,28 @@ impl MouseCapture {
                 {
                     self.surface = Some(surface);
                     self.current = Some(surface);
-                    self.shown = Some(shown);
+                    // The owner may already have moved before this frame reads
+                    // the press. Anchor the grab to our last committed display,
+                    // not a transform that may contain the owner's first jump.
+                    self.shown = Some(
+                        committed
+                            .iter()
+                            .find(|old| {
+                                old.window == p.window && old.native_space == p.native_space
+                            })
+                            .map_or(shown, |old| Rect {
+                                x: old.frame.x,
+                                y: old.frame.y,
+                                width: surface.width,
+                                height: surface.height,
+                            }),
+                    );
+                    if let Some(anchor) = self.shown {
+                        self.corrected = (surface.x - anchor.x).abs() <= 2.0
+                            && (surface.y - anchor.y).abs() <= 2.0
+                            && (shown.x - anchor.x).abs() <= 2.0
+                            && (shown.y - anchor.y).abs() <= 2.0;
+                    }
                 }
                 let frame = self.shown.unwrap_or(p.frame);
                 self.left_edge = self.point.0 <= frame.x + 8.0;
@@ -127,32 +154,47 @@ impl MouseCapture {
             && let Some(id) = self.window
             && let Some(w) = geometry.originals.get(&id)
             && let Some(before) = self.surface
-            && let Ok((now, _)) = ribbon_macos::window_drag_geometry(id, w.pid)
+            && let Ok((now, shown)) = ribbon_macos::window_drag_geometry(id, w.pid)
         {
             let changed = (now.x - before.x).abs() > 2.0
                 || (now.y - before.y).abs() > 2.0
                 || (now.width - before.width).abs() > 2.0
                 || (now.height - before.height).abs() > 2.0;
-            self.changed |= changed;
-            self.active |= changed;
+            let moved_transform = self.shown.is_some_and(|start| {
+                (shown.x - start.x).abs() > 2.0 || (shown.y - start.y).abs() > 2.0
+            });
+            self.changed |= changed || moved_transform;
+            self.active |= changed || moved_transform;
             self.current = Some(now);
         }
         self.window.filter(|_| self.active)
     }
     fn frame(&self, viewport: Rect) -> Option<Rect> {
-        if !self.changed {
+        self.frame_for_pointer(ribbon_macos::pointer(), viewport)
+    }
+    fn frame_for_pointer(&self, pointer: (f64, f64), viewport: Rect) -> Option<Rect> {
+        if !self.changed || self.corrected {
             return None;
         }
         let current = self.current?;
         let mut frame = drag_frame(
             self.shown?,
             self.point,
-            ribbon_macos::pointer(),
+            pointer,
             current,
             self.resizing,
             self.left_edge,
             self.top_edge,
         );
+        // Prefer an accepted owner position to a pointer sample that runs
+        // slightly ahead of AppKit's first drag transaction.
+        if !self.resizing
+            && (current.x - frame.x).abs() <= 4.0
+            && (current.y - frame.y).abs() <= 4.0
+        {
+            frame.x = current.x;
+            frame.y = current.y;
+        }
         frame.y = frame.y.max(viewport.y);
         Some(frame)
     }
@@ -625,6 +667,13 @@ fn monitor_for(engine: &Engine, requested: Option<String>) -> Result<String> {
         .map(|m| m.id.clone())
         .context("No active monitor")
 }
+fn monitor_viewports(engine: &Engine) -> BTreeMap<String, Rect> {
+    engine
+        .monitors
+        .iter()
+        .map(|(id, m)| (id.clone(), m.viewport))
+        .collect()
+}
 fn sticky_leases(geometry: &GeometryLease) -> Vec<StickyWindow> {
     geometry
         .modes
@@ -705,7 +754,12 @@ fn set_mode(
                     .map(|(id, w)| (*id, w.pid))
                     .collect();
                 ribbon_macos::resize_window_observed(id, original.pid, released.frame, || {
-                    backend.frame_with_sticky(&held, &owners, &sticky_leases(geometry))
+                    backend.frame_with_sticky_in_viewports(
+                        &held,
+                        &owners,
+                        &sticky_leases(geometry),
+                        &monitor_viewports(engine),
+                    )
                 })?;
                 backend.detach(&released, original.pid)?;
             }
@@ -738,7 +792,12 @@ fn set_mode(
                 .iter()
                 .map(|(id, w)| (*id, w.pid))
                 .collect();
-            backend.frame_with_sticky(&engine.placements(), &owners, &sticky_leases(geometry))?;
+            backend.frame_with_sticky_in_viewports(
+                &engine.placements(),
+                &owners,
+                &sticky_leases(geometry),
+                &monitor_viewports(engine),
+            )?;
         }
         Ok(())
     })();
@@ -1029,6 +1088,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
     let frame_trace = std::env::var_os("RIBBONWM_FRAME_TRACE").is_some();
     let mut last_frame = Vec::new();
     let mut committed: Vec<Placement> = Vec::new();
+    let mut anchor_attempts: BTreeMap<WindowId, (Rect, Instant)> = BTreeMap::new();
     let mut quit = false;
     let mut input: Option<ribbon_macos::input::InputSource> = None;
     let mut last_input_attempt = last_tick - Duration::from_secs(5);
@@ -1065,11 +1125,15 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                 mouse = MouseCapture::default();
             }
             let suspended = overview || start < overview_resume;
+            let previous_drag = geometry.dragged;
             geometry.dragged = if options.dry_run || suspended {
                 None
             } else {
-                mouse.update(&engine, &geometry)
+                mouse.update(&engine, &geometry, &committed)
             };
+            if let Some(id) = previous_drag.filter(|_| geometry.dragged.is_none()) {
+                anchor_attempts.remove(&id);
+            }
             if !options.dry_run
                 && engine.settings.gesture_scroll
                 && input.is_none()
@@ -1268,7 +1332,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
             }
             // Do not recenter underneath the pointer during a border drag. Keep
             // adopting native sizes, then animate the final target after release.
-            if geometry.dragged.is_none() {
+            if geometry.dragged.is_none() && !ribbon_macos::left_mouse_down() {
                 engine.tick(start.duration_since(last_tick).as_secs_f64());
             }
             last_tick = start;
@@ -1314,10 +1378,66 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                                 .viewport,
                         ),
                     )?;
+                    // AppKit translates its current compositor transform for
+                    // every native move. Repeated absolute pointer corrections
+                    // feed the previous correction back into the next owner
+                    // transaction, making the two writers fight. Remove the
+                    // initial physical/presentation offset once, then let the
+                    // owner move while the backend updates only the clip.
+                    mouse.corrected |= mouse.changed;
                     last_tick = Instant::now();
                     last_frame.clear();
                     std::thread::sleep(frame_duration);
                     continue 'frames;
+                }
+                if ribbon_macos::left_mouse_down() {
+                    // Content clicks and unmanaged drags must not let an AX
+                    // resize/rebase run before capture has identified chrome.
+                    backend.heartbeat()?;
+                    last_tick = Instant::now();
+                    std::thread::sleep(frame_duration);
+                    continue 'frames;
+                }
+                // At rest, a completely visible window can use its real native
+                // position. This prevents AppKit's first drag transaction from
+                // applying a leftover scroll/drag translation twice, and gives
+                // macOS decorations the same anchor as the displayed surface.
+                // Partially clipped columns remain compositor-scrolled.
+                let mut rebase_only = BTreeSet::new();
+                if !animating && !ribbon_macos::left_mouse_down() {
+                    for p in &plans {
+                        let m = &engine.monitors[&p.monitor];
+                        if m.suspended
+                            || m.native_space != p.native_space
+                            || p.clip != Some(p.frame)
+                        {
+                            continue;
+                        }
+                        let Some(w) = geometry.originals.get(&p.window) else {
+                            continue;
+                        };
+                        if sizes.get(&p.window) != Some(&(w.pid, p.frame.width, p.frame.height)) {
+                            continue;
+                        }
+                        if anchor_attempts
+                            .get(&p.window)
+                            .is_some_and(|(frame, next)| *frame == p.frame && start < *next)
+                        {
+                            continue;
+                        }
+                        anchor_attempts
+                            .insert(p.window, (p.frame, start + Duration::from_millis(100)));
+                        if let Ok((surface, _)) =
+                            ribbon_macos::window_drag_geometry(p.window, w.pid)
+                            && ((surface.x - p.frame.x).abs() > 2.0
+                                || (surface.y - p.frame.y).abs() > 2.0)
+                        {
+                            anchor_attempts
+                                .insert(p.window, (p.frame, start + Duration::from_secs(1)));
+                            sizes.remove(&p.window);
+                            rebase_only.insert(p.window);
+                        }
+                    }
                 }
                 let mut geometry_changed = false;
                 // Hold the previously committed layout through the entire AX resize
@@ -1347,17 +1467,26 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                             .find(|old| {
                                 old.window == p.window && old.native_space == p.native_space
                             })
-                            .filter(|_| sizes.get(&p.window).is_some_and(|s| s.0 == w.pid))
+                            .filter(|_| {
+                                rebase_only.contains(&p.window)
+                                    || sizes.get(&p.window).is_some_and(|s| s.0 == w.pid)
+                            })
                         {
                             *p = previous.clone();
                         } else {
-                            p.frame = w.bounds;
-                            p.clip = Some(w.bounds);
+                            p.frame =
+                                ribbon_macos::window_presentation(w.id, w.pid).unwrap_or(w.bounds);
+                            p.clip = p.frame.intersection(engine.monitors[&p.monitor].viewport);
                         }
                     }
                     // Drag captures already took the interactive-only branch
                     // above. Save originals before AX changes the transform.
-                    backend.frame_with_sticky(&held, &owners, &sticky_leases(&geometry))?;
+                    backend.frame_with_sticky_in_viewports(
+                        &held,
+                        &owners,
+                        &sticky_leases(&geometry),
+                        &monitor_viewports(&engine),
+                    )?;
                 }
                 let mut lease_tick = Instant::now();
                 for p in &plans {
@@ -1381,11 +1510,36 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                         let resized = ribbon_macos::resize_window_observed(
                             p.window,
                             w.pid,
-                            resize_anchor(viewport, w.bounds, size.1, size.2),
-                            || backend.frame_with_sticky(&held, &owners, &sticky_leases(&geometry)),
+                            if p.clip == Some(p.frame) {
+                                p.frame
+                            } else {
+                                resize_anchor(viewport, w.bounds, size.1, size.2)
+                            },
+                            || {
+                                if ribbon_macos::left_mouse_down() {
+                                    bail!("Native mouse interaction began during geometry update");
+                                }
+                                backend.frame_with_sticky_in_viewports(
+                                    &held,
+                                    &owners,
+                                    &sticky_leases(&geometry),
+                                    &monitor_viewports(&engine),
+                                )
+                            },
                         );
                         inventory.invalidate();
                         if let Err(e) = resized {
+                            if ribbon_macos::left_mouse_down() {
+                                last_frame.clear();
+                                continue 'frames;
+                            }
+                            if rebase_only.contains(&p.window) {
+                                // A refused position is not a reason to change
+                                // the user's tiled/floating mode or old layout.
+                                sizes.insert(p.window, size);
+                                eprintln!("Native anchor for {} deferred: {e:#}", p.window.0);
+                                continue;
+                            }
                             if ribbon_macos::window_owner(p.window) != w.pid {
                                 forget_closed(&mut engine, &mut geometry, p.window)?;
                                 sizes.remove(&p.window);
@@ -1413,10 +1567,11 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                                 .iter()
                                 .map(|(id, w)| (*id, w.pid))
                                 .collect();
-                            backend.frame_with_sticky(
+                            backend.frame_with_sticky_in_viewports(
                                 &engine.placements(),
                                 &owners,
                                 &sticky_leases(&geometry),
+                                &monitor_viewports(&engine),
                             )?;
                             last_frame.clear();
                             committed.retain(|old| old.window != p.window);
@@ -1427,7 +1582,12 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                         // A slow owner must not expire the restoration lease. The
                         // heartbeat holds old placements until all owners are ready.
                         if lease_tick.elapsed() >= Duration::from_millis(250) {
-                            backend.frame_with_sticky(&held, &owners, &sticky_leases(&geometry))?;
+                            backend.frame_with_sticky_in_viewports(
+                                &held,
+                                &owners,
+                                &sticky_leases(&geometry),
+                                &monitor_viewports(&engine),
+                            )?;
                             lease_tick = Instant::now();
                         }
                     }
@@ -1448,7 +1608,12 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                     || frame != last_frame
                     || start.duration_since(last_send) >= Duration::from_millis(50)
                 {
-                    backend.frame_with_sticky(&plans, &owners, &sticky_leases(&geometry))?;
+                    backend.frame_with_sticky_in_viewports(
+                        &plans,
+                        &owners,
+                        &sticky_leases(&geometry),
+                        &monitor_viewports(&engine),
+                    )?;
                     last_frame = frame;
                     committed = plans;
                     last_send = Instant::now();
@@ -1490,7 +1655,12 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
             p.clip = Some(p.frame);
             if let Err(error) =
                 ribbon_macos::resize_window_observed(p.window, w.pid, p.frame, || {
-                    backend.frame_with_sticky(&held, &owners, &sticky_leases(&geometry))
+                    backend.frame_with_sticky_in_viewports(
+                        &held,
+                        &owners,
+                        &sticky_leases(&geometry),
+                        &monitor_viewports(&engine),
+                    )
                 })
             {
                 eprintln!("Stop geometry for {}: {error:#}", p.window.0);
@@ -1539,6 +1709,49 @@ fn gesture_targets(engine: &Engine, blocked: bool) -> Vec<ribbon_macos::input::T
 mod tests {
     use super::*;
     use ribbon_core::{NativeSpaceId, Rect};
+
+    #[test]
+    fn native_drag_gets_one_offset_correction_then_yields_to_its_owner() {
+        let shown = Rect {
+            x: 24.0,
+            y: 57.0,
+            width: 1464.0,
+            height: 901.0,
+        };
+        let viewport = Rect {
+            x: 0.0,
+            y: 33.0,
+            width: 1512.0,
+            height: 949.0,
+        };
+        let mut capture = MouseCapture {
+            point: (174.0, 88.0),
+            shown: Some(shown),
+            current: Some(shown),
+            changed: true,
+            ..MouseCapture::default()
+        };
+        let first = capture.frame_for_pointer((179.0, 91.0), viewport).unwrap();
+        assert_eq!((first.x, first.y), (29.0, 60.0));
+        capture.corrected = true;
+        // Owner moves are no longer overwritten by a newer pointer sample.
+        capture.current = Some(Rect {
+            x: 210.0,
+            y: 150.0,
+            ..shown
+        });
+        assert!(
+            capture
+                .frame_for_pointer((420.0, 250.0), viewport)
+                .is_none()
+        );
+        // Release creates a fresh capture; correction applies again if needed.
+        capture.corrected = false;
+        assert_eq!(
+            capture.frame_for_pointer((179.0, 0.0), viewport).unwrap().y,
+            33.0
+        );
+    }
 
     #[test]
     fn pointer_drag_does_not_double_logical_translation_offsets() {
