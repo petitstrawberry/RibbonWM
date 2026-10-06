@@ -174,6 +174,12 @@ static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
 }
 @end
 int main(int argc,char **argv) {@autoreleasepool {
+    if(argc==2&&!strcmp(argv[1],"--overview-state")) {reply(@{@"active":@(ribbon_mission_control_active())});return 0;}
+    if(argc==2&&!strcmp(argv[1],"--overview-exit")) {
+        if(!ribbon_mission_control_active())return 1;
+        CGEventRef down=CGEventCreateKeyboardEvent(NULL,53,true),up=CGEventCreateKeyboardEvent(NULL,53,false);
+        CGEventPost(kCGHIDEventTap,down);CGEventPost(kCGHIDEventTap,up);CFRelease(down);CFRelease(up);return 0;
+    }
     if((argc==2||argc==3)&&!strcmp(argv[1],"--permission-only")) {
         NSMutableDictionary *state=[@{@"cached":@(AXIsProcessTrusted()),@"live":@(ribbon_ax_trusted()),@"pid":@(getpid())} mutableCopy];
         if(argc==3)state[@"owned_access"]=@(ribbon_owned_probe_accessible(atoi(argv[2])));
@@ -314,9 +320,10 @@ int main(int argc,char **argv) {@autoreleasepool {
                 }
                 reply(@{@"posted_scroll":@(direct),@"posted_momentum":@(tail)});return 0;
             }
-            double dx=0;
+            double dx=0,dy=0;
             if(drag) {
-                dx=strtod(argv[4],&end);if(*end||!isfinite(dx)||fabs(dx)>200||strcmp(argv[5],"0")!=0)return 1;
+                dx=strtod(argv[4],&end);if(*end||!isfinite(dx)||fabs(dx)>200)return 1;
+                dy=strtod(argv[5],&end);if(*end||!isfinite(dy)||fabs(dy)>200||(!moveDrag&&dy!=0))return 1;
                 if(ribbon_focused_window((int)pid)!=wid||[clip[0] doubleValue]!=0||fabs([clip[2] doubleValue]-[state[@"frame"][@"width"] doubleValue])>1)return 1;
                 point.x=-[t[4] doubleValue]+[clip[2] doubleValue]-1;
                 if(moveDrag)point=CGPointMake(-[t[4] doubleValue]+[clip[2] doubleValue]/2,-[t[5] doubleValue]+10);
@@ -324,17 +331,25 @@ int main(int argc,char **argv) {@autoreleasepool {
             CGEventRef move=CGEventCreateMouseEvent(NULL,kCGEventMouseMoved,point,kCGMouseButtonLeft);
             CGEventRef down=CGEventCreateMouseEvent(NULL,kCGEventLeftMouseDown,point,kCGMouseButtonLeft);
             CGEventRef up=CGEventCreateMouseEvent(NULL,kCGEventLeftMouseUp,point,kCGMouseButtonLeft);
-            CGEventPost(kCGHIDEventTap,move);usleep(100000);CGEventPost(kCGHIDEventTap,down);usleep(50000);
+            CGEventPost(kCGHIDEventTap,move);usleep(100000);
+            NSDictionary *beforeDown=moveDrag?windowState(sky,(uint32_t)wid):nil;
+            CGEventPost(kCGHIDEventTap,down);
+            NSMutableArray *pressSamples=[NSMutableArray array];
+            for(int i=0;i<10;i++) {
+                usleep(5000);
+                if(moveDrag)[pressSamples addObject:windowState(sky,(uint32_t)wid)];
+            }
             if(drag) {
                 NSMutableArray *samples=[NSMutableArray array];
                 for(unsigned i=1;i<=10;i++) {
-                    CGPoint next=CGPointMake(point.x+dx*i/10,point.y);
+                    CGPoint next=CGPointMake(point.x+dx*i/10,point.y+dy*i/10);
                     CGEventRef event=CGEventCreateMouseEvent(NULL,kCGEventLeftMouseDragged,next,kCGMouseButtonLeft);
                     CGEventPost(kCGHIDEventTap,event);CFRelease(event);usleep(50000);
                     if(moveDrag)[samples addObject:windowState(sky,(uint32_t)wid)];
                 }
-                CGEventSetLocation(up,CGPointMake(point.x+dx,point.y));
-                if(moveDrag)reply(@{@"drag_samples":samples});
+                CGEventSetLocation(up,CGPointMake(point.x+dx,point.y+dy));
+                if(moveDrag)reply(@{@"drag_samples":samples,@"before_down":beforeDown,@"press_samples":pressSamples,
+                    @"press":@[@(point.x),@(point.y)]});
             }
             CGEventPost(kCGHIDEventTap,up);
             CFRelease(move);CFRelease(down);CFRelease(up);

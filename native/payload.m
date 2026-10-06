@@ -140,6 +140,8 @@ static NSDictionary *frame(NSDictionary *r) {
         if(u[@"pid"]&&!identifier(u[@"pid"],INT_MAX,&pid))return error(@"Invalid expected owner PID");
         CGRect viewport;
         if(u[@"viewport"]&&!rect(u[@"viewport"],&viewport))return error(@"Invalid interactive viewport");
+        CGRect dragFrame;
+        if(u[@"drag_frame"]&&(!u[@"viewport"]||!rect(u[@"drag_frame"],&dragFrame)))return error(@"Invalid pointer drag frame");
         [ids addObject:@((uint32_t)v)];
     }
     NSMutableSet *allIDs=[ids mutableCopy];[allIDs unionSet:stickyIDs];
@@ -180,6 +182,7 @@ static NSDictionary *frame(NSDictionary *r) {
         }
         CGRect local=CGRectZero;
         BOOL interactive=u[@"viewport"]!=nil;
+        BOOL pointerDrag=u[@"drag_frame"]!=nil;
         if(interactive) {
             // Rust decides when to suspend placement. Read the owner's current
             // surface; clip it to the leased monitor without moving it back.
@@ -188,12 +191,16 @@ static NSDictionary *frame(NSDictionary *r) {
             if(fabs(current.a-1)>1e-6||fabs(current.b)>1e-6||fabs(current.c)>1e-6||fabs(current.d-1)>1e-6)return error(@"Unsupported interactive transform");
             rect(u[@"viewport"],&viewport);
             CGRect shown=CGRectMake(-current.tx,-current.ty,bounds.size.width,bounds.size.height);
+            if(pointerDrag) {
+                CGRect desired;rect(u[@"drag_frame"],&desired);
+                shown.origin=desired.origin;f.origin=desired.origin;
+            }
             CGRect visible=CGRectIntersection(shown,viewport);
             if(!CGRectIsNull(visible)&&!CGRectIsEmpty(visible))local=CGRectMake(visible.origin.x-shown.origin.x,visible.origin.y-shown.origin.y,visible.size.width,visible.size.height);
         } else if(u[@"clip"]!=NSNull.null) {rect(u[@"clip"],&c);local=CGRectMake(c.origin.x-f.origin.x,c.origin.y-f.origin.y,c.size.width,c.size.height);}
         CFTypeRef region=NULL;CGError er=sky.newRegion(&local,&region);
         CGError ec=er?er:sky.setClip(sky.connection(),wid,region);
-        CGError et=ec?ec:(interactive?0:sky.setTransform(sky.connection(),wid,CGAffineTransformMakeTranslation(-f.origin.x,-f.origin.y)));
+        CGError et=ec?ec:(interactive&&!pointerDrag?0:sky.setTransform(sky.connection(),wid,CGAffineTransformMakeTranslation(-f.origin.x,-f.origin.y)));
         if(region)sky.releaseRegion(region);
         if(ec||et) {
             if(ownerPID(wid)!=pid){forgetWindow(wid);continue;}
@@ -207,15 +214,69 @@ static NSDictionary *frame(NSDictionary *r) {
     if(controlledCount()==0)controller=nil;
     return @{@"ok":@YES,@"controlled":@(controlledCount())};
 }
+static NSDictionary *overview(void) {
+    for(RibbonSavedWindowV3 *w in saved.allValues) {
+        if(ownerPID(w.wid)!=w.pid){forgetWindow(w.wid);continue;}
+        CGRect b;CGError eb=sky.getBounds(sky.connection(),w.wid,&b);
+        if(eb||!isfinite(b.size.width)||!isfinite(b.size.height)||b.size.width<=0||b.size.height<=0)return error(@"Cannot read overview surface");
+        CGRect full=CGRectMake(0,0,b.size.width,b.size.height);CFTypeRef region=NULL;
+        CGError er=sky.newRegion(&full,&region);
+        CGError ec=er?er:sky.setClip(sky.connection(),w.wid,region);
+        if(region)sky.releaseRegion(region);
+        CGError et=ec?ec:sky.setTransform(sky.connection(),w.wid,w.transform);
+        if(ec||et)return error(@"Cannot expose full window");
+    }
+    lastUpdate=NSProcessInfo.processInfo.systemUptime;
+    return @{@"ok":@YES};
+}
+static NSDictionary *releaseFrames(NSDictionary *r,BOOL all) {
+    NSArray *updates=r[@"updates"];
+    if(![updates isKindOfClass:NSArray.class]||updates.count>128)return error(@"Invalid release updates");
+    NSMutableSet *ids=[NSMutableSet set];
+    for(id u in updates) {
+        double wid=0,pid=0;CGRect f;
+        if(![u isKindOfClass:NSDictionary.class]||!identifier(u[@"wid"],UINT32_MAX,&wid)||
+           !identifier(u[@"pid"],INT_MAX,&pid)||!rect(u[@"frame"],&f)||[ids containsObject:@((uint32_t)wid)])return error(@"Invalid release descriptor");
+        RibbonSavedWindowV3 *old=saved[@((uint32_t)wid)];
+        if(old&&old.pid!=(int)pid)return error(@"Release requires a matching lease");
+        [ids addObject:@((uint32_t)wid)];
+    }
+    // Commit the usable desktop frame rather than returning to an obsolete
+    // startup transform/clip. Rust has settled the corresponding AX geometry.
+    NSMutableSet *finished=[NSMutableSet set];
+    for(NSDictionary *u in updates) {
+        uint32_t wid=[u[@"wid"] unsignedIntValue];pid_t pid=[u[@"pid"] intValue];CGRect f;
+        if(!saved[@(wid)])continue;
+        rect(u[@"frame"],&f);
+        if(ownerPID(wid)!=pid){forgetWindow(wid);continue;}
+        CGRect b;CGError eb=sky.getBounds(sky.connection(),wid,&b);
+        if(eb||!isfinite(b.size.width)||!isfinite(b.size.height)||b.size.width<=0||b.size.height<=0)return error(@"Cannot read released surface");
+        CGRect full=CGRectMake(0,0,b.size.width,b.size.height);CFTypeRef region=NULL;
+        CGError er=sky.newRegion(&full,&region),ec=er?er:sky.setClip(sky.connection(),wid,region);
+        if(region)sky.releaseRegion(region);
+        CGError et=ec?ec:sky.setTransform(sky.connection(),wid,CGAffineTransformMakeTranslation(-f.origin.x,-f.origin.y));
+        if(ec||et)return error(@"Cannot release full window");
+        [finished addObject:@(wid)];
+    }
+    for(NSNumber *wid in finished)forgetWindow(wid.unsignedIntValue);
+    unsigned failed=all?restoreAll():0;lastUpdate=NSProcessInfo.processInfo.systemUptime;
+    if(!controlledCount())controller=nil;
+    return failed?error(@"Remaining restoration failed"):@{@"ok":@YES};
+}
+static NSDictionary *finish(NSDictionary *r) {return releaseFrames(r,YES);}
 static NSDictionary *handle(id r) {
     if(![r isKindOfClass:NSDictionary.class])return error(@"Expected JSON object");
-    if([r[@"op"] isEqual:@"hello"])return @{@"ok":@YES,@"version":@2,@"capabilities":hasStickyAPI?@[@"sticky",@"interactive_clip"]:@[@"interactive_clip"],@"build":buildName?:@"",@"pid":@(getpid()),@"uid":@(getuid()),@"controlled":@(controlledCount())};
+    if([r[@"op"] isEqual:@"hello"])return @{@"ok":@YES,@"version":@2,@"capabilities":hasStickyAPI?@[@"sticky",@"interactive_clip",@"overview",@"finish",@"pointer_drag"]:@[@"interactive_clip",@"overview",@"finish",@"pointer_drag"],@"build":buildName?:@"",@"pid":@(getpid()),@"uid":@(getuid()),@"controlled":@(controlledCount())};
     NSString *session=r[@"session"];
     if(![session isKindOfClass:NSString.class]||session.length==0||session.length>128)return error(@"Invalid session");
     if(controller&&![controller isEqual:session])return error(@"Another controller holds the lease");
     if([r[@"op"] isEqual:@"reset"]) {unsigned failed=restoreAll();return failed?error(@"Restore failed; watchdog will retry"):@{@"ok":@YES};}
     if([r[@"op"] isEqual:@"frame"])return frame(r);
     if([r[@"op"] isEqual:@"sticky"])return setSticky(r[@"window"],session);
+    if([r[@"op"] isEqual:@"overview"])return overview();
+    if([r[@"op"] isEqual:@"heartbeat"]) {lastUpdate=NSProcessInfo.processInfo.systemUptime;return @{@"ok":@YES};}
+    if([r[@"op"] isEqual:@"finish"])return finish(r);
+    if([r[@"op"] isEqual:@"detach"])return releaseFrames(r,NO);
     return error(@"Unknown operation");
 }
 

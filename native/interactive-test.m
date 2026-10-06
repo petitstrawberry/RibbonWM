@@ -39,6 +39,11 @@ int main(void) { @autoreleasepool {
         sky.releaseRegion(clip);
         check(fabs(bounds.size.width-fmax(0,1000-x))<1&&bounds.origin.x==0,"interactive clip stays inside retained viewport");
     }
+    update[@"drag_frame"]=rectangle(240,260,400,400);
+    check([frame(request)[@"ok"] boolValue],"pointer drag frame corrects an owner translation offset");
+    CGAffineTransform pointed;sky.getTransform(sky.connection(),wid,&pointed);
+    check(pointed.tx==-240&&pointed.ty==-260,"pointer drag preserves the grab point on both axes");
+    [update removeObjectForKey:@"drag_frame"];
     [update removeObjectForKey:@"viewport"];
     check([frame(request)[@"ok"] boolValue],"normal placement resumes after release");
     CGAffineTransform released;sky.getTransform(sky.connection(),wid,&released);
@@ -46,5 +51,23 @@ int main(void) { @autoreleasepool {
     check(!restoreAll(),"original compositor state restored");
     sky.getTransform(sky.connection(),wid,&released);
     check(CGAffineTransformEqualToTransform(original,released),"original transform restored exactly");
+    update[@"clip"]=NSNull.null;
+    check([frame(request)[@"ok"] boolValue],"fully hidden surface leased");
+    check([overview()[@"ok"] boolValue],"overview removes hidden clip without dropping the lease");
+    CFTypeRef full=NULL;CGRect fullBounds=CGRectZero;
+    check(!sky.copyClip(sky.connection(),wid,&full)&&!regionBounds(full,&fullBounds),"read exposed full clip");
+    sky.releaseRegion(full);
+    check(fullBounds.size.width==400&&fullBounds.size.height==400&&saved.count==1,"overview exposes complete real surface and retains snapshot");
+    sky.getTransform(sky.connection(),wid,&released);
+    check(CGAffineTransformEqualToTransform(original,released),"overview returns native transform");
+    update[@"clip"]=rectangle(200,200,400,400);
+    check([frame(request)[@"ok"] boolValue],"layout resumes after overview");
+    NSMutableDictionary *bad=[update mutableCopy];bad[@"pid"]=@(getpid()+1);
+    check(![finish(@{@"updates":@[bad]})[@"ok"] boolValue]&&saved.count==1,"release rejects a changed owner before writing");
+    update[@"frame"]=rectangle(240,260,400,400);
+    check([finish(request)[@"ok"] boolValue]&&saved.count==0,"stop commits desktop geometry and removes the lease");
+    check(!restoreAll(),"post-stop cleanup has no obsolete snapshot to apply");
+    sky.getTransform(sky.connection(),wid,&released);
+    check(released.tx==-240&&released.ty==-260,"post-stop cleanup preserves the released position");
     [window close];return 0;
 } }

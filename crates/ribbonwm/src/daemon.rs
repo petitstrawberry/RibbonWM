@@ -27,6 +27,169 @@ struct GeometryLease {
     originals: BTreeMap<WindowId, Window>,
     logical_originals: BTreeMap<WindowId, Rect>,
     resized: BTreeSet<WindowId>,
+    dragged: Option<WindowId>,
+}
+#[derive(Default)]
+struct MouseCapture {
+    pressed: bool,
+    point: (f64, f64),
+    event_window: u32,
+    window: Option<WindowId>,
+    surface: Option<Rect>,
+    current: Option<Rect>,
+    shown: Option<Rect>,
+    changed: bool,
+    resizing: bool,
+    left_edge: bool,
+    top_edge: bool,
+    active: bool,
+}
+fn pressed_placement<'a>(
+    plans: &'a [Placement],
+    geometry: &GeometryLease,
+    event_window: u32,
+    frontmost: i32,
+    point: (f64, f64),
+) -> Option<&'a Placement> {
+    plans.iter().find(|p| {
+        geometry.originals.get(&p.window).is_some_and(|w| {
+            // At mouse-down the clicked app may not have activated yet. An
+            // explicit event target is stronger evidence than frontmost PID.
+            if event_window != 0 {
+                p.window.0 == event_window
+            } else {
+                w.pid == frontmost
+            }
+        }) && p.clip.is_some_and(|r| {
+            Rect {
+                x: r.x - 8.0,
+                y: r.y - 8.0,
+                width: r.width + 16.0,
+                height: r.height + 16.0,
+            }
+            .contains(point.0, point.1)
+        })
+    })
+}
+fn chrome_hit(frame: Rect, point: (f64, f64)) -> bool {
+    let (x, y) = point;
+    y <= frame.y + 36.0
+        || x <= frame.x + 8.0
+        || x >= frame.x + frame.width - 8.0
+        || y >= frame.y + frame.height - 8.0
+}
+impl MouseCapture {
+    fn update(&mut self, engine: &Engine, geometry: &GeometryLease) -> Option<WindowId> {
+        let sample = ribbon_macos::mouse_state();
+        if !ribbon_macos::left_mouse_down() {
+            *self = Self::default();
+            return None;
+        }
+        if !self.pressed {
+            self.pressed = true;
+            self.point = if sample.down != 0 {
+                (sample.x, sample.y)
+            } else {
+                ribbon_macos::pointer()
+            };
+            self.event_window = if sample.down != 0 { sample.window } else { 0 };
+        }
+        // Activation can arrive after mouse-down. Retry with the original
+        // press position, never retarget an established capture under a drag.
+        if self.window.is_none() {
+            let plans = engine.placements();
+            if let Some(p) = pressed_placement(
+                &plans,
+                geometry,
+                self.event_window,
+                ribbon_macos::frontmost_pid(),
+                self.point,
+            ) {
+                self.window = Some(p.window);
+                if let Some(w) = geometry.originals.get(&p.window)
+                    && let Ok((surface, shown)) = ribbon_macos::window_drag_geometry(w.id, w.pid)
+                {
+                    self.surface = Some(surface);
+                    self.current = Some(surface);
+                    self.shown = Some(shown);
+                }
+                let frame = self.shown.unwrap_or(p.frame);
+                self.left_edge = self.point.0 <= frame.x + 8.0;
+                self.top_edge = self.point.1 <= frame.y + 8.0;
+                self.resizing = self.left_edge
+                    || self.top_edge
+                    || self.point.0 >= frame.x + frame.width - 8.0
+                    || self.point.1 >= frame.y + frame.height - 8.0;
+                self.active = chrome_hit(frame, self.point);
+            }
+        }
+        if sample.dragged != 0
+            && let Some(id) = self.window
+            && let Some(w) = geometry.originals.get(&id)
+            && let Some(before) = self.surface
+            && let Ok((now, _)) = ribbon_macos::window_drag_geometry(id, w.pid)
+        {
+            let changed = (now.x - before.x).abs() > 2.0
+                || (now.y - before.y).abs() > 2.0
+                || (now.width - before.width).abs() > 2.0
+                || (now.height - before.height).abs() > 2.0;
+            self.changed |= changed;
+            self.active |= changed;
+            self.current = Some(now);
+        }
+        self.window.filter(|_| self.active)
+    }
+    fn frame(&self, viewport: Rect) -> Option<Rect> {
+        if !self.changed {
+            return None;
+        }
+        let current = self.current?;
+        let mut frame = drag_frame(
+            self.shown?,
+            self.point,
+            ribbon_macos::pointer(),
+            current,
+            self.resizing,
+            self.left_edge,
+            self.top_edge,
+        );
+        frame.y = frame.y.max(viewport.y);
+        Some(frame)
+    }
+}
+fn drag_frame(
+    start: Rect,
+    press: (f64, f64),
+    pointer: (f64, f64),
+    current: Rect,
+    resizing: bool,
+    left: bool,
+    top: bool,
+) -> Rect {
+    Rect {
+        x: start.x
+            + if resizing {
+                if left {
+                    start.width - current.width
+                } else {
+                    0.0
+                }
+            } else {
+                pointer.0 - press.0
+            },
+        y: start.y
+            + if resizing {
+                if top {
+                    start.height - current.height
+                } else {
+                    0.0
+                }
+            } else {
+                pointer.1 - press.1
+            },
+        width: current.width,
+        height: current.height,
+    }
 }
 /// Read-only WindowServer metadata runs away from the frame loop. AX, AppKit
 /// notifications, policy and compositor commits stay on the controlling thread.
@@ -76,7 +239,16 @@ impl WindowInventory {
             Ok((generation, result)) => {
                 self.pending = false;
                 if generation == self.generation {
-                    Some(result?)
+                    match result {
+                        Ok(windows) => Some(windows),
+                        Err(error) => {
+                            // A failed metadata read is not an empty desktop.
+                            // Keep layouts and leases, retry on the next poll.
+                            eprintln!("Window inventory deferred: {error:#}");
+                            self.dirty = false;
+                            None
+                        }
+                    }
                 } else {
                     self.dirty = true;
                     None
@@ -160,6 +332,7 @@ fn forget_closed(engine: &mut Engine, geometry: &mut GeometryLease, id: WindowId
     Ok(())
 }
 fn display_for<'a>(window: &Window, displays: &'a [Display]) -> Option<&'a Display> {
+    let bounds = window_bounds(window);
     displays
         .iter()
         .filter(|d| {
@@ -167,14 +340,21 @@ fn display_for<'a>(window: &Window, displays: &'a [Display]) -> Option<&'a Displ
         })
         .max_by(|a, b| {
             let area = |d: &Display| {
-                window
-                    .bounds
+                bounds
                     .intersection(d.frame)
                     .map_or(0.0, |r| r.width * r.height)
             };
             area(a).total_cmp(&area(b))
         })
-        .filter(|d| window.bounds.intersection(d.frame).is_some())
+        .filter(|d| bounds.intersection(d.frame).is_some())
+}
+fn window_bounds(window: &Window) -> Rect {
+    // Mission Control and compositor clipping change presentation metadata.
+    // Width, monitor selection and saved geometry belong to the real surface.
+    window
+        .surface_bounds
+        .filter(|r| r.valid())
+        .unwrap_or(window.bounds)
 }
 fn app_excluded(window: &Window, patterns: &[String]) -> bool {
     identity_excluded(&window.app, &window.bundle_id, patterns)
@@ -220,12 +400,13 @@ fn refresh_observers(
     Ok(())
 }
 fn normal_window_candidate(window: &Window) -> bool {
+    let bounds = window_bounds(window);
     // Display utilities may expose 1x1 normal-layer helper surfaces. They
     // are not user app windows and must never be expanded into a column.
     window.layer == 0
-        && window.bounds.valid()
-        && window.bounds.width >= 100.0
-        && window.bounds.height >= 100.0
+        && bounds.valid()
+        && bounds.width >= 100.0
+        && bounds.height >= 100.0
         && window.onscreen
         && window.pid != std::process::id() as i32
 }
@@ -246,6 +427,27 @@ fn resize_anchor(viewport: Rect, original: Rect, width: f64, height: f64) -> Rec
         height,
     }
 }
+fn released_frame(engine: &Engine, monitor: &str, mut frame: Rect, index: usize) -> Rect {
+    let viewport = engine.monitors[monitor].viewport;
+    let inner = Rect {
+        x: viewport.x + engine.settings.left_margin(),
+        y: viewport.y + engine.settings.top_margin(),
+        width: (viewport.width - engine.settings.left_margin() - engine.settings.right_margin())
+            .max(100.0),
+        height: (viewport.height - engine.settings.top_margin() - engine.settings.bottom_margin())
+            .max(100.0),
+    };
+    if frame.intersection(inner).is_none() {
+        frame.x = inner.x + (index % 8) as f64 * 24.0;
+        frame.y = inner.y + (index % 8) as f64 * 8.0;
+    }
+    resize_anchor(
+        inner,
+        frame,
+        frame.width.min(inner.width),
+        frame.height.min(inner.height),
+    )
+}
 fn synchronize(
     engine: &mut Engine,
     geometry: &mut GeometryLease,
@@ -255,6 +457,9 @@ fn synchronize(
     snapshot: (Vec<Window>, bool),
 ) -> Result<()> {
     let (mut inventory, reveal_focus) = snapshot;
+    for window in &mut inventory {
+        window.bounds = window_bounds(window);
+    }
     // Only a cached destination has a saved offset; initial discovery should
     // reveal the native active window normally.
     let context_changed = displays.iter().any(|d| {
@@ -274,7 +479,9 @@ fn synchronize(
             forget_closed(engine, geometry, id)?;
         }
     }
-    observe_native_focus(engine, geometry, options, reveal_focus && !context_changed);
+    if geometry.dragged.is_none() {
+        observe_native_focus(engine, geometry, options, reveal_focus && !context_changed);
+    }
     // CG inventories are in stacking order; window IDs give deterministic
     // creation order when several windows arrive between discovery polls.
     inventory.sort_by_key(|w| w.id);
@@ -292,7 +499,7 @@ fn synchronize(
         }
         if let Some((monitor, space)) = engine.window_context(w.id) {
             if let Some(display) = display_for(&w, displays)
-                && (options.dry_run || !ribbon_macos::left_mouse_down())
+                && geometry.dragged != Some(w.id)
                 && (monitor != display.id || space != display.native_space)
             {
                 engine.relocate_window(&display.id, w.id)?;
@@ -331,7 +538,7 @@ fn synchronize(
             }
             continue;
         }
-        if !normal_window_candidate(&w) {
+        if geometry.dragged.is_some() || !normal_window_candidate(&w) {
             continue;
         }
         if !options.all && !options.selected.contains(&w.id.0) {
@@ -481,18 +688,34 @@ fn set_mode(
     geometry.modes.insert(id, next);
     let transition = (|| -> Result<()> {
         if !next.wants_tile() && engine.window_ids().contains(&id) {
-            if !dry_run && geometry.resized.contains(&id) {
-                ribbon_macos::restore_window(
-                    &original,
-                    old_logical.context("Missing original AX geometry")?,
-                )?;
+            if !dry_run {
+                let backend = backend.context("Dock backend required")?;
+                let held = engine.placements();
+                let mut released = held
+                    .iter()
+                    .find(|p| p.window == id)
+                    .context("Missing placement")?
+                    .clone();
+                let shown = ribbon_macos::window_presentation(id, original.pid)?;
+                released.frame = released_frame(engine, &released.monitor, shown, 0);
+                released.clip = Some(released.frame);
+                let owners = geometry
+                    .originals
+                    .iter()
+                    .map(|(id, w)| (*id, w.pid))
+                    .collect();
+                ribbon_macos::resize_window_observed(id, original.pid, released.frame, || {
+                    backend.frame_with_sticky(&held, &owners, &sticky_leases(geometry))
+                })?;
+                backend.detach(&released, original.pid)?;
             }
             engine.remove_window(id)?;
         } else if next.wants_tile() && !engine.window_ids().contains(&id) {
-            let current = ribbon_macos::windows()?
+            let mut current = ribbon_macos::windows()?
                 .into_iter()
                 .find(|w| w.id == id && w.pid == original.pid)
                 .context("Window disappeared")?;
+            current.bounds = window_bounds(&current);
             if let Some(display) = display_for(&current, &ribbon_macos::displays()?) {
                 let width = current.bounds.width.min(
                     (display.viewport.width
@@ -558,17 +781,18 @@ fn handle(
     match request {
         Request::Status {} => {
             let pid = ribbon_macos::frontmost_pid();
-            let native_focused_window = (!dry_run
-                && geometry.originals.values().any(|w| w.pid == pid))
-            .then(|| ribbon_macos::focused_window(pid))
-            .flatten();
+            let native_focused_window = geometry.dragged.or_else(|| {
+                (!dry_run && geometry.originals.values().any(|w| w.pid == pid))
+                    .then(|| ribbon_macos::focused_window(pid))
+                    .flatten()
+            });
             let original_geometry: BTreeMap<_, _> = geometry
                 .originals
                 .iter()
                 .map(|(id, w)| (*id, json!({"pid":w.pid,"bounds":w.bounds})))
                 .collect();
             return Ok(
-                json!({"ok":true,"mode":if dry_run{"dry_run"}else{"live"},"state":engine,"original_geometry":original_geometry,"window_modes":geometry.modes,"native_focused_window":native_focused_window,"placements":engine.placements()}),
+                json!({"ok":true,"mode":if dry_run{"dry_run"}else{"live"},"state":engine,"original_geometry":original_geometry,"window_modes":geometry.modes,"native_focused_window":native_focused_window,"mouse_hold":geometry.dragged,"native_overview":!dry_run&&ribbon_macos::mission_control_active(),"placements":engine.placements()}),
             );
         }
         Request::Quit {} => *quit = true,
@@ -761,6 +985,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
         originals: BTreeMap::new(),
         logical_originals: BTreeMap::new(),
         resized: BTreeSet::new(),
+        dragged: None,
     };
     let mut engine = Engine::new(options.settings.clone())?;
     let mut displays = ribbon_macos::displays()?;
@@ -773,16 +998,19 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
     if let Some(source) = &events {
         refresh_observers(source, &mut watching, &options)?;
     }
-    synchronize(
-        &mut engine,
-        &mut geometry,
-        &options,
-        &displays,
-        &mut sizes,
-        (ribbon_macos::windows()?, true),
-    )?;
+    let initial_overview = !options.dry_run && ribbon_macos::mission_control_active();
+    if !initial_overview {
+        synchronize(
+            &mut engine,
+            &mut geometry,
+            &options,
+            &displays,
+            &mut sizes,
+            (ribbon_macos::windows()?, true),
+        )?;
+    }
     for requested in &options.selected {
-        if !geometry.originals.contains_key(&WindowId(*requested)) {
+        if !initial_overview && !geometry.originals.contains_key(&WindowId(*requested)) {
             bail!(
                 "Window {requested} is unavailable, minimized, sticky, or outside the current desktop context"
             );
@@ -802,278 +1030,270 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
     let mut last_frame = Vec::new();
     let mut committed: Vec<Placement> = Vec::new();
     let mut quit = false;
-    let mut input = None;
+    let mut input: Option<ribbon_macos::input::InputSource> = None;
     let mut last_input_attempt = last_tick - Duration::from_secs(5);
     let mut gesture_frontmost = (-1, true);
     let mut inventory = WindowInventory::start();
+    let mut mouse = MouseCapture::default();
+    let mut overview = false;
+    let mut overview_resume = Instant::now();
     eprintln!(
         "RibbonWM {}: {} windows; socket {}",
         if options.dry_run { "dry run" } else { "live" },
         engine.window_ids().len(),
         ipc::socket_path().display()
     );
-    'frames: while running.load(Ordering::Relaxed) && !quit {
-        let start = Instant::now();
-        if !options.dry_run
-            && engine.settings.gesture_scroll
-            && input.is_none()
-            && start.duration_since(last_input_attempt) >= Duration::from_secs(5)
-        {
-            last_input_attempt = start;
-            // Tap creation is the live OS authorization check; a cached
-            // preflight false must not prevent a later permission grant.
-            match ribbon_macos::input::InputSource::start(&engine.settings) {
-                Ok(source) => input = Some(source),
-                Err(e) => eprintln!("Gestures unavailable: {e:#}"),
-            }
-        }
-        if let Some(source) = &mut input {
-            let blocked = gesture_blocked(&options, &mut gesture_frontmost);
-            if let Err(e) = source.update(&engine.settings, gesture_targets(&engine, blocked)) {
-                eprintln!("Gestures suspended: {e:#}");
-                input = None;
-            }
-        }
-        // At most eight clients per frame. Each client's total read deadline is bounded.
-        for _ in 0..8 {
-            match socket.listener.accept() {
-                Ok((mut stream, _)) => {
-                    let response = ipc::receive(&mut stream)
-                        .and_then(|r| {
-                            let native_geometry = matches!(r, Request::SetMode { .. });
-                            if native_geometry {
-                                inventory.invalidate();
-                            }
-                            handle(
-                                &mut engine,
-                                r,
-                                options.dry_run,
-                                &mut geometry,
-                                backend.as_ref(),
-                                &mut sizes,
-                                &mut quit,
-                            )
-                        })
-                        .unwrap_or_else(|e| json!({"ok":false,"error":e.to_string()}));
-                    if let Err(e) = ipc::respond(&mut stream, &response) {
-                        eprintln!("IPC: {e:#}");
-                    }
+    let frame_result = (|| -> Result<()> {
+        'frames: while running.load(Ordering::Relaxed) && !quit {
+            let start = Instant::now();
+            let notifications = events.as_ref().map_or(0, ribbon_macos::EventSource::drain);
+            let in_overview = !options.dry_run && ribbon_macos::mission_control_active();
+            if in_overview && !overview {
+                if let Some(backend) = &backend {
+                    backend.overview()?;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        if quit {
-            break;
-        }
-        let after_ipc = Instant::now();
-        let animating = engine.monitors.values().any(|m| {
-            let scroll = &m.layout().scroll;
-            !m.suspended && (scroll.position - scroll.target).abs() > 0.01
-        }) || input
-            .as_ref()
-            .is_some_and(ribbon_macos::input::InputSource::active);
-        let notifications = events.as_ref().map_or(0, ribbon_macos::EventSource::drain);
-        if event_trace && notifications != 0 {
-            eprintln!("Native events: {notifications}");
-        }
-        if (notifications & ribbon_macos::EventSource::APPS != 0
-            || (!animating && start.duration_since(last_watch_refresh) >= Duration::from_secs(1)))
-            && let Some(source) = &events
-        {
-            refresh_observers(source, &mut watching, &options)?;
-            last_watch_refresh = start;
-        }
-        let after_events = Instant::now();
-        if notifications
-            & (ribbon_macos::EventSource::WINDOWS
-                | ribbon_macos::EventSource::GEOMETRY
-                | ribbon_macos::EventSource::APPS)
-            != 0
-            || start.duration_since(last_inventory) >= Duration::from_millis(100)
-        {
-            let next = ribbon_macos::displays()?;
-            let signature = |list: &[Display]| {
-                let mut s: Vec<_> = list
-                    .iter()
-                    .map(|d| {
-                        (
-                            d.id.clone(),
-                            d.viewport.x.to_bits(),
-                            d.viewport.y.to_bits(),
-                            d.viewport.width.to_bits(),
-                            d.viewport.height.to_bits(),
-                            d.scale.to_bits(),
-                        )
-                    })
-                    .collect();
-                s.sort();
-                s
-            };
-            if !options.dry_run && signature(&next) != signature(&displays) {
-                bail!(
-                    "Display geometry changed; releasing windows. Restart run to use the new display geometry"
-                );
-            }
-            if next.iter().any(|d| {
-                engine.monitors.get(&d.id).is_some_and(|m| {
-                    m.native_space != d.native_space || m.suspended != d.native_fullscreen
-                })
-            }) {
+                if let Some(input) = &mut input {
+                    input.cancel();
+                }
                 inventory.invalidate();
-            }
-            displays = next;
-            // Activate the native context before processing focus/destruction,
-            // without waiting for asynchronous window metadata.
-            update_contexts(&mut engine, &displays)?;
-            inventory.request()?;
-            last_inventory = start;
-        }
-        if let Some(source) = &events {
-            for closed in source.closed_windows(!animating) {
-                let id = WindowId(closed.wid);
-                // Some apps expose AXWindows only on their active Space.
-                // A withdrawn-list entry does not prove an inactive window closed.
-                if closed.withdrawn != 0 && inactive_window(&engine, &geometry, id) {
-                    continue;
-                }
-                if geometry
-                    .originals
-                    .get(&id)
-                    .is_some_and(|w| w.pid == closed.pid)
-                {
-                    forget_closed(&mut engine, &mut geometry, id)?;
-                    sizes.remove(&id);
-                }
-            }
-        }
-        if let Some(windows) = inventory.poll()? {
-            let reveal = !input
-                .as_ref()
-                .is_some_and(ribbon_macos::input::InputSource::active);
-            synchronize(
-                &mut engine,
-                &mut geometry,
-                &options,
-                &displays,
-                &mut sizes,
-                (windows, reveal),
-            )?;
-        }
-        if notifications & ribbon_macos::EventSource::FOCUS != 0
-            || start.duration_since(last_focus) >= Duration::from_millis(100)
-        {
-            let reveal = !input
-                .as_ref()
-                .is_some_and(ribbon_macos::input::InputSource::active);
-            observe_native_focus(&mut engine, &geometry, &options, reveal);
-            last_focus = start;
-        }
-        let after_inventory = Instant::now();
-        if let Some(source) = &mut input {
-            // A native Space notification may have changed targets in this batch.
-            let blocked = gesture_blocked(&options, &mut gesture_frontmost);
-            if let Err(e) = source.update(&engine.settings, gesture_targets(&engine, blocked)) {
-                eprintln!("Gestures suspended: {e:#}");
-                source.cancel();
-            }
-            if ribbon_macos::left_mouse_down() {
-                source.cancel();
-            }
-            for delta in source.drain() {
-                if engine
-                    .monitors
-                    .get(&delta.monitor)
-                    .is_some_and(|m| !m.suspended && m.native_space == delta.space)
-                {
-                    // No focus call, spring or synthesized momentum on this route.
-                    engine.apply(&delta.monitor, &Action::Scroll { delta: delta.delta })?;
-                }
-            }
-        }
-        // Do not recenter underneath the pointer during a border drag. Keep
-        // adopting native sizes, then animate the final target after release.
-        if options.dry_run || !ribbon_macos::left_mouse_down() {
-            engine.tick(start.duration_since(last_tick).as_secs_f64());
-        }
-        last_tick = start;
-        let before_backend = Instant::now();
-        if let Some(backend) = &backend {
-            for id in geometry.originals.keys().copied().collect::<Vec<_>>() {
-                if geometry
-                    .originals
-                    .get(&id)
-                    .is_some_and(|w| ribbon_macos::window_owner(id) != w.pid)
-                {
-                    forget_closed(&mut engine, &mut geometry, id)?;
-                    sizes.remove(&id);
-                }
-            }
-            sizes.retain(|id, _| geometry.originals.contains_key(id));
-            let owners = geometry
-                .originals
-                .iter()
-                .map(|(id, w)| (*id, w.pid))
-                .collect();
-            let plans = engine.placements();
-            if ribbon_macos::left_mouse_down() {
-                // Owner-driven drag loops change the transform themselves. Keep
-                // the lease and monitor clip, but never overwrite that transform.
-                let viewports = engine
-                    .monitors
-                    .iter()
-                    .map(|(id, m)| (id.clone(), m.viewport))
-                    .collect();
-                backend.interactive_frame(
-                    &plans,
-                    &owners,
-                    &sticky_leases(&geometry),
-                    &viewports,
-                )?;
-                last_tick = Instant::now();
+                overview = true;
+            } else if !in_overview && overview {
+                overview = false;
+                overview_resume = start + Duration::from_millis(200);
+                inventory.invalidate();
                 last_frame.clear();
+                mouse = MouseCapture::default();
+            }
+            let suspended = overview || start < overview_resume;
+            geometry.dragged = if options.dry_run || suspended {
+                None
+            } else {
+                mouse.update(&engine, &geometry)
+            };
+            if !options.dry_run
+                && engine.settings.gesture_scroll
+                && input.is_none()
+                && start.duration_since(last_input_attempt) >= Duration::from_secs(5)
+            {
+                last_input_attempt = start;
+                // Tap creation is the live OS authorization check; a cached
+                // preflight false must not prevent a later permission grant.
+                match ribbon_macos::input::InputSource::start(&engine.settings) {
+                    Ok(source) => input = Some(source),
+                    Err(e) => eprintln!("Gestures unavailable: {e:#}"),
+                }
+            }
+            if let Some(source) = &mut input {
+                let blocked = gesture_blocked(&options, &mut gesture_frontmost);
+                if let Err(e) = source.update(&engine.settings, gesture_targets(&engine, blocked)) {
+                    eprintln!("Gestures suspended: {e:#}");
+                    input = None;
+                }
+            }
+            // At most eight clients per frame. Each client's total read deadline is bounded.
+            for _ in 0..8 {
+                match socket.listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let response = ipc::receive(&mut stream)
+                            .and_then(|r| {
+                                if suspended && !matches!(r, Request::Status {} | Request::Quit {})
+                                {
+                                    bail!("Window operations are paused during Mission Control");
+                                }
+                                if geometry.dragged.is_some()
+                                    && !matches!(r, Request::Status {} | Request::Quit {})
+                                {
+                                    bail!("Window operations are paused during a mouse drag");
+                                }
+                                let native_geometry = matches!(r, Request::SetMode { .. });
+                                if native_geometry {
+                                    inventory.invalidate();
+                                }
+                                handle(
+                                    &mut engine,
+                                    r,
+                                    options.dry_run,
+                                    &mut geometry,
+                                    backend.as_ref(),
+                                    &mut sizes,
+                                    &mut quit,
+                                )
+                            })
+                            .unwrap_or_else(|e| json!({"ok":false,"error":e.to_string()}));
+                        if let Err(e) = ipc::respond(&mut stream, &response) {
+                            eprintln!("IPC: {e:#}");
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            if quit {
+                break;
+            }
+            if suspended {
+                if let Some(backend) = &backend {
+                    backend.heartbeat()?;
+                }
+                last_tick = Instant::now();
                 std::thread::sleep(frame_duration);
                 continue 'frames;
             }
-            let mut geometry_changed = false;
-            // Hold the previously committed layout through the entire AX resize
-            // batch. Do not publish half of a newly split column between owners.
-            let pending = plans
-                .iter()
-                .filter(|p| {
-                    engine
-                        .monitors
-                        .get(&p.monitor)
-                        .is_some_and(|m| !m.suspended && m.native_space == p.native_space)
-                })
-                .any(|p| {
-                    geometry.originals.get(&p.window).is_some_and(|w| {
-                        sizes.get(&p.window) != Some(&(w.pid, p.frame.width, p.frame.height))
-                    })
-                });
-            let mut held = plans.clone();
-            if pending {
-                let dragging = ribbon_macos::left_mouse_down();
-                for p in &mut held {
-                    let w = geometry
-                        .originals
-                        .get(&p.window)
-                        .context("Missing original geometry")?;
-                    if let Some(previous) = committed
+            let after_ipc = Instant::now();
+            let animating = engine.monitors.values().any(|m| {
+                let scroll = &m.layout().scroll;
+                !m.suspended && (scroll.position - scroll.target).abs() > 0.01
+            }) || input
+                .as_ref()
+                .is_some_and(ribbon_macos::input::InputSource::active);
+            if event_trace && notifications != 0 {
+                eprintln!("Native events: {notifications}");
+            }
+            if (notifications & ribbon_macos::EventSource::APPS != 0
+                || (!animating
+                    && start.duration_since(last_watch_refresh) >= Duration::from_secs(1)))
+                && geometry.dragged.is_none()
+                && let Some(source) = &events
+            {
+                refresh_observers(source, &mut watching, &options)?;
+                last_watch_refresh = start;
+            }
+            let after_events = Instant::now();
+            if notifications
+                & (ribbon_macos::EventSource::WINDOWS
+                    | ribbon_macos::EventSource::GEOMETRY
+                    | ribbon_macos::EventSource::APPS)
+                != 0
+                || start.duration_since(last_inventory) >= Duration::from_millis(100)
+            {
+                let next = ribbon_macos::displays()?;
+                let signature = |list: &[Display]| {
+                    let mut s: Vec<_> = list
                         .iter()
-                        .find(|old| old.window == p.window && old.native_space == p.native_space)
-                        .filter(|_| sizes.get(&p.window).is_some_and(|s| s.0 == w.pid))
+                        .map(|d| {
+                            (
+                                d.id.clone(),
+                                d.viewport.x.to_bits(),
+                                d.viewport.y.to_bits(),
+                                d.viewport.width.to_bits(),
+                                d.viewport.height.to_bits(),
+                                d.scale.to_bits(),
+                            )
+                        })
+                        .collect();
+                    s.sort();
+                    s
+                };
+                if !options.dry_run && signature(&next) != signature(&displays) {
+                    bail!(
+                        "Display geometry changed; releasing windows. Restart run to use the new display geometry"
+                    );
+                }
+                if next.iter().any(|d| {
+                    engine.monitors.get(&d.id).is_some_and(|m| {
+                        m.native_space != d.native_space || m.suspended != d.native_fullscreen
+                    })
+                }) {
+                    inventory.invalidate();
+                }
+                displays = next;
+                // Activate the native context before processing focus/destruction,
+                // without waiting for asynchronous window metadata.
+                update_contexts(&mut engine, &displays)?;
+                inventory.request()?;
+                last_inventory = start;
+            }
+            if let Some(source) = &events {
+                for closed in source.closed_windows(!animating && geometry.dragged.is_none()) {
+                    let id = WindowId(closed.wid);
+                    // Some apps expose AXWindows only on their active Space.
+                    // A withdrawn-list entry does not prove an inactive window closed.
+                    if closed.withdrawn != 0 && inactive_window(&engine, &geometry, id) {
+                        continue;
+                    }
+                    if geometry
+                        .originals
+                        .get(&id)
+                        .is_some_and(|w| w.pid == closed.pid)
                     {
-                        *p = previous.clone();
-                    } else {
-                        p.frame = w.bounds;
-                        p.clip = Some(w.bounds);
+                        forget_closed(&mut engine, &mut geometry, id)?;
+                        sizes.remove(&id);
                     }
                 }
-                // Also saves originals before AX changes the owner's transform.
-                // Do not send AX size writes into an in-progress mouse drag.
-                // Keep the compositor lease alive and reconsider on release.
-                if dragging {
+            }
+            if let Some(windows) = inventory.poll()? {
+                let reveal = !input
+                    .as_ref()
+                    .is_some_and(ribbon_macos::input::InputSource::active);
+                synchronize(
+                    &mut engine,
+                    &mut geometry,
+                    &options,
+                    &displays,
+                    &mut sizes,
+                    (windows, reveal),
+                )?;
+            }
+            if geometry.dragged.is_none()
+                && (notifications & ribbon_macos::EventSource::FOCUS != 0
+                    || start.duration_since(last_focus) >= Duration::from_millis(100))
+            {
+                let reveal = !input
+                    .as_ref()
+                    .is_some_and(ribbon_macos::input::InputSource::active);
+                observe_native_focus(&mut engine, &geometry, &options, reveal);
+                last_focus = start;
+            }
+            let after_inventory = Instant::now();
+            if let Some(source) = &mut input {
+                // A native Space notification may have changed targets in this batch.
+                let blocked = gesture_blocked(&options, &mut gesture_frontmost);
+                if let Err(e) = source.update(&engine.settings, gesture_targets(&engine, blocked)) {
+                    eprintln!("Gestures suspended: {e:#}");
+                    source.cancel();
+                }
+                if ribbon_macos::left_mouse_down() {
+                    source.cancel();
+                }
+                for delta in source.drain() {
+                    if engine
+                        .monitors
+                        .get(&delta.monitor)
+                        .is_some_and(|m| !m.suspended && m.native_space == delta.space)
+                    {
+                        // No focus call, spring or synthesized momentum on this route.
+                        engine.apply(&delta.monitor, &Action::Scroll { delta: delta.delta })?;
+                    }
+                }
+            }
+            // Do not recenter underneath the pointer during a border drag. Keep
+            // adopting native sizes, then animate the final target after release.
+            if geometry.dragged.is_none() {
+                engine.tick(start.duration_since(last_tick).as_secs_f64());
+            }
+            last_tick = start;
+            let before_backend = Instant::now();
+            if let Some(backend) = &backend {
+                for id in geometry.originals.keys().copied().collect::<Vec<_>>() {
+                    if geometry
+                        .originals
+                        .get(&id)
+                        .is_some_and(|w| ribbon_macos::window_owner(id) != w.pid)
+                    {
+                        forget_closed(&mut engine, &mut geometry, id)?;
+                        sizes.remove(&id);
+                    }
+                }
+                sizes.retain(|id, _| geometry.originals.contains_key(id));
+                let owners = geometry
+                    .originals
+                    .iter()
+                    .map(|(id, w)| (*id, w.pid))
+                    .collect();
+                let plans = engine.placements();
+                if let Some(window) = geometry.dragged {
+                    // Owner-driven drag loops change the transform themselves. Keep
+                    // the lease and monitor clip, but never overwrite that transform.
                     let viewports = engine
                         .monitors
                         .iter()
@@ -1084,122 +1304,202 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                         &owners,
                         &sticky_leases(&geometry),
                         &viewports,
+                        window,
+                        mouse.frame(
+                            engine.monitors[&plans
+                                .iter()
+                                .find(|p| p.window == window)
+                                .context("Missing drag placement")?
+                                .monitor]
+                                .viewport,
+                        ),
                     )?;
                     last_tick = Instant::now();
+                    last_frame.clear();
                     std::thread::sleep(frame_duration);
                     continue 'frames;
                 }
-                backend.frame_with_sticky(&held, &owners, &sticky_leases(&geometry))?;
-            }
-            let mut lease_tick = Instant::now();
-            for p in &plans {
-                let m = engine.monitors.get(&p.monitor).context("Missing monitor")?;
-                if m.suspended || m.native_space != p.native_space {
-                    continue;
+                let mut geometry_changed = false;
+                // Hold the previously committed layout through the entire AX resize
+                // batch. Do not publish half of a newly split column between owners.
+                let pending = plans
+                    .iter()
+                    .filter(|p| {
+                        engine
+                            .monitors
+                            .get(&p.monitor)
+                            .is_some_and(|m| !m.suspended && m.native_space == p.native_space)
+                    })
+                    .any(|p| {
+                        geometry.originals.get(&p.window).is_some_and(|w| {
+                            sizes.get(&p.window) != Some(&(w.pid, p.frame.width, p.frame.height))
+                        })
+                    });
+                let mut held = plans.clone();
+                if pending {
+                    for p in &mut held {
+                        let w = geometry
+                            .originals
+                            .get(&p.window)
+                            .context("Missing original geometry")?;
+                        if let Some(previous) = committed
+                            .iter()
+                            .find(|old| {
+                                old.window == p.window && old.native_space == p.native_space
+                            })
+                            .filter(|_| sizes.get(&p.window).is_some_and(|s| s.0 == w.pid))
+                        {
+                            *p = previous.clone();
+                        } else {
+                            p.frame = w.bounds;
+                            p.clip = Some(w.bounds);
+                        }
+                    }
+                    // Drag captures already took the interactive-only branch
+                    // above. Save originals before AX changes the transform.
+                    backend.frame_with_sticky(&held, &owners, &sticky_leases(&geometry))?;
                 }
-                let w = geometry
-                    .originals
-                    .get(&p.window)
-                    .context("Missing original geometry")?;
-                let size = (w.pid, p.frame.width, p.frame.height);
-                if sizes.get(&p.window) != Some(&size) {
-                    // Record before writing: even a failed AX request may have partially changed geometry.
-                    geometry.resized.insert(p.window);
-                    let viewport = engine
-                        .monitors
-                        .get(&p.monitor)
-                        .context("Missing monitor")?
-                        .viewport;
-                    let resized = ribbon_macos::resize_window_observed(
-                        p.window,
-                        w.pid,
-                        resize_anchor(viewport, w.bounds, size.1, size.2),
-                        || backend.frame_with_sticky(&held, &owners, &sticky_leases(&geometry)),
-                    );
-                    inventory.invalidate();
-                    if let Err(e) = resized {
-                        if ribbon_macos::window_owner(p.window) != w.pid {
-                            forget_closed(&mut engine, &mut geometry, p.window)?;
+                let mut lease_tick = Instant::now();
+                for p in &plans {
+                    let m = engine.monitors.get(&p.monitor).context("Missing monitor")?;
+                    if m.suspended || m.native_space != p.native_space {
+                        continue;
+                    }
+                    let w = geometry
+                        .originals
+                        .get(&p.window)
+                        .context("Missing original geometry")?;
+                    let size = (w.pid, p.frame.width, p.frame.height);
+                    if sizes.get(&p.window) != Some(&size) {
+                        // Record before writing: even a failed AX request may have partially changed geometry.
+                        geometry.resized.insert(p.window);
+                        let viewport = engine
+                            .monitors
+                            .get(&p.monitor)
+                            .context("Missing monitor")?
+                            .viewport;
+                        let resized = ribbon_macos::resize_window_observed(
+                            p.window,
+                            w.pid,
+                            resize_anchor(viewport, w.bounds, size.1, size.2),
+                            || backend.frame_with_sticky(&held, &owners, &sticky_leases(&geometry)),
+                        );
+                        inventory.invalidate();
+                        if let Err(e) = resized {
+                            if ribbon_macos::window_owner(p.window) != w.pid {
+                                forget_closed(&mut engine, &mut geometry, p.window)?;
+                                sizes.remove(&p.window);
+                                continue 'frames;
+                            }
+                            eprintln!(
+                                "Leaving window {} floating after resize refusal: {e:#}",
+                                p.window.0
+                            );
+                            if let Some(logical) = geometry.logical_originals.get(&p.window)
+                                && let Err(restore) = ribbon_macos::restore_window(w, *logical)
+                            {
+                                eprintln!("Geometry restore after resize refusal: {restore:#}");
+                            }
+                            engine.remove_window(p.window)?;
+                            geometry
+                                .modes
+                                .get_mut(&p.window)
+                                .context("Missing window mode")?
+                                .floating = true;
+                            geometry.resized.remove(&p.window);
                             sizes.remove(&p.window);
+                            let owners = geometry
+                                .originals
+                                .iter()
+                                .map(|(id, w)| (*id, w.pid))
+                                .collect();
+                            backend.frame_with_sticky(
+                                &engine.placements(),
+                                &owners,
+                                &sticky_leases(&geometry),
+                            )?;
+                            last_frame.clear();
+                            committed.retain(|old| old.window != p.window);
                             continue 'frames;
                         }
-                        eprintln!(
-                            "Leaving window {} floating after resize refusal: {e:#}",
-                            p.window.0
-                        );
-                        if let Some(logical) = geometry.logical_originals.get(&p.window)
-                            && let Err(restore) = ribbon_macos::restore_window(w, *logical)
-                        {
-                            eprintln!("Geometry restore after resize refusal: {restore:#}");
+                        sizes.insert(p.window, size);
+                        geometry_changed = true;
+                        // A slow owner must not expire the restoration lease. The
+                        // heartbeat holds old placements until all owners are ready.
+                        if lease_tick.elapsed() >= Duration::from_millis(250) {
+                            backend.frame_with_sticky(&held, &owners, &sticky_leases(&geometry))?;
+                            lease_tick = Instant::now();
                         }
-                        engine.remove_window(p.window)?;
-                        geometry
-                            .modes
-                            .get_mut(&p.window)
-                            .context("Missing window mode")?
-                            .floating = true;
-                        geometry.resized.remove(&p.window);
-                        sizes.remove(&p.window);
-                        let owners = geometry
-                            .originals
-                            .iter()
-                            .map(|(id, w)| (*id, w.pid))
-                            .collect();
-                        backend.frame_with_sticky(
-                            &engine.placements(),
-                            &owners,
-                            &sticky_leases(&geometry),
-                        )?;
-                        last_frame.clear();
-                        committed.retain(|old| old.window != p.window);
-                        continue 'frames;
-                    }
-                    sizes.insert(p.window, size);
-                    geometry_changed = true;
-                    // A slow owner must not expire the restoration lease. The
-                    // heartbeat holds old placements until all owners are ready.
-                    if lease_tick.elapsed() >= Duration::from_millis(250) {
-                        backend.frame_with_sticky(&held, &owners, &sticky_leases(&geometry))?;
-                        lease_tick = Instant::now();
                     }
                 }
+                if geometry_changed {
+                    // AX work can take several frames. Resume the spring from its
+                    // displayed position rather than jumping over that stalled time.
+                    last_tick = Instant::now();
+                }
+                // Focus/native selection metadata does not change compositor geometry.
+                let frame = serde_json::to_vec(
+                    &plans
+                        .iter()
+                        .map(|p| (p.window, p.frame, p.clip))
+                        .collect::<Vec<_>>(),
+                )?;
+                if geometry_changed
+                    || frame != last_frame
+                    || start.duration_since(last_send) >= Duration::from_millis(50)
+                {
+                    backend.frame_with_sticky(&plans, &owners, &sticky_leases(&geometry))?;
+                    last_frame = frame;
+                    committed = plans;
+                    last_send = Instant::now();
+                }
             }
-            if geometry_changed {
-                // AX work can take several frames. Resume the spring from its
-                // displayed position rather than jumping over that stalled time.
-                last_tick = Instant::now();
-            }
-            // Focus/native selection metadata does not change compositor geometry.
-            let frame = serde_json::to_vec(
-                &plans
-                    .iter()
-                    .map(|p| (p.window, p.frame, p.clip))
-                    .collect::<Vec<_>>(),
-            )?;
-            if geometry_changed
-                || frame != last_frame
-                || start.duration_since(last_send) >= Duration::from_millis(50)
-            {
-                backend.frame_with_sticky(&plans, &owners, &sticky_leases(&geometry))?;
-                last_frame = frame;
-                committed = plans;
-                last_send = Instant::now();
-            }
-        }
-        if frame_trace {
-            eprintln!(
-                "Frame timing: {}",
-                json!({"ipc_ms":after_ipc.duration_since(start).as_secs_f64()*1000.0,
+            if frame_trace {
+                eprintln!(
+                    "Frame timing: {}",
+                    json!({"ipc_ms":after_ipc.duration_since(start).as_secs_f64()*1000.0,
                 "events_ms":after_events.duration_since(after_ipc).as_secs_f64()*1000.0,
                 "inventory_ms":after_inventory.duration_since(after_events).as_secs_f64()*1000.0,
                 "input_ms":before_backend.duration_since(after_inventory).as_secs_f64()*1000.0,
                 "backend_ms":before_backend.elapsed().as_secs_f64()*1000.0,"notifications":notifications,"animating":animating})
-            );
+                );
+            }
+            if let Some(remaining) = frame_duration.checked_sub(start.elapsed()) {
+                std::thread::sleep(remaining);
+            }
         }
-        if let Some(remaining) = frame_duration.checked_sub(start.elapsed()) {
-            std::thread::sleep(remaining);
+        Ok(())
+    })();
+    if let Some(backend) = &backend {
+        let owners = geometry
+            .originals
+            .iter()
+            .map(|(id, w)| (*id, w.pid))
+            .collect();
+        let mut released = engine.placements();
+        let held = engine.placements();
+        for (index, p) in released.iter_mut().enumerate() {
+            let Some(w) = geometry.originals.get(&p.window) else {
+                continue;
+            };
+            if ribbon_macos::window_owner(p.window) != w.pid {
+                continue;
+            }
+            let shown = ribbon_macos::window_presentation(p.window, w.pid).unwrap_or(p.frame);
+            p.frame = released_frame(&engine, &p.monitor, shown, index);
+            p.clip = Some(p.frame);
+            if let Err(error) =
+                ribbon_macos::resize_window_observed(p.window, w.pid, p.frame, || {
+                    backend.frame_with_sticky(&held, &owners, &sticky_leases(&geometry))
+                })
+            {
+                eprintln!("Stop geometry for {}: {error:#}", p.window.0);
+            }
         }
+        backend.finish(&released, &owners)?;
+        geometry.resized.clear();
     }
+    frame_result?;
     Ok(())
 }
 
@@ -1241,6 +1541,132 @@ mod tests {
     use ribbon_core::{NativeSpaceId, Rect};
 
     #[test]
+    fn pointer_drag_does_not_double_logical_translation_offsets() {
+        let start = Rect {
+            x: 301.0,
+            y: 57.0,
+            width: 910.0,
+            height: 901.0,
+        };
+        // The owner relocated its physical frame from x100 to x312 and
+        // WindowServer applied the old presentation offset again: x513.
+        let doubled = Rect {
+            x: 513.0,
+            y: 39.0,
+            ..start
+        };
+        let corrected = drag_frame(
+            start,
+            (756.0, 67.0),
+            (767.0, 73.0),
+            doubled,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(corrected.x, 312.0);
+        assert_eq!(corrected.y, 63.0);
+        // Right/bottom resizing keeps the opposite visual corner fixed,
+        // even if the owner changes its logical anchor at acquisition.
+        let resized = Rect {
+            width: 1020.0,
+            height: 850.0,
+            ..doubled
+        };
+        let right = drag_frame(
+            start,
+            (1210.0, 400.0),
+            (1320.0, 400.0),
+            resized,
+            true,
+            false,
+            false,
+        );
+        assert_eq!((right.x, right.y), (301.0, 57.0));
+        let upper_left = drag_frame(
+            start,
+            (302.0, 58.0),
+            (192.0, 109.0),
+            resized,
+            true,
+            true,
+            true,
+        );
+        assert_eq!(
+            (
+                upper_left.x + upper_left.width,
+                upper_left.y + upper_left.height
+            ),
+            (start.x + start.width, start.y + start.height)
+        );
+    }
+
+    #[test]
+    fn mouse_down_target_survives_delayed_app_activation() {
+        let frame = Rect {
+            x: 100.0,
+            y: 57.0,
+            width: 800.0,
+            height: 600.0,
+        };
+        let id = WindowId(42);
+        let plans = vec![Placement {
+            window: id,
+            monitor: "main".into(),
+            native_space: NativeSpaceId(3),
+            frame,
+            clip: Some(frame),
+            focused: false,
+        }];
+        let mut geometry = GeometryLease {
+            modes: BTreeMap::new(),
+            originals: BTreeMap::new(),
+            logical_originals: BTreeMap::new(),
+            resized: BTreeSet::new(),
+            dragged: None,
+        };
+        geometry.originals.insert(
+            id,
+            Window {
+                id,
+                pid: 123,
+                app: "Owned fixture".into(),
+                bundle_id: "test.fixture".into(),
+                title: String::new(),
+                layer: 0,
+                onscreen: true,
+                bounds: frame,
+                surface_bounds: Some(frame),
+                native_spaces: vec![NativeSpaceId(3)],
+                sticky: false,
+                sticky_known: true,
+            },
+        );
+        let press = (200.0, 65.0);
+        // The target is owned by a different app from the current frontmost app.
+        assert_eq!(
+            pressed_placement(&plans, &geometry, 42, 999, press)
+                .unwrap()
+                .window,
+            id
+        );
+        // Without an event window, wait for activation and retry the same press.
+        assert!(pressed_placement(&plans, &geometry, 0, 999, press).is_none());
+        assert_eq!(
+            pressed_placement(&plans, &geometry, 0, 123, press)
+                .unwrap()
+                .window,
+            id
+        );
+        // Clicking an unmanaged overlay must never grab a managed window beneath it.
+        assert!(pressed_placement(&plans, &geometry, 777, 123, press).is_none());
+        // Hidden columns do not acquire a mouse capture.
+        let mut hidden = plans;
+        hidden[0].clip = None;
+        assert!(pressed_placement(&hidden, &geometry, 42, 123, press).is_none());
+    }
+
+    #[test]
     fn withdrawn_windows_remain_known_on_inactive_spaces_for_tiles_and_floats() {
         let viewport = Rect {
             x: 0.0,
@@ -1259,6 +1685,7 @@ mod tests {
             originals: BTreeMap::new(),
             logical_originals: BTreeMap::new(),
             resized: BTreeSet::new(),
+            dragged: None,
         };
         geometry.originals.insert(
             id,
@@ -1332,6 +1759,19 @@ mod tests {
         assert!(inventory.poll().unwrap().is_some());
         assert_eq!(requests.recv().unwrap(), pending);
         assert!(requests.try_recv().is_err());
+
+        // A transient native JSON/query failure must not stop the controller
+        // or replace its layout with an empty inventory.
+        results
+            .send((pending, Err(anyhow::anyhow!("invalid native rectangle"))))
+            .unwrap();
+        assert!(inventory.poll().unwrap().is_none());
+        assert!(!inventory.pending);
+        assert!(requests.try_recv().is_err());
+        inventory.request().unwrap();
+        assert_eq!(requests.recv().unwrap(), pending);
+        results.send((pending, Ok(Vec::new()))).unwrap();
+        assert!(inventory.poll().unwrap().is_some());
     }
 
     #[test]
@@ -1407,6 +1847,29 @@ mod tests {
         };
         let exclusions = vec!["com.openai.*".into(), "ChatGPT*".into()];
         assert!(normal_window_candidate(&window) && !app_excluded(&window, &exclusions));
+        let physical = window.bounds;
+        window.surface_bounds = Some(physical);
+        window.bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 105.0,
+            height: 600.0,
+        };
+        assert_eq!(window_bounds(&window), physical);
+        window.bounds = Rect {
+            x: 19.0,
+            y: 124.0,
+            width: 317.0,
+            height: 390.0,
+        };
+        assert_eq!(window_bounds(&window), physical);
+        // An unavailable optional surface query retains the legacy fallback.
+        window.surface_bounds = Some(Rect {
+            width: 0.0,
+            ..physical
+        });
+        assert_eq!(window_bounds(&window), window.bounds);
+        window.surface_bounds = None;
         window.app = "BetterDisplay".into();
         window.bundle_id = "pro.betterdisplay.BetterDisplay".into();
         window.bounds = Rect {
@@ -1423,5 +1886,78 @@ mod tests {
         assert!(normal_window_candidate(&window) && app_excluded(&window, &exclusions));
         assert!(app_excluded(&window, &["com.openai.codex".into()]));
         assert!(!app_excluded(&window, &["com.openai.chat".into()]));
+    }
+
+    #[test]
+    fn leaving_management_preserves_visible_positions_and_recovers_hidden_columns() {
+        let settings = Settings {
+            padding_top: Some(24.0),
+            padding_bottom: Some(24.0),
+            padding_left: Some(24.0),
+            padding_right: Some(24.0),
+            ..Settings::default()
+        };
+        let mut engine = Engine::new(settings).unwrap();
+        engine
+            .update_monitor(
+                "main",
+                Rect {
+                    x: 0.0,
+                    y: 33.0,
+                    width: 1512.0,
+                    height: 949.0,
+                },
+                NativeSpaceId(3),
+                false,
+            )
+            .unwrap();
+        let visible = Rect {
+            x: 298.0,
+            y: 57.0,
+            width: 732.0,
+            height: 901.0,
+        };
+        assert_eq!(released_frame(&engine, "main", visible, 0), visible);
+        let hidden = Rect {
+            x: 2400.0,
+            ..visible
+        };
+        let recovered = released_frame(&engine, "main", hidden, 2);
+        assert_eq!(recovered.x, 72.0);
+        assert_eq!(recovered.y, 57.0);
+        assert_eq!(recovered.width, 732.0);
+        let partial = Rect {
+            x: -310.0,
+            ..visible
+        };
+        assert_eq!(released_frame(&engine, "main", partial, 0).x, 24.0);
+        assert!(!chrome_hit(visible, (500.0, 400.0))); // Ordinary content selection.
+        assert!(chrome_hit(visible, (500.0, 65.0))); // Title bar.
+        assert!(chrome_hit(visible, (1028.0, 400.0))); // Resize border.
+        engine
+            .update_monitor(
+                "above",
+                Rect {
+                    x: -1600.0,
+                    y: -867.0,
+                    width: 1600.0,
+                    height: 867.0,
+                },
+                NativeSpaceId(7),
+                false,
+            )
+            .unwrap();
+        let upper = released_frame(
+            &engine,
+            "above",
+            Rect {
+                x: -1500.0,
+                y: -840.0,
+                width: 800.0,
+                height: 600.0,
+            },
+            0,
+        );
+        assert_eq!(upper.y, -840.0); // Never clamp another monitor to global y=0.
     }
 }

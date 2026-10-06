@@ -2,12 +2,97 @@
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
 #include "bridge.h"
+#include <dlfcn.h>
 static NSMutableDictionary<NSNumber *,id> *observers;
 static NSMutableArray *workspaceObservers;
 static uint32_t pendingEvents;
 static CFMutableDictionaryRef watchedElements;
 static NSMutableDictionary<NSNumber *,NSDictionary *> *closedWindows;
 static double lastMembershipCheck;
+static AXObserverRef dockObserver;
+static AXUIElementRef dockElement;
+static pid_t dockPID;
+static int overviewActive;
+static int overviewSignal;
+static double lastOverviewPoll,overviewBegan;
+static CFMachPortRef mouseTap;
+static CFRunLoopSourceRef mouseSource;
+static RibbonMouseState mouseState;
+static double lastMouseTapAttempt;
+static void overviewConnectionEvent(uint32_t type,void *data,size_t size,void *context,int cid) {
+    (void)data;(void)size;(void)context;(void)cid;
+    if(type==1204) {__atomic_store_n(&overviewSignal,1,__ATOMIC_RELEASE);__atomic_store_n(&overviewActive,1,__ATOMIC_RELEASE);}
+}
+static void observeOverviewConnection(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once,^{
+        void *sky=dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",RTLD_NOW);
+        int (*connection)(void)=dlsym(sky,"SLSMainConnectionID");
+        CGError (*observe)(int,void (*)(uint32_t,void *,size_t,void *,int),uint32_t,void *)=dlsym(sky,"SLSRegisterConnectionNotifyProc");
+        if(connection&&observe)observe(connection(),overviewConnectionEvent,1204,NULL);
+    });
+}
+static CGEventRef mouseEvent(CGEventTapProxy proxy,CGEventType type,CGEventRef event,void *context) {
+    (void)proxy;(void)context;
+    if(type==kCGEventTapDisabledByTimeout||type==kCGEventTapDisabledByUserInput) {
+        if(mouseTap)CGEventTapEnable(mouseTap,true);return event;
+    }
+    if(type==kCGEventLeftMouseDown) {
+        CGPoint p=CGEventGetLocation(event);
+        mouseState=(RibbonMouseState){p.x,p.y,(uint32_t)CGEventGetIntegerValueField(event,kCGMouseEventWindowUnderMousePointer),1,0};
+    } else if(type==kCGEventLeftMouseDragged)mouseState.dragged=1;
+    else if(type==kCGEventLeftMouseUp)mouseState.down=mouseState.dragged=0;
+    return event;
+}
+RibbonMouseState ribbon_mouse_state(void) {
+    double now=NSProcessInfo.processInfo.systemUptime;
+    if(!mouseTap&&now-lastMouseTapAttempt>=1) {
+        lastMouseTapAttempt=now;
+        mouseTap=CGEventTapCreate(kCGHIDEventTap,kCGHeadInsertEventTap,kCGEventTapOptionListenOnly,
+            CGEventMaskBit(kCGEventLeftMouseDown)|CGEventMaskBit(kCGEventLeftMouseDragged)|CGEventMaskBit(kCGEventLeftMouseUp),mouseEvent,NULL);
+        if(mouseTap) {
+            mouseSource=CFMachPortCreateRunLoopSource(NULL,mouseTap,0);
+            if(!mouseSource){CFRelease(mouseTap);mouseTap=NULL;return mouseState;}
+            CFRunLoopAddSource(CFRunLoopGetMain(),mouseSource,kCFRunLoopDefaultMode);CGEventTapEnable(mouseTap,true);
+        }
+    }
+    if(!ribbon_left_mouse_down())mouseState.down=mouseState.dragged=0;
+    return mouseState;
+}
+static void overviewNotification(AXObserverRef observer,AXUIElementRef element,CFStringRef name,void *context) {
+    (void)observer;(void)element;(void)context;
+    BOOL active=!CFEqual(name,CFSTR("AXExposeExit"));
+    __atomic_store_n(&overviewActive,active,__ATOMIC_RELEASE);
+    if(active)overviewBegan=NSProcessInfo.processInfo.systemUptime;
+}
+int ribbon_mission_control_active(void) { @autoreleasepool {
+    observeOverviewConnection();
+    // Same Dock notifications and layer-18 fallback used by yabai. Observe only
+    // Dock; never inspect another application's AX hierarchy for this state.
+    NSRunningApplication *dock=[NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.dock"].firstObject;
+    if(dock.processIdentifier!=dockPID) {
+        if(dockObserver){CFRunLoopRemoveSource(CFRunLoopGetMain(),AXObserverGetRunLoopSource(dockObserver),kCFRunLoopDefaultMode);CFRelease(dockObserver);dockObserver=NULL;}
+        if(dockElement){CFRelease(dockElement);dockElement=NULL;}
+        dockPID=dock.processIdentifier;
+        if(dockPID>0&&!AXObserverCreate(dockPID,overviewNotification,&dockObserver)) {
+            dockElement=AXUIElementCreateApplication(dockPID);
+            for(NSString *name in @[@"AXExposeShowAllWindows",@"AXExposeShowFrontWindows",@"AXExposeShowDesktop",@"AXExposeExit"])
+                AXObserverAddNotification(dockObserver,dockElement,(__bridge CFStringRef)name,NULL);
+            CFRunLoopAddSource(CFRunLoopGetMain(),AXObserverGetRunLoopSource(dockObserver),kCFRunLoopDefaultMode);
+        }
+    }
+    double now=NSProcessInfo.processInfo.systemUptime;
+    if(__atomic_exchange_n(&overviewSignal,0,__ATOMIC_ACQ_REL))overviewBegan=now;
+    if(now-lastOverviewPoll>=0.1) {
+        lastOverviewPoll=now;BOOL found=NO;
+        CFArrayRef rows=CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly,kCGNullWindowID);
+        for(NSDictionary *row in (__bridge NSArray *)rows)
+            if([row[(id)kCGWindowOwnerPID] intValue]==dockPID&&[row[(id)kCGWindowLayer] intValue]==18&&!row[(id)kCGWindowName]){found=YES;break;}
+        if(rows)CFRelease(rows);
+        if(found||now-overviewBegan>0.4)__atomic_store_n(&overviewActive,found,__ATOMIC_RELEASE);
+    }
+    return __atomic_load_n(&overviewActive,__ATOMIC_ACQUIRE);
+} }
 void ribbon_watch_ax_element(const void *element,int pid) {
     AXObserverRef observer=(__bridge AXObserverRef)observers[@(pid)];
     if(!observer)return;
@@ -143,4 +228,11 @@ void ribbon_stop_observing(void) {
     for(id token in workspaceObservers)[NSWorkspace.sharedWorkspace.notificationCenter removeObserver:token];
     observers=nil;workspaceObservers=nil;pendingEvents=0;lastMembershipCheck=0;
     if(watchedElements)CFRelease(watchedElements);watchedElements=NULL;closedWindows=nil;
+    if(dockObserver){CFRunLoopRemoveSource(CFRunLoopGetMain(),AXObserverGetRunLoopSource(dockObserver),kCFRunLoopDefaultMode);CFRelease(dockObserver);dockObserver=NULL;}
+    if(dockElement)CFRelease(dockElement);dockElement=NULL;dockPID=0;
+    __atomic_store_n(&overviewActive,0,__ATOMIC_RELEASE);__atomic_store_n(&overviewSignal,0,__ATOMIC_RELEASE);
+    lastOverviewPoll=overviewBegan=0;
+    if(mouseTap){CGEventTapEnable(mouseTap,false);CFMachPortInvalidate(mouseTap);CFRelease(mouseTap);mouseTap=NULL;}
+    if(mouseSource){CFRunLoopRemoveSource(CFRunLoopGetMain(),mouseSource,kCFRunLoopDefaultMode);CFRelease(mouseSource);mouseSource=NULL;}
+    mouseState=(RibbonMouseState){0};lastMouseTapAttempt=0;
 }

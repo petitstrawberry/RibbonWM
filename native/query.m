@@ -50,7 +50,16 @@ static void resolve(void) {
         hasStickyAPI=loadStickyAPI(&stickyAPI);
     });
 }
-static NSDictionary *rectJSON(CGRect r) {return @{@"x":@(r.origin.x),@"y":@(r.origin.y),@"width":@(r.size.width),@"height":@(r.size.height)};}
+static NSDictionary *rectJSON(CGRect r) {
+    // An empty WindowServer clip can report CGRectNull (infinite origin), even
+    // when the query succeeds. Never turn that sentinel into JSON numbers.
+    if(CGRectIsNull(r)||CGRectIsInfinite(r)||!isfinite(r.origin.x)||!isfinite(r.origin.y)||!isfinite(r.size.width)||!isfinite(r.size.height)||
+        r.size.width<0||r.size.height<0)return nil;
+    return @{@"x":@(r.origin.x),@"y":@(r.origin.y),@"width":@(r.size.width),@"height":@(r.size.height)};
+}
+static BOOL usableBounds(CGRect r) {
+    return rectJSON(r)!=nil&&r.size.width>0&&r.size.height>0;
+}
 char *ribbon_query_json(int kind) { @autoreleasepool {
     resolve(); NSMutableArray *rows=[NSMutableArray array];
     if (kind==0) {
@@ -75,6 +84,7 @@ char *ribbon_query_json(int kind) { @autoreleasepool {
                 (RibbonRect){v.origin.x,v.origin.y,v.size.width,v.size.height},
                 (RibbonRect){frame.origin.x,frame.origin.y,frame.size.width,frame.size.height},MAX(menuHeight,screen.safeAreaInsets.top));
             CGRect viewport=CGRectMake(usable.x,usable.y,usable.width,usable.height);
+            if(!rectJSON(frame)||!rectJSON(viewport)) {CFRelease(uuidString);CFRelease(uuid);continue;}
             [rows addObject:@{@"id":(__bridge NSString *)uuidString,@"display_id":@(did),@"name":screen.localizedName,
                 @"frame":rectJSON(frame),@"viewport":rectJSON(viewport),
                 @"scale":@(screen.backingScaleFactor),@"native_space":@(sid),@"native_fullscreen":(spaceType&&sid&&spaceType(connection(),sid)!=0)?@YES:@NO,@"primary":CGDisplayIsMain(did)?@YES:@NO}];
@@ -89,6 +99,8 @@ char *ribbon_query_json(int kind) { @autoreleasepool {
         CFArrayRef windows=CGWindowListCopyWindowInfo(kCGWindowListOptionAll|kCGWindowListExcludeDesktopElements,kCGNullWindowID);
         for (NSDictionary *w in (__bridge NSArray *)windows) {
             CGRect b; if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)w[(id)kCGWindowBounds],&b)) continue;
+            NSDictionary *presented=rectJSON(b);
+            if(!presented)continue;
             uint32_t wid=[w[(id)kCGWindowNumber] unsignedIntValue];
             NSNumber *owner=w[(id)kCGWindowOwnerPID]?:@0;
             NSString *bundle=bundles[owner];
@@ -99,18 +111,22 @@ char *ribbon_query_json(int kind) { @autoreleasepool {
             CFArrayRef spaces=connection&&windowSpaces?windowSpaces(connection(),7,(__bridge CFArrayRef)@[@(wid)]):NULL;
             bool sticky=false;
             bool stickyKnown=hasStickyAPI&&connection&&readSticky(&stickyAPI,connection(),wid,&sticky);
-            CGRect surface;
-            id physical=surfaceBounds&&connection&&!surfaceBounds(connection(),wid,&surface)?rectJSON(surface):(id)NSNull.null;
+            CGRect surface=CGRectNull;
+            id physical=surfaceBounds&&connection&&!surfaceBounds(connection(),wid,&surface)?rectJSON(surface):nil;
             [rows addObject:@{@"id":@(wid),@"pid":w[(id)kCGWindowOwnerPID]?:@0,@"app":w[(id)kCGWindowOwnerName]?:@"",
                 @"title":w[(id)kCGWindowName]?:@"",@"layer":w[(id)kCGWindowLayer]?:@0,@"onscreen":[w[(id)kCGWindowIsOnscreen] boolValue]?@YES:@NO,
                 @"bundle_id":bundle,
-                @"bounds":rectJSON(b),@"surface_bounds":physical,@"native_spaces":spaces?(__bridge NSArray *)spaces:@[],
+                @"bounds":presented,@"surface_bounds":physical?:NSNull.null,@"native_spaces":spaces?(__bridge NSArray *)spaces:@[],
                 @"sticky":@(sticky),@"sticky_known":@(stickyKnown)}];
             if(spaces)CFRelease(spaces);
         }
         if(windows)CFRelease(windows);
     }
-    NSData *json=[NSJSONSerialization dataWithJSONObject:rows options:0 error:nil];
+    // Do not let an Objective-C serialization exception unwind through Rust.
+    NSData *json=nil;
+    @try {json=[NSJSONSerialization dataWithJSONObject:rows options:0 error:nil];}
+    @catch(NSException *exception) {fprintf(stderr,"Window inventory serialization: %s\n",exception.reason.UTF8String);return NULL;}
+    if(!json)return NULL;
     char *result=malloc(json.length+1);if(!result)return NULL;memcpy(result,json.bytes,json.length);result[json.length]=0;return result;
 } }
 void ribbon_free(void *pointer) {free(pointer);}
@@ -195,6 +211,16 @@ int ribbon_window_geometry(uint32_t wid,int expected_pid,RibbonRect *rect) { @au
     if(!window)return kAXErrorInvalidUIElement;
     AXError error=axGeometry(window,rect);CFRelease(window);return error;
 } }
+int ribbon_window_presentation(uint32_t wid,int expected_pid,RibbonRect *rect,RibbonRect *surface) {
+    if(ribbon_window_owner(wid)!=expected_pid)return kAXErrorInvalidUIElement;
+    SkyLight sky;CGRect bounds;CGAffineTransform transform;
+    if(!loadSkyLight(&sky)||sky.getBounds(sky.connection(),wid,&bounds)||sky.getTransform(sky.connection(),wid,&transform)||
+        !usableBounds(bounds)||!isfinite(transform.a)||!isfinite(transform.b)||!isfinite(transform.c)||!isfinite(transform.d)||
+        !isfinite(transform.tx)||!isfinite(transform.ty)||fabs(transform.a-1)>1e-6||
+        fabs(transform.b)>1e-6||fabs(transform.c)>1e-6||fabs(transform.d-1)>1e-6)return kAXErrorFailure;
+    *rect=(RibbonRect){-transform.tx,-transform.ty,bounds.size.width,bounds.size.height};
+    *surface=(RibbonRect){bounds.origin.x,bounds.origin.y,bounds.size.width,bounds.size.height};return 0;
+}
 static int settleWindow(AXUIElementRef window,uint32_t wid,RibbonRect rect,RibbonRect outer,BOOL exactPosition,RibbonGeometryProgress progress,void *context) {
     // AX replies can precede the owner's WindowServer move transaction. That
     // transaction translates the current transform relatively: resetting the
@@ -206,7 +232,7 @@ static int settleWindow(AXUIElementRef window,uint32_t wid,RibbonRect rect,Ribbo
         if(progress&&progress(context))return kAXErrorFailure;
         CGRect bounds;CGAffineTransform transform;
         CGError eb=sky.getBounds(sky.connection(),wid,&bounds),et=sky.getTransform(sky.connection(),wid,&transform);
-        if(eb||et)return kAXErrorCannotComplete;
+        if(eb||et||!usableBounds(bounds))return kAXErrorCannotComplete;
         RibbonRect logical={0};AXError ax=axGeometry(window,&logical);
         if(ax)return ax;
         // AX positions need not equal SLS bounds (Chrome titlebar offsets).
@@ -255,7 +281,7 @@ static int resizeWindow(uint32_t wid,int expected_pid,RibbonRect target,BOOL log
     (void)guard;
     SkyLight sky;CGRect bounds;RibbonRect ax={0};
     AXError snapshot=axGeometry(w,&ax);
-    if(snapshot||!loadSkyLight(&sky)||sky.getBounds(sky.connection(),wid,&bounds)){CFRelease(w);return snapshot?snapshot:kAXErrorFailure;}
+    if(snapshot||!loadSkyLight(&sky)||sky.getBounds(sky.connection(),wid,&bounds)||!usableBounds(bounds)){CFRelease(w);return snapshot?snapshot:kAXErrorFailure;}
     RibbonRect native={bounds.origin.x,bounds.origin.y,bounds.size.width,bounds.size.height};
     // AX can describe an inset client frame. Layout/clipping describes the
     // outer WindowServer surface. Convert both origin and size through the
@@ -263,7 +289,7 @@ static int resizeWindow(uint32_t wid,int expected_pid,RibbonRect target,BOOL log
     RibbonRect rect=logicalTarget?target:ribbon_outer_to_ax(target,ax,native);
     RibbonRect outer=logicalTarget?(RibbonRect){target.x+native.x-ax.x,target.y+native.y-ax.y,
         target.width+native.width-ax.width,target.height+native.height-ax.height}:target;
-    if(rect.width<=0||rect.height<=0){CFRelease(w);return kAXErrorIllegalArgument;}
+    if(!isfinite(rect.x)||!isfinite(rect.y)||!isfinite(rect.width)||!isfinite(rect.height)||rect.width<=0||rect.height<=0){CFRelease(w);return kAXErrorIllegalArgument;}
     // AppKit constrains a resize against the logical frame's current position.
     // Anchor it inside its monitor before sizing; the compositor owns the visual position.
     CGPoint position=CGPointMake(rect.x,rect.y);AXValueRef p=AXValueCreate(kAXValueCGPointType,&position);

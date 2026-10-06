@@ -172,3 +172,55 @@ layout animation; the test now waits for that animation to settle first.
   rules for sticky/above, BSP parent zoom/rotation, rule/signal API compatibility,
   automatic display-topology recovery and state persistence remain incomplete.
 - Intel Dock injection and other macOS versions are not verified.
+
+## Desktop recovery and stability changes, 2026-10-06
+
+The deployed service crashed in the native inventory worker with an uncaught
+`NSInvalidArgumentException`: JSON serialization received an infinite rectangle.
+Restarting then adopted clipped presentation dimensions. Stopping the service
+alone left narrow clips and mismatched logical/presentation origins behind.
+During recovery the service and backend watcher were stopped. Four affected terminal windows and
+the OrbStack main window were recovered through their exact owner identities;
+the user confirmed normal dragging again. OrbStack metadata sampling after
+recovery showed zero position disagreement in 40 samples. That static sampling
+does not establish drag behavior under the updated WM.
+
+The source changes reject null/infinite native rectangles, defer failed
+inventory reads, and use physical surface dimensions for enrollment. Floating
+and normal exit settle usable current coordinates and explicitly commit full
+clips before releasing compositor snapshots. Mouse capture targets the actual
+mouse-down window and retries delayed application activation. Mission Control
+pauses geometry adoption and exposes full surfaces while retaining layout state.
+
+An owner drag exposed a second failure: the initial visual x301 / physical x100
+separation was applied twice, so the first 11-point drag showed x513 instead of
+x312. A monotonic-position check had incorrectly passed this behavior. The
+regression now samples mouse-down and every step, checks both coordinates against
+the pointer displacement, and rejects that initial jump. Rust reads physical
+and presented geometry directly from WindowServer during capture, with no AX
+reads or writes in that drag path. The captured visual grab point drives the
+compositor correction; resizing retains the opposite visual edges. The monitor
+clip remains active and the top cannot cross the monitor's menu-bar boundary.
+
+The final owned Alacritty diagonal drag advances from (301,57) through (312,63)
+to (411,117), matching each 11/6-point pointer step within two points. Mouse-down
+samples retain the initial position. A border drag is adopted as width800 to910;
+three commanded resizes retain nonempty drawing/input clips in496 samples.
+Native payload lifecycle tests pass pointer correction on both axes, overview,
+owner validation and committed release. The finite-rectangle native test and
+67 Rust tests, formatting, Clippy and Nix package build pass. The native demo's
+transformed, clipped and empty-clip input tests also pass.
+
+Actual Mission Control exposes all four complete owned surfaces, including
+hidden columns, and exit restores column widths/order and manual scroll. SIGTERM
+commits full clips and usable on-display coordinates, with no origin reset.
+Ten floating/detach/retile cycles preserve the released visible position,
+physical size and full clip; manual floating resize is retained on retiling.
+The first automated Mission Control exit attempted a synthetic Escape that did
+not exit; the test now toggles the native Mission Control application and cleans
+it up on failure. It is not counted as a successful run.
+
+Current runtime hardware is one built-in display. These owned-fixture checks do
+not establish every application's behavior or updated multi-display behavior.
+Abrupt termination still falls back to compositor snapshots and does not
+reliably recover owner geometry; it is not covered by the normal-exit guarantee.

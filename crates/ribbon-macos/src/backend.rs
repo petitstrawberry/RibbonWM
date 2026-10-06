@@ -35,6 +35,8 @@ struct Update {
     clip: Option<Rect>,
     #[serde(skip_serializing_if = "Option::is_none")]
     viewport: Option<Rect>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drag_frame: Option<Rect>,
 }
 #[derive(Serialize)]
 struct Request<'a> {
@@ -78,6 +80,7 @@ pub struct Backend {
     version: Cell<u32>,
     sticky: Cell<bool>,
     interactive: Cell<bool>,
+    lifecycle: Cell<bool>,
 }
 impl Backend {
     pub fn connect() -> Result<Self> {
@@ -86,6 +89,7 @@ impl Backend {
             version: Cell::new(0),
             sticky: Cell::new(false),
             interactive: Cell::new(false),
+            lifecycle: Cell::new(false),
             session: format!(
                 "{}-{}-{}",
                 uid(),
@@ -94,6 +98,11 @@ impl Backend {
             ),
         };
         let status = b.status()?;
+        b.lifecycle.set(
+            status.capabilities.iter().any(|c| c == "overview")
+                && status.capabilities.iter().any(|c| c == "finish")
+                && status.capabilities.iter().any(|c| c == "pointer_drag"),
+        );
         if !matches!(status.version, 1 | 2) || status.uid != uid() {
             bail!("Unexpected payload version or user");
         }
@@ -149,9 +158,9 @@ impl Backend {
         )?)
     }
     pub fn require_live_version(&self) -> Result<()> {
-        if self.version.get() != 2 || !self.interactive.get() {
+        if self.version.get() != 2 || !self.interactive.get() || !self.lifecycle.get() {
             bail!(
-                "Reload the Dock backend with nix develop -c sh scripts/load-backend.sh (protocol 2 and interactive_clip required)"
+                "Reload the Dock backend with nix develop -c sh scripts/load-backend.sh (protocol 2, interactive_clip, overview, finish and pointer_drag required)"
             );
         }
         Ok(())
@@ -181,15 +190,22 @@ impl Backend {
         owners: &BTreeMap<WindowId, i32>,
         stickies: &[StickyWindow],
         viewports: &BTreeMap<String, Rect>,
+        window: WindowId,
+        drag_frame: Option<Rect>,
     ) -> Result<()> {
-        self.send_frame(placements, owners, stickies, Some(viewports))
+        self.send_frame(
+            placements,
+            owners,
+            stickies,
+            Some((viewports, window, drag_frame)),
+        )
     }
     fn send_frame(
         &self,
         placements: &[Placement],
         owners: &BTreeMap<WindowId, i32>,
         stickies: &[StickyWindow],
-        viewports: Option<&BTreeMap<String, Rect>>,
+        viewports: Option<(&BTreeMap<String, Rect>, WindowId, Option<Rect>)>,
     ) -> Result<()> {
         self.require_live_version()?;
         if placements.len() > 128 {
@@ -211,10 +227,14 @@ impl Backend {
                             frame: p.frame,
                             clip: p.clip,
                             viewport: viewports
-                                .map(|v| {
+                                .filter(|(_, id, _)| *id == p.window)
+                                .map(|(v, _, _)| {
                                     v.get(&p.monitor).copied().context("Missing drag viewport")
                                 })
                                 .transpose()?,
+                            drag_frame: viewports
+                                .filter(|(_, id, _)| *id == p.window)
+                                .and_then(|(_, _, f)| f),
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
@@ -226,6 +246,48 @@ impl Backend {
     }
     pub fn reset(&self) -> Result<()> {
         self.request("reset", None, None, None)?;
+        self.armed.set(false);
+        Ok(())
+    }
+    pub fn overview(&self) -> Result<()> {
+        self.request("overview", None, None, None)?;
+        Ok(())
+    }
+    pub fn heartbeat(&self) -> Result<()> {
+        self.request("heartbeat", None, None, None)?;
+        Ok(())
+    }
+    pub fn detach(&self, placement: &Placement, pid: i32) -> Result<()> {
+        self.request(
+            "detach",
+            Some(vec![Update {
+                wid: placement.window.0,
+                pid,
+                frame: placement.frame,
+                clip: Some(placement.frame),
+                viewport: None,
+                drag_frame: None,
+            }]),
+            None,
+            None,
+        )?;
+        Ok(())
+    }
+    pub fn finish(&self, placements: &[Placement], owners: &BTreeMap<WindowId, i32>) -> Result<()> {
+        let updates = placements
+            .iter()
+            .map(|p| {
+                Ok(Update {
+                    wid: p.window.0,
+                    pid: *owners.get(&p.window).context("Missing release owner")?,
+                    frame: p.frame,
+                    clip: Some(p.frame),
+                    viewport: None,
+                    drag_frame: None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.request("finish", Some(updates), None, None)?;
         self.armed.set(false);
         Ok(())
     }

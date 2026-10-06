@@ -107,9 +107,17 @@ def main(alacritty):
             print("PASS: real mouse border drag changes the owner width and the WM adopts it without snapping back:",
                   dict(before=before, after=native["frame"]["width"]), flush=True)
             start_x = -inspect(a)["transform"][4]
-            result = subprocess.check_output([str(HELPER), "--move-drag-fixture", str(a), str(pa.pid), "110", "0"],
+            result = subprocess.check_output([str(HELPER), "--move-drag-fixture", str(a), str(pa.pid), "110", "60"],
                                              text=True, timeout=3)
-            samples = json.loads(result.splitlines()[0])["drag_samples"]
+            trace = json.loads(result.splitlines()[0])
+            (ROOT / "docs/drag-grab-trace.jsonl").write_text(json.dumps(trace)+"\n")
+            initial=trace["before_down"]["transform"]
+            for sample in trace["press_samples"]:
+                assert all(abs(sample["transform"][i]-initial[i])<=2 for i in (4,5)), ("mouse-down jumps",trace)
+            samples = trace["drag_samples"]
+            for i,sample in enumerate(samples,1):
+                assert abs(-sample["transform"][4]-(-initial[4]+11*i))<=2, ("drag x offset doubled",trace)
+                assert abs(-sample["transform"][5]-(-initial[5]+6*i))<=2, ("drag y offset doubled",trace)
             positions = [-sample["transform"][4] for sample in samples]
             assert positions[-1] - start_x >= 40, (start_x, positions)
             assert all(b >= a-2 for a, b in zip(positions, positions[1:])), positions

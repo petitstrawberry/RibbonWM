@@ -69,6 +69,7 @@ unsafe extern "C" {
         context: *mut c_void,
     ) -> i32;
     fn ribbon_window_geometry(wid: u32, pid: i32, rect: *mut Rect) -> i32;
+    fn ribbon_window_presentation(wid: u32, pid: i32, rect: *mut Rect, surface: *mut Rect) -> i32;
     fn ribbon_restore_window(wid: u32, pid: i32, rect: Rect) -> i32;
     fn ribbon_focus_window(wid: u32, pid: i32) -> i32;
     fn ribbon_frontmost_pid() -> i32;
@@ -78,6 +79,8 @@ unsafe extern "C" {
     fn ribbon_forget_window(wid: u32);
     fn ribbon_pointer(x: *mut f64, y: *mut f64);
     fn ribbon_left_mouse_down() -> i32;
+    fn ribbon_mouse_state() -> MouseState;
+    fn ribbon_mission_control_active() -> i32;
     fn ribbon_left_mouse_down_age() -> f64;
     fn ribbon_watch_application(pid: i32) -> i32;
     fn ribbon_unwatch_application(pid: i32);
@@ -187,6 +190,23 @@ pub fn left_mouse_down() -> bool {
     // SAFETY: read-only global button state; no app UI or input injection.
     unsafe { ribbon_left_mouse_down() != 0 }
 }
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MouseState {
+    pub x: f64,
+    pub y: f64,
+    pub window: u32,
+    pub down: u32,
+    pub dragged: u32,
+}
+pub fn mouse_state() -> MouseState {
+    // SAFETY: listen-only event tap, main-thread value-only state.
+    unsafe { ribbon_mouse_state() }
+}
+pub fn mission_control_active() -> bool {
+    // SAFETY: main-thread Dock observer and metadata query.
+    unsafe { ribbon_mission_control_active() != 0 }
+}
 pub fn left_mouse_down_age() -> f64 {
     // SAFETY: value-only query of the combined session's last button event.
     unsafe { ribbon_left_mouse_down_age() }
@@ -271,6 +291,25 @@ pub fn window_geometry(id: WindowId, pid: i32) -> Result<Rect> {
         bail!("Reading AX geometry for window {} failed ({code})", id.0);
     }
     Ok(rect)
+}
+pub fn window_presentation(id: WindowId, pid: i32) -> Result<Rect> {
+    window_drag_geometry(id, pid).map(|(_, shown)| shown)
+}
+/// Physical and presented geometry read directly from WindowServer, without AX.
+pub fn window_drag_geometry(id: WindowId, pid: i32) -> Result<(Rect, Rect)> {
+    let mut rect = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 0.0,
+        height: 0.0,
+    };
+    let mut surface = rect;
+    // SAFETY: both pointers are writable values; native verifies owner and finite geometry.
+    let code = unsafe { ribbon_window_presentation(id.0, pid, &mut rect, &mut surface) };
+    if code != 0 || !rect.valid() || !surface.valid() {
+        bail!("Reading presentation for window {} failed ({code})", id.0);
+    }
+    Ok((surface, rect))
 }
 pub fn restore_window(window: &Window, logical: Rect) -> Result<()> {
     if !logical.valid() {

@@ -187,7 +187,7 @@ nix develop -c cargo run --locked -- run --all --config config/live.toml \
 | `float on/off/toggle` / `sticky on/off/toggle` | タイルから離す・モニター内のnative Spacesへ表示 |
 | `config gap VALUE` / `config padding_top VALUE` | 実行中のスペーシングを変更 |
 | `status` / `windows` / `displays` / `backend-status` | 状態を確認 |
-| `quit` | 復元して正常終了 |
+| `quit` | 使える画面内の位置へ管理を解除して正常終了 |
 
 CLIの `--monitor UUID` で対象を指定できます。省略時はポインター下の画面です。
 以下の互換構文は**キーボードフォーカスのある画面**を基準にします。
@@ -216,7 +216,9 @@ ribbonwm -m window --focus stack.next
 
 BSPの親ズーム・90度回転、float時の `--grid`、モニター間ウィンドウ転送、
 Space作成/削除、rule/signalなどの全機能互換はありません。未対応構文はエラーを返します。
-floatは元の幾何へ戻し、stickyは通常レベルです。sticky解除後はmacOSが決めた
+floatは現在表示されている位置とサイズで管理を解除します。画面外・一部だけ
+表示された列は作業領域の内側へ戻します。正常終了も同じ扱いで、起動時の
+古い配置へは戻しません。stickyは通常レベルです。sticky解除後はmacOSが決めた
 現在のSpaceへ再タイルします。最前面固定や元のSpace所属までの復元は行いません。
 
 [skhd設定例](config/skhdrc)は方向操作のキー配置を維持し、BSP回転を幅循環、

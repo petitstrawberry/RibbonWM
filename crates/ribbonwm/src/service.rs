@@ -120,6 +120,9 @@ pub fn run(user: String, config: PathBuf, exclude_apps: Vec<String>) -> Result<(
             s.version == 2
                 && s.capabilities.iter().any(|c| c == "sticky")
                 && s.capabilities.iter().any(|c| c == "interactive_clip")
+                && s.capabilities.iter().any(|c| c == "overview")
+                && s.capabilities.iter().any(|c| c == "finish")
+                && s.capabilities.iter().any(|c| c == "pointer_drag")
                 && expected.as_ref().is_none_or(|build| *build == s.build)
         });
         if accessibility && backend {

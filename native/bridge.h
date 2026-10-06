@@ -33,6 +33,7 @@ int ribbon_resize_window(uint32_t wid,int expected_pid,RibbonRect rect);
 typedef int (*RibbonGeometryProgress)(void *);
 int ribbon_resize_window_observed(uint32_t wid,int expected_pid,RibbonRect rect,RibbonGeometryProgress progress,void *context);
 int ribbon_window_geometry(uint32_t wid,int expected_pid,RibbonRect *rect);
+int ribbon_window_presentation(uint32_t wid,int expected_pid,RibbonRect *rect,RibbonRect *surface);
 int ribbon_restore_window(uint32_t wid,int expected_pid,RibbonRect rect);
 int ribbon_focus_window(uint32_t wid,int expected_pid);
 int ribbon_frontmost_pid(void);
@@ -42,6 +43,9 @@ int ribbon_window_owner(uint32_t wid);
 void ribbon_forget_window(uint32_t wid);
 void ribbon_pointer(double *x,double *y);
 int ribbon_left_mouse_down(void);
+typedef struct {double x,y;uint32_t window,down,dragged;} RibbonMouseState;
+RibbonMouseState ribbon_mouse_state(void);
+int ribbon_mission_control_active(void);
 double ribbon_left_mouse_down_age(void);
 typedef struct { uint64_t identity; double x,y; uint32_t phase; } RibbonTouch;
 typedef struct {

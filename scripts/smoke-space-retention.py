@@ -4,6 +4,7 @@ Run with no existing WM controller, via nix develop. Never enrolls user apps.
 """
 import copy
 import json
+import runpy
 import os
 from pathlib import Path
 import subprocess
@@ -13,12 +14,14 @@ import time
 
 ROOT = Path(__file__).resolve().parent.parent
 HELPER = ROOT / "native/build/test-window"
+inspect = runpy.run_path(str(ROOT / "scripts/smoke-live.py"))["inspect"]
 
 
 def main(binary, alacritty):
     assert os.environ.get("IN_NIX_SHELL")
     assert not Path(f"/tmp/ribbonwm-{os.getuid()}/wm.sock").exists()
     children, daemon = [], None
+    overview_entered = False
 
     def cli(*args):
         return json.loads(subprocess.check_output([binary, *map(str, args)], text=True, timeout=5))
@@ -98,6 +101,35 @@ def main(binary, alacritty):
                 time.sleep(1.2)  # Several snapshots of partially clipped surfaces.
                 assert [c["width"] for c in layout(cli("status"))["columns"]] == widths, "Clipping was adopted as a resize"
                 print("PASS: partially clipped columns retain physical widths across inventory refreshes", flush=True)
+                if "--overview-only" in sys.argv[3:]:
+                    subprocess.run([str(HELPER), "--focus-fixture", str(managed[-1]["id"]),str(managed[-1]["pid"])],check=True)
+                    baseline=copy.deepcopy(layout(cli("status")))
+                    subprocess.run(["/usr/bin/open","-a","Mission Control"],check=True)
+                    overview_entered = True
+                    wait(lambda s:s["native_overview"])
+                    time.sleep(.8)
+                    for w in managed:
+                        surface=inspect(w["id"])
+                        assert surface["clip_bounds"][:2]==[0,0],surface
+                        assert abs(surface["clip_bounds"][2]-surface["frame"]["width"])<2 and abs(surface["clip_bounds"][3]-surface["frame"]["height"])<2,surface
+                    assert layout(cli("status"))["columns"]==baseline["columns"]
+                    print("PASS: actual Mission Control exposes all four complete real surfaces, including fully hidden columns",flush=True)
+                    subprocess.run(["/usr/bin/open","-a","Mission Control"],check=True)
+                    wait(lambda s:not s["native_overview"])
+                    overview_entered = False
+                    time.sleep(.7)
+                    restored=layout(settled())
+                    assert restored["columns"]==baseline["columns"] and restored["scroll"]==baseline["scroll"],(baseline,restored)
+                    print("PASS: exiting actual Mission Control restores the saved strip and manual scroll",flush=True)
+                    daemon.terminate()
+                    assert daemon.wait(timeout=10)==0
+                    assert cli("backend-status")["controlled"]==0
+                    for w in managed:
+                        surface=inspect(w["id"])
+                        assert -surface["transform"][4]>=24 and -surface["transform"][5]>=57,surface
+                        assert abs(surface["clip_bounds"][2]-surface["frame"]["width"])<2 and abs(surface["clip_bounds"][3]-surface["frame"]["height"])<2,surface
+                    print("PASS: SIGTERM leaves every owned window inside its display with a full clip; no origin reset",flush=True)
+                    return
 
                 # Native activation changes logical focus, without a WM command.
                 for w in (unmanaged, managed[0]):
@@ -142,6 +174,9 @@ def main(binary, alacritty):
                 print("PASS: an actual click still reveals the selected column", flush=True)
                 assert {p["window"] for p in cli("status")["placements"]} == {w["id"] for w in managed}
         finally:
+            if overview_entered and json.loads(subprocess.check_output([str(HELPER),"--overview-state"]))["active"]:
+                subprocess.run(["/usr/bin/open","-a","Mission Control"],check=True)
+                time.sleep(.5)
             if daemon is not None and daemon.poll() is None:
                 cli("quit")
                 daemon.wait(timeout=10)

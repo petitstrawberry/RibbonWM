@@ -17,6 +17,11 @@ inspect = support["inspect"]
 
 def main(binary, alacritty):
     assert os.environ.get("IN_NIX_SHELL")
+    isolated = "--isolated" in sys.argv[3:]
+    daemon = None
+    log = None
+    if isolated:
+        assert not Path(f"/tmp/ribbonwm-{os.getuid()}/wm.sock").exists()
     def cli(*args):
         return json.loads(subprocess.check_output([binary, *map(str, args)], text=True, timeout=5))
     def wait(predicate, reason, timeout=8):
@@ -39,7 +44,7 @@ def main(binary, alacritty):
         subprocess.run([str(HELPER), "--focus-fixture", str(wid), str(p.pid)], check=True, timeout=3)
     assert "sticky" in cli("backend-status")["capabilities"]
     display = next(d for d in cli("displays") if d["primary"])
-    settings=cli("status")["state"]["settings"]
+    settings=cli("status")["state"]["settings"] if not isolated else dict(padding_top=24, padding_bottom=24)
     top=settings["padding_top"] if settings["padding_top"] is not None else settings["vertical_margin"]
     bottom=settings["padding_bottom"] if settings["padding_bottom"] is not None else settings["vertical_margin"]
     tiled_height=display["viewport"]["height"]-top-bottom
@@ -55,6 +60,20 @@ def main(binary, alacritty):
         try:
             raw = wait(lambda: next((w for w in cli("windows") if w["pid"] == p.pid and w["title"].startswith("RibbonWM QA Modes ")), None), "Fixture window not created")
             wid = raw["id"]
+            if isolated:
+                native_focus()
+                time.sleep(.5)
+                print("Before management:", raw, inspect(wid), flush=True)
+                config = Path(temporary) / "config.toml"
+                config.write_text("padding_top=24.0\npadding_bottom=24.0\npadding_left=24.0\npadding_right=24.0\n"
+                                  "gap=6.0\npreserve_window_width=true\ncenter_content=true\nanimation_duration=0.1\n")
+                with config.open("a") as stream:
+                    stream.write("animation_curve='ease_out'\n")
+                log = (ROOT / "docs/modes-daemon.txt").open("w")
+                daemon = subprocess.Popen([binary, "run", "--windows", str(wid), "--config", str(config),
+                    "--exclude-app", "com.openai.*", "--exclude-app", "ChatGPT*",
+                    "--exclude-app", "com.apple.systempreferences"], stdout=log, stderr=log)
+                wait(lambda: Path(f"/tmp/ribbonwm-{os.getuid()}/wm.sock").exists(), "Owned daemon did not start")
             # App restoration may open the new process on its previous Space.
             # Activate only our owned fixture before requiring visible enrollment.
             native_focus()
@@ -64,17 +83,19 @@ def main(binary, alacritty):
             window = wait(enrolled, "Fixture not automatically enrolled")
             wid = window["id"]
             original_space = space()
-            baseline = cli("status")["original_geometry"][str(wid)]["bounds"]
             native_focus()
+            wait(lambda: abs(next(x["frame"]["width"] for x in cli("status")["placements"] if x["window"]==wid)-inspect(wid)["frame"]["width"])<2 and abs(inspect(wid)["frame"]["height"]-tiled_height)<2, "Initial tile did not settle")
+            time.sleep(.3)
+            baseline=next(x["frame"] for x in cli("status")["placements"] if x["window"]==wid)
             cli("-m", "window", "--toggle", "float")
             wait(lambda: mode()["floating"] and not tiled(), "Float did not leave the strip")
             time.sleep(.5)
             restored = inspect(wid)
-            assert all(abs(restored["frame"][k] - baseline[k]) < 2 for k in baseline), (restored, baseline)
+            assert all(abs(-restored["transform"][4+i]-baseline[k])<2 for i,k in enumerate(("x","y"))), (restored, baseline)
             assert restored["transform"][:4] == [1, 0, 0, 1], restored
             assert restored["clip_bounds"][:2] == [0, 0], restored
             assert abs(restored["clip_bounds"][2]-baseline["width"]) <= 2 and abs(restored["clip_bounds"][3]-baseline["height"]) <= 2, (restored, baseline)
-            width, height = baseline["width"] + 120, baseline["height"] + 50
+            width, height = baseline["width"] + 120, baseline["height"] - 120
             subprocess.run([str(HELPER), "--resize-fixture", str(wid), str(p.pid), str(width), str(height)], check=True, timeout=3)
             time.sleep(1.2)
             cli("float", "on", "--window", wid)
@@ -84,6 +105,21 @@ def main(binary, alacritty):
             wait(lambda: tiled() and abs(inspect(wid)["frame"]["height"] - tiled_height) < 2, "Retile not applied")
             assert abs(inspect(wid)["frame"]["width"] - width) < 2
             print("PASS: float releases real geometry and input, survives inventory polls/manual resize, retile adopts the new width", flush=True)
+            if "--float-only" in sys.argv[3:]:
+                for _ in range(10):
+                    time.sleep(.3)
+                    before=next(x["frame"] for x in cli("status")["placements"] if x["window"]==wid)
+                    cli("float", "on", "--window", wid)
+                    wait(lambda: not tiled(), "Repeated detach failed")
+                    time.sleep(.15)
+                    surface=inspect(wid)
+                    assert surface["clip_bounds"][:2] == [0,0], surface
+                    assert abs(surface["clip_bounds"][2]-width)<2 and abs(surface["clip_bounds"][3]-tiled_height)<2, surface
+                    assert all(abs(-surface["transform"][4+i]-before[k])<2 for i,k in enumerate(("x","y"))), (surface,before)
+                    cli("float", "off", "--window", wid)
+                    wait(lambda: tiled() and abs(inspect(wid)["frame"]["height"]-tiled_height)<2, "Repeated retile failed")
+                print("PASS: ten detach/retile cycles preserve floating position, physical size and full clip", flush=True)
+                return
             cli("float", "on", "--window", wid)
             cli("sticky", "on", "--window", wid)
             wait(lambda: inventory()["sticky"] and not tiled(), "Native sticky tag not applied")
@@ -159,6 +195,10 @@ def main(binary, alacritty):
             if p.poll() is None:
                 p.terminate()
                 p.wait(timeout=5)
+            if daemon is not None:
+                daemon.wait(timeout=5)
+            if log is not None:
+                log.close()
             # Closing the focused app can itself activate another native Space.
             time.sleep(1)
             snapshot = json.loads(subprocess.check_output([str(HELPER), "--spaces"], text=True))
