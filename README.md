@@ -75,6 +75,8 @@ modules = [
 ```
 
 システムflakeを更新・ビルドしてから `sudo darwin-rebuild switch --flake …` で反映します。
+`rebuild`だけでは`flake.lock`に固定されたRibbonWMのrevisionは更新されません。
+更新時は先にシステムflakeのディレクトリで`nix flake update ribbonwm`を実行します。
 同時にyabaiを有効にするとmoduleのassertionで拒否します。
 
 ユーザーLaunchAgent `org.nixos.ribbonwm` は `bin/ribbonwm service …` を直接起動します。
@@ -86,6 +88,8 @@ modules = [
 `enableDockInjection = true` はroot LaunchDaemon `org.nixos.ribbonwm-backend` を追加します。
 指定ユーザーのDockを監視し、必要なときにパッケージのバックエンドをロードします。
 実行中WMのleaseは奪いません。Dock再起動後の自動復旧はまだ実機未検証です。
+サービスは同じパッケージのpayload build名を確認してから管理を開始します。
+`doctor`には実行ファイルと期待するpayload名が出ます。待機理由はログで確認できます。
 
 ログは `~/Library/Logs/RibbonWM/wm.log` と `/var/log/ribbonwm-backend.log`。
 `ribbonwm quit` は正常終了し、そのまま停止します。異常終了はlaunchdが再起動します。

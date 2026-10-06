@@ -16,5 +16,7 @@ build/dock-loader: loader.m Makefile | build
 	/usr/bin/codesign -s - -f $@
 build/test-window: test-window.m query.m bridge.h skylight.h Makefile | build
 	$(CC) $(CFLAGS) -fobjc-arc test-window.m query.m $(LDLIBS) -framework ApplicationServices -o $@
+build/socket-test: socket-test.m payload.m skylight.h Makefile | build
+	$(CC) $(CFLAGS) -fobjc-arc socket-test.m $(LDLIBS) -o $@
 clean:
 	rm -rf build

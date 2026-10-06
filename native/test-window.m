@@ -1,7 +1,8 @@
-// Independent AppKit fixture. It never changes WindowServer transforms or clips.
-// Only the external controller and Dock payload may perform those operations.
+// Independent AppKit fixture. Normal mode leaves transforms to the controller.
+// Geometry regression mode changes only its own window, without Dock injection.
 #import "skylight.h"
 #include "bridge.h"
+#include <libproc.h>
 
 static void reply(NSDictionary *value) {
     NSData *data=[NSJSONSerialization dataWithJSONObject:value options:0 error:nil];
@@ -72,6 +73,12 @@ static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
         state[@"ignores_mouse"]=@(self.target.ignoresMouseEvents);state[@"occlusion"]=@(self.target.occlusionState);
         reply(state);return;
     }
+    if([op isEqual:@"translate"]&&[self.configuration[@"geometry_test"] boolValue]) {
+        double x=[command[@"x"] doubleValue],y=[command[@"y"] doubleValue];
+        if(!isfinite(x)||!isfinite(y)||fabs(x)>10000||fabs(y)>10000)return;
+        CGError error=self.sky.setTransform(self.sky.connection(),(uint32_t)self.target.windowNumber,CGAffineTransformMakeTranslation(-x,-y));
+        reply(@{@"transform_error":@(error)});return;
+    }
     if([op isEqual:@"click"]||[op isEqual:@"move"]) {
         CGPoint p=CGPointMake([command[@"x"] doubleValue],[command[@"y"] doubleValue]);
         CGEventRef e=CGEventCreateMouseEvent(NULL,kCGEventMouseMoved,p,kCGMouseButtonLeft);CGEventPost(kCGHIDEventTap,e);CFRelease(e);
@@ -101,7 +108,11 @@ static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
         [panel orderFrontRegardless];[self.backdrops addObject:panel];
     }
     NSDictionary *origin=self.configuration[@"target"]?:@{@"x":@940,@"y":@360};
-    self.target=[[TestPanel alloc] initWithContentRect:NSMakeRect([origin[@"x"] doubleValue],height-[origin[@"y"] doubleValue]-400,400,400) styleMask:NSWindowStyleMaskBorderless|NSWindowStyleMaskNonactivatingPanel backing:NSBackingStoreBuffered defer:NO];
+    NSUInteger style=[self.configuration[@"geometry_test"] boolValue]?
+        NSWindowStyleMaskTitled|NSWindowStyleMaskResizable|NSWindowStyleMaskNonactivatingPanel:
+        NSWindowStyleMaskBorderless|NSWindowStyleMaskNonactivatingPanel;
+    self.target=[[TestPanel alloc] initWithContentRect:NSMakeRect([origin[@"x"] doubleValue],height-[origin[@"y"] doubleValue]-400,400,400) styleMask:style backing:NSBackingStoreBuffered defer:NO];
+    self.target.title=@"RibbonWM QA geometry";
     self.target.level=NSFloatingWindowLevel;self.target.hidesOnDeactivate=NO;self.target.hasShadow=[self.configuration[@"shadow"] boolValue];
     self.target.collectionBehavior=NSWindowCollectionBehaviorMoveToActiveSpace;
     self.target.alphaValue=0;self.target.ignoresMouseEvents=YES;
@@ -125,19 +136,34 @@ static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
 }
 @end
 int main(int argc,char **argv) {@autoreleasepool {
+    if(argc==2&&!strcmp(argv[1],"--viewport-test")) {
+        RibbonRect primary=ribbon_display_viewport((RibbonRect){0,0,1512,982},(RibbonRect){0,0,1512,949},(RibbonRect){0,0,1512,982},33);
+        RibbonRect upper=ribbon_display_viewport((RibbonRect){-100,982,1600,900},(RibbonRect){-100,982,1600,900},(RibbonRect){-100,-900,1600,900},33);
+        RibbonRect lower=ribbon_display_viewport((RibbonRect){700,-1000,1800,1000},(RibbonRect){710,-960,1780,960},(RibbonRect){700,982,1800,1000},33);
+        if(primary.y!=33||primary.height!=949||upper.y!=-867||upper.height!=867||
+            lower.x!=710||lower.y!=1015||lower.height!=927)return 1;
+        puts("PASS: menu bar reservation follows each CG display origin, including monitors above primary");return 0;
+    }
     // External focus event for QA: only the explicitly named disposable
     // Alacritty window is eligible, never a user's ordinary terminal or Codex.
-    if((argc==4&&(strcmp(argv[1],"--focus-fixture")==0||strcmp(argv[1],"--click-fixture")==0))||
-       (argc==6&&(strcmp(argv[1],"--resize-fixture")==0||strcmp(argv[1],"--drag-fixture")==0))) {
+    if((argc==4&&(strcmp(argv[1],"--focus-fixture")==0||strcmp(argv[1],"--click-fixture")==0||strcmp(argv[1],"--geometry-fixture")==0))||
+       (argc==6&&(strcmp(argv[1],"--resize-fixture")==0||strcmp(argv[1],"--drag-fixture")==0))||
+       (argc==8&&strcmp(argv[1],"--restore-fixture")==0)) {
         BOOL click=strcmp(argv[1],"--click-fixture")==0;
         BOOL resize=strcmp(argv[1],"--resize-fixture")==0;
         BOOL drag=strcmp(argv[1],"--drag-fixture")==0;
+        BOOL geometry=strcmp(argv[1],"--geometry-fixture")==0;
+        BOOL restore=strcmp(argv[1],"--restore-fixture")==0;
         char *end=NULL;unsigned long wid=strtoul(argv[2],&end,10);
         if(!wid||wid>UINT32_MAX||*end)return 1;
         long pid=strtol(argv[3],&end,10);if(pid<=0||pid>INT_MAX||*end)return 1;
         NSRunningApplication *app=[NSRunningApplication runningApplicationWithProcessIdentifier:(pid_t)pid];
         // Nix's executable wrapper can launch Alacritty without a bundle ID.
-        if(![app.bundleIdentifier isEqual:@"org.alacritty"]&&![app.localizedName.lowercaseString containsString:@"alacritty"]){reply(@{@"error":@"Not the fixture app",@"bundle":app.bundleIdentifier?:@"",@"app":app.localizedName?:@""});return 1;}
+        char ownPath[PROC_PIDPATHINFO_MAXSIZE]={0},targetPath[PROC_PIDPATHINFO_MAXSIZE]={0};
+        BOOL ownFixture=proc_pidpath(getpid(),ownPath,sizeof(ownPath))>0&&
+            proc_pidpath((pid_t)pid,targetPath,sizeof(targetPath))>0&&!strcmp(ownPath,targetPath);
+        if(![app.bundleIdentifier isEqual:@"org.alacritty"]&&![app.localizedName.lowercaseString containsString:@"alacritty"]&&
+            !(ownFixture&&(geometry||resize||restore))){reply(@{@"error":@"Not the fixture app",@"bundle":app.bundleIdentifier?:@"",@"app":app.localizedName?:@""});return 1;}
         CFArrayRef list=CGWindowListCopyWindowInfo(kCGWindowListOptionAll|kCGWindowListExcludeDesktopElements,kCGNullWindowID);
         BOOL fixture=NO;
         for(NSDictionary *row in (__bridge NSArray *)list) {
@@ -147,6 +173,18 @@ int main(int argc,char **argv) {@autoreleasepool {
         }
         if(list)CFRelease(list);
         if(!fixture){reply(@{@"error":@"Not a named fixture window"});return 1;}
+        if(geometry) {
+            RibbonRect rect={0};int error=ribbon_window_geometry((uint32_t)wid,(int)pid,&rect);
+            reply(@{@"geometry_error":@(error),@"geometry":@{@"x":@(rect.x),@"y":@(rect.y),@"width":@(rect.width),@"height":@(rect.height)}});return error?1:0;
+        }
+        if(restore) {
+            double values[4];for(int i=0;i<4;i++) {
+                values[i]=strtod(argv[i+4],&end);if(*end||!isfinite(values[i])||fabs(values[i])>10000)return 1;
+            }
+            if(values[2]<100||values[3]<100)return 1;
+            int error=ribbon_restore_window((uint32_t)wid,(int)pid,(RibbonRect){values[0],values[1],values[2],values[3]});
+            reply(@{@"restore_error":@(error)});return error?1:0;
+        }
         if(resize) {
             double width=strtod(argv[4],&end);if(*end||!isfinite(width)||width<100||width>10000)return 1;
             double height=strtod(argv[5],&end);if(*end||!isfinite(height)||height<100||height>10000)return 1;

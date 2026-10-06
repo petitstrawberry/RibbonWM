@@ -265,7 +265,11 @@ static bool replaceIdleSocket(struct sockaddr_un *addr) {
     int noSigpipe=1;setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&noSigpipe,sizeof(noSigpipe));
     uid_t uid=0;gid_t gid=0;
     bool ok=false;
-    if(!connect(fd,(struct sockaddr *)addr,sizeof(*addr))&&!getpeereid(fd,&uid,&gid)&&uid==getuid()) {
+    int connected=connect(fd,(struct sockaddr *)addr,sizeof(*addr));
+    // Dock can die without unlinking its socket. A refused, same-user socket
+    // has no listening owner; retain the inode check before removing it.
+    if(connected&&errno==ECONNREFUSED)ok=true;
+    if(!connected&&!getpeereid(fd,&uid,&gid)&&uid==getuid()) {
         const char *hello="{\"op\":\"hello\"}\n";
         if(write(fd,hello,strlen(hello))==(ssize_t)strlen(hello)) {
             char bytes[4096];size_t used=0;

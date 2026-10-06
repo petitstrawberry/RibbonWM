@@ -24,6 +24,7 @@ pub struct Options {
 struct GeometryLease {
     modes: BTreeMap<WindowId, WindowMode>,
     originals: BTreeMap<WindowId, Window>,
+    logical_originals: BTreeMap<WindowId, Rect>,
     resized: BTreeSet<WindowId>,
 }
 impl Drop for GeometryLease {
@@ -31,7 +32,8 @@ impl Drop for GeometryLease {
         for id in &self.resized {
             if let Some(w) = self.originals.get(id)
                 && ribbon_macos::window_owner(*id) == w.pid
-                && let Err(e) = ribbon_macos::restore_window(w)
+                && let Some(logical) = self.logical_originals.get(id)
+                && let Err(e) = ribbon_macos::restore_window(w, *logical)
             {
                 eprintln!("Geometry restore: {e:#}");
             }
@@ -63,6 +65,7 @@ fn forget_closed(engine: &mut Engine, geometry: &mut GeometryLease, id: WindowId
         engine.remove_window(id)?;
     }
     geometry.originals.remove(&id);
+    geometry.logical_originals.remove(&id);
     geometry.modes.remove(&id);
     geometry.resized.remove(&id);
     ribbon_macos::forget_window(id);
@@ -216,6 +219,14 @@ fn synchronize(
         if !options.dry_run && !ribbon_macos::window_manageable(w.id, w.pid) {
             continue;
         }
+        if !options.dry_run {
+            // The presented CG rectangle can differ from the owner's AX frame.
+            // Save before Dock or AX writes; restore each through its own API.
+            let Ok(logical) = ribbon_macos::window_geometry(w.id, w.pid) else {
+                continue;
+            };
+            geometry.logical_originals.insert(w.id, logical);
+        }
         let width = engine.settings.preserve_window_width.then(|| {
             w.bounds
                 .width
@@ -315,11 +326,15 @@ fn set_mode(
         next.sticky_leased = true;
     }
     let before = engine.clone();
+    let old_logical = geometry.logical_originals.get(&id).copied();
     geometry.modes.insert(id, next);
     let transition = (|| -> Result<()> {
         if !next.wants_tile() && engine.window_ids().contains(&id) {
             if !dry_run && geometry.resized.contains(&id) {
-                ribbon_macos::restore_window(&original)?;
+                ribbon_macos::restore_window(
+                    &original,
+                    old_logical.context("Missing original AX geometry")?,
+                )?;
             }
             engine.remove_window(id)?;
         } else if next.wants_tile() && !engine.window_ids().contains(&id) {
@@ -335,6 +350,11 @@ fn set_mode(
                     .max(100.0),
                 );
                 engine.add_window(&display.id, id, Some(width))?;
+                if !dry_run {
+                    geometry
+                        .logical_originals
+                        .insert(id, ribbon_macos::window_geometry(id, current.pid)?);
+                }
                 geometry.originals.insert(id, current);
             }
         }
@@ -353,6 +373,11 @@ fn set_mode(
         *engine = before;
         geometry.modes.insert(id, old);
         geometry.originals.insert(id, original.clone());
+        if let Some(logical) = old_logical {
+            geometry.logical_originals.insert(id, logical);
+        } else {
+            geometry.logical_originals.remove(&id);
+        }
         if next.sticky != old.sticky
             && !dry_run
             && let Some(backend) = backend
@@ -569,6 +594,7 @@ pub fn run(options: Options) -> Result<()> {
     let mut geometry = GeometryLease {
         modes: BTreeMap::new(),
         originals: BTreeMap::new(),
+        logical_originals: BTreeMap::new(),
         resized: BTreeSet::new(),
     };
     let mut engine = Engine::new(options.settings.clone())?;
@@ -754,7 +780,15 @@ pub fn run(options: Options) -> Result<()> {
                     let resized = ribbon_macos::resize_window(
                         p.window,
                         w.pid,
-                        resize_anchor(viewport, w.bounds, size.1, size.2),
+                        resize_anchor(
+                            viewport,
+                            *geometry
+                                .logical_originals
+                                .get(&p.window)
+                                .context("Missing original AX geometry")?,
+                            size.1,
+                            size.2,
+                        ),
                     );
                     if let Err(e) = resized {
                         if ribbon_macos::window_owner(p.window) != w.pid {

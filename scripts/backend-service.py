@@ -47,6 +47,27 @@ def probe():
     print(json.dumps(result))
 
 
+def expected_backend(backend, payload, uid, dock):
+    return bool(backend and backend.get("ok") and backend.get("version") == 2
+                and backend.get("build") == payload.name and backend.get("uid") == uid
+                and backend.get("pid") == dock)
+
+
+def wait_for_backend(command, user, payload, dock, timeout=2):
+    # dlopen returns before the payload's listener necessarily starts serving.
+    deadline = time.monotonic() + timeout
+    loaded = None
+    while True:
+        result = subprocess.run(command, user=user.pw_uid, group=user.pw_gid, extra_groups=[],
+                                capture_output=True, text=True, timeout=3, check=True)
+        loaded = json.loads(result.stdout)["backend"]
+        if expected_backend(loaded, payload, user.pw_uid, dock):
+            return loaded
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"Backend identity mismatch: expected {payload.name}, Dock {dock}; received {loaded}")
+        time.sleep(.05)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--probe", action="store_true")
@@ -76,7 +97,7 @@ def main():
                                     capture_output=True, text=True, timeout=3, check=True)
             state = json.loads(result.stdout)
             old = state["backend"]
-            if old and old.get("ok") and old.get("pid") == docks[0] and old.get("uid") == user.pw_uid and old.get("build") == payload.name:
+            if expected_backend(old, payload, user.pw_uid, docks[0]):
                 if not args.watch:
                     print("Dock backend already loaded", flush=True)
                     return
@@ -84,11 +105,7 @@ def main():
                 raise RuntimeError("Stop RibbonWM before replacing the backend")
             else:
                 subprocess.run([args.loader, str(payload), str(docks[0])], check=True, timeout=10)
-                result = subprocess.run(command, user=user.pw_uid, group=user.pw_gid, extra_groups=[],
-                                        capture_output=True, text=True, timeout=3, check=True)
-                loaded = json.loads(result.stdout)["backend"]
-                if not loaded or loaded.get("build") != payload.name or loaded.get("uid") != user.pw_uid or loaded.get("pid") != docks[0]:
-                    raise RuntimeError("Loaded backend did not respond with the expected identity")
+                wait_for_backend(command, user, payload, docks[0])
                 print(f"Dock backend ready for {args.user}, pid {docks[0]}", flush=True)
                 if not args.watch:
                     return

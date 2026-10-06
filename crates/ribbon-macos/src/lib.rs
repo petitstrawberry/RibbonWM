@@ -48,6 +48,7 @@ unsafe extern "C" {
     fn ribbon_ax_trusted() -> i32;
     fn ribbon_ax_request_permission() -> i32;
     fn ribbon_resize_window(wid: u32, pid: i32, rect: Rect) -> i32;
+    fn ribbon_window_geometry(wid: u32, pid: i32, rect: *mut Rect) -> i32;
     fn ribbon_restore_window(wid: u32, pid: i32, rect: Rect) -> i32;
     fn ribbon_focus_window(wid: u32, pid: i32) -> i32;
     fn ribbon_frontmost_pid() -> i32;
@@ -108,12 +109,26 @@ pub fn resize_window(id: WindowId, pid: i32, logical_frame: Rect) -> Result<()> 
     }
     Ok(())
 }
-pub fn restore_window(window: &Window) -> Result<()> {
-    if !window.bounds.valid() {
+pub fn window_geometry(id: WindowId, pid: i32) -> Result<Rect> {
+    let mut rect = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 0.0,
+        height: 0.0,
+    };
+    // SAFETY: rect is writable; native code validates the owning PID first.
+    let code = unsafe { ribbon_window_geometry(id.0, pid, &mut rect) };
+    if code != 0 || !rect.valid() {
+        bail!("Reading AX geometry for window {} failed ({code})", id.0);
+    }
+    Ok(rect)
+}
+pub fn restore_window(window: &Window, logical: Rect) -> Result<()> {
+    if !logical.valid() {
         bail!("Invalid original geometry");
     }
     // SAFETY: value-only arguments; native code checks the current owning PID before writing.
-    let code = unsafe { ribbon_restore_window(window.id.0, window.pid, window.bounds) };
+    let code = unsafe { ribbon_restore_window(window.id.0, window.pid, logical) };
     if code != 0 {
         bail!("Restoring window {} failed ({code})", window.id.0);
     }

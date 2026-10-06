@@ -31,7 +31,6 @@ char *ribbon_query_json(int kind) { @autoreleasepool {
     resolve(); NSMutableArray *rows=[NSMutableArray array];
     if (kind==0) {
         NSArray<NSScreen *> *screens=NSScreen.screens;
-        CGFloat primaryHeight=screens.count?screens[0].frame.size.height:0;
         // Secondary visibleFrame can include the menu bar (observed on macOS 26).
         // Reserve the primary screen's measured bar height on every display;
         // NSStatusBar.thickness alone reports 22 even when the visible inset is 30.
@@ -45,9 +44,13 @@ char *ribbon_query_json(int kind) { @autoreleasepool {
             uint64_t sid=connection&&currentSpace?currentSpace(connection(),uuidString):0;
             NSRect v=screen.visibleFrame;
             CGRect frame=CGDisplayBounds(did);
-            CGFloat top=MAX(primaryHeight-NSMaxY(v),frame.origin.y+MAX(menuHeight,screen.safeAreaInsets.top));
-            CGFloat bottom=primaryHeight-NSMinY(v);
-            CGRect viewport=CGRectMake(v.origin.x,top,v.size.width,MAX(1,bottom-top));
+            // Convert screen-local insets: AppKit is bottom-up, CG/AX top-down.
+            // Displays above primary can have a negative global CG origin.
+            NSRect a=screen.frame;
+            RibbonRect usable=ribbon_display_viewport((RibbonRect){a.origin.x,a.origin.y,a.size.width,a.size.height},
+                (RibbonRect){v.origin.x,v.origin.y,v.size.width,v.size.height},
+                (RibbonRect){frame.origin.x,frame.origin.y,frame.size.width,frame.size.height},MAX(menuHeight,screen.safeAreaInsets.top));
+            CGRect viewport=CGRectMake(usable.x,usable.y,usable.width,usable.height);
             [rows addObject:@{@"id":(__bridge NSString *)uuidString,@"display_id":@(did),@"name":screen.localizedName,
                 @"frame":rectJSON(frame),@"viewport":rectJSON(viewport),
                 @"scale":@(screen.backingScaleFactor),@"native_space":@(sid),@"native_fullscreen":(spaceType&&sid&&spaceType(connection(),sid)!=0)?@YES:@NO,@"primary":CGDisplayIsMain(did)?@YES:@NO}];
@@ -116,7 +119,21 @@ static AXUIElementRef findAXWindow(uint32_t wid,int expected_pid,pid_t *pid) {
     if(found)windowCache[@(wid)]=@{@"pid":@(expected_pid),@"element":(__bridge id)found};
     return found;
 }
-static int settleWindow(uint32_t wid,RibbonRect rect,BOOL exactPosition) {
+static AXError axGeometry(AXUIElementRef window,RibbonRect *rect) {
+    CFTypeRef p=NULL,s=NULL;CGPoint point=CGPointZero;CGSize size=CGSizeZero;
+    AXError error=AXUIElementCopyAttributeValue(window,kAXPositionAttribute,&p);
+    if(!error)error=AXUIElementCopyAttributeValue(window,kAXSizeAttribute,&s);
+    if(!error&&(!p||!s||!AXValueGetValue(p,kAXValueCGPointType,&point)||!AXValueGetValue(s,kAXValueCGSizeType,&size)))error=kAXErrorFailure;
+    if(p)CFRelease(p);if(s)CFRelease(s);
+    if(!error)*rect=(RibbonRect){point.x,point.y,size.width,size.height};
+    return error;
+}
+int ribbon_window_geometry(uint32_t wid,int expected_pid,RibbonRect *rect) { @autoreleasepool {
+    pid_t pid=0;AXUIElementRef window=findAXWindow(wid,expected_pid,&pid);
+    if(!window)return kAXErrorInvalidUIElement;
+    AXError error=axGeometry(window,rect);CFRelease(window);return error;
+} }
+static int settleWindow(AXUIElementRef window,uint32_t wid,RibbonRect rect,BOOL exactPosition) {
     // AX replies can precede the owner's WindowServer move transaction. That
     // transaction translates the current transform relatively: resetting the
     // compositor before it arrives would apply the original offset twice.
@@ -127,18 +144,23 @@ static int settleWindow(uint32_t wid,RibbonRect rect,BOOL exactPosition) {
         CGRect bounds;CGAffineTransform transform;
         CGError eb=sky.getBounds(sky.connection(),wid,&bounds),et=sky.getTransform(sky.connection(),wid,&transform);
         if(eb||et)return kAXErrorCannotComplete;
-        BOOL position=fabs(bounds.origin.x-rect.x)<=2&&fabs(bounds.origin.y-rect.y)<=2;
+        RibbonRect logical={0};AXError ax=axGeometry(window,&logical);
+        if(ax)return ax;
+        // AX positions need not equal SLS bounds (Chrome titlebar offsets).
+        // Verify the owner's position in the coordinate system we wrote.
+        BOOL position=fabs(logical.x-rect.x)<=2&&fabs(logical.y-rect.y)<=2;
         if(!exactPosition) {
             // AppKit may constrain the logical anchor. Visual placement belongs
             // to Dock, so accept a stable anchor inside the intended display.
             for(NSScreen *screen in NSScreen.screens) {
                 CGRect display=CGDisplayBounds([screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue]);
                 if(CGRectContainsPoint(display,CGPointMake(rect.x,rect.y))) {
-                    position=CGRectContainsPoint(display,bounds.origin);break;
+                    position=CGRectContainsPoint(display,CGPointMake(logical.x,logical.y));break;
                 }
             }
         }
-        BOOL matches=position&&fabs(bounds.size.width-rect.width)<=2&&fabs(bounds.size.height-rect.height)<=2;
+        BOOL matches=position&&fabs(logical.width-rect.width)<=2&&fabs(logical.height-rect.height)<=2&&
+            fabs(bounds.size.width-rect.width)<=2&&fabs(bounds.size.height-rect.height)<=2;
         double now=NSProcessInfo.processInfo.systemUptime;
         if(matches&&havePrevious&&CGAffineTransformEqualToTransform(transform,previous)) {
             if(!stable)stable=now;
@@ -193,7 +215,8 @@ int ribbon_resize_window(uint32_t wid,int expected_pid,RibbonRect rect) { @autor
     p=AXValueCreate(kAXValueCGPointType,&position);
     if(!error)error=AXUIElementSetAttributeValue(w,kAXPositionAttribute,p);CFRelease(p);
     if(error)fprintf(stderr,"Window %u AX resize failed (%d): requested=(%.1f,%.1f), accepted=(%.1f,%.1f)\n",wid,error,size.width,size.height,accepted.width,accepted.height);
-    CFRelease(w);return error?error:settleWindow(wid,rect,NO);
+    if(!error)error=settleWindow(w,wid,rect,NO);
+    CFRelease(w);return error;
 } }
 int ribbon_restore_window(uint32_t wid,int expected_pid,RibbonRect rect) { @autoreleasepool {
     int resized=ribbon_resize_window(wid,expected_pid,rect);if(resized)return resized;
@@ -202,8 +225,8 @@ int ribbon_restore_window(uint32_t wid,int expected_pid,RibbonRect rect) { @auto
     // AppKit doesn't constrain it against the larger managed size.
     CGPoint point=CGPointMake(rect.x,rect.y);AXValueRef p=AXValueCreate(kAXValueCGPointType,&point);
     AXError ep=AXUIElementSetAttributeValue(w,kAXPositionAttribute,p);
-    CFRelease(p);CFRelease(w);if(ep)return ep;
-    return settleWindow(wid,rect,YES);
+    CFRelease(p);if(!ep)ep=settleWindow(w,wid,rect,YES);
+    CFRelease(w);return ep;
 } }
 int ribbon_focus_window(uint32_t wid,int expected_pid) { @autoreleasepool {
     pid_t pid=0;AXUIElementRef w=findAXWindow(wid,expected_pid,&pid);if(!w)return kAXErrorInvalidUIElement;

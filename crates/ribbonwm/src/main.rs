@@ -158,7 +158,8 @@ fn doctor() -> Result<()> {
         Err(e) => json!({"available":false,"reason":e.to_string()}),
     };
     print(
-        json!({"name":"RibbonWM","version":env!("CARGO_PKG_VERSION"),"accessibility":ribbon_macos::accessibility_trusted(),
+        json!({"name":"RibbonWM","version":env!("CARGO_PKG_VERSION"),"executable":std::env::current_exe()?,
+        "expected_backend":ribbon_macos::backend::expected_build()?,"accessibility":ribbon_macos::accessibility_trusted(),
         "displays":ribbon_macos::displays()?,"backend":backend,
         "workspace_policy":"one horizontal scroll layout per native macOS Space and monitor",
         "live_verification":"See docs/verification.md for actual runtime coverage"}),

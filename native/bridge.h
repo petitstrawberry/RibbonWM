@@ -1,7 +1,13 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include <math.h>
 typedef struct { double x,y,width,height; } RibbonRect;
+static inline RibbonRect ribbon_display_viewport(RibbonRect app,RibbonRect visible,RibbonRect cg,double reservedTop) {
+    double top=fmax(app.y+app.height-visible.y-visible.height,reservedTop);
+    double bottom=visible.y-app.y;
+    return (RibbonRect){cg.x+visible.x-app.x,cg.y+top,visible.width,fmax(1,cg.height-top-bottom)};
+}
 typedef struct { uint32_t wid; RibbonRect bounds; } RibbonDemoWindow;
 typedef struct { RibbonRect viewport; RibbonDemoWindow windows[3]; } RibbonDemoInfo;
 typedef struct { uint32_t wid,visible; double dx,dy; RibbonRect clip; } RibbonDemoFrame;
@@ -17,6 +23,7 @@ void ribbon_free(void *);
 int ribbon_ax_trusted(void);
 int ribbon_ax_request_permission(void);
 int ribbon_resize_window(uint32_t wid,int expected_pid,RibbonRect rect);
+int ribbon_window_geometry(uint32_t wid,int expected_pid,RibbonRect *rect);
 int ribbon_restore_window(uint32_t wid,int expected_pid,RibbonRect rect);
 int ribbon_focus_window(uint32_t wid,int expected_pid);
 int ribbon_frontmost_pid(void);

@@ -54,6 +54,22 @@ pub fn socket_path() -> PathBuf {
     PathBuf::from(format!("/tmp/ribbonwm-{}/backend.sock", uid()))
 }
 
+/// Packaged services must use the payload shipped with their executable.
+/// Development binaries have no installed lib directory and use the explicit loader.
+pub fn expected_build() -> Result<Option<String>> {
+    let exe = std::env::current_exe()?;
+    let Some(root) = exe.parent().and_then(|p| p.parent()) else {
+        return Ok(None);
+    };
+    let payload = root.join("lib/ribbonwm/ribbon-payload.dylib");
+    if !payload.exists() {
+        return Ok(None);
+    }
+    Ok(std::fs::canonicalize(payload)?
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned()))
+}
+
 pub struct Backend {
     session: String,
     armed: Cell<bool>,

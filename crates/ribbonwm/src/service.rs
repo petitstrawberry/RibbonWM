@@ -50,15 +50,23 @@ pub fn run(user: String, config: PathBuf, exclude_apps: Vec<String>) -> Result<(
             .with_context(|| format!("Reading {}", config.display()))?,
     )?;
     settings.validate()?;
+    let expected = ribbon_macos::backend::expected_build()?;
+    eprintln!(
+        "Starting service: executable={}, expected backend={expected:?}",
+        std::env::current_exe()?.display()
+    );
     if !ribbon_macos::accessibility_trusted() {
         eprintln!("Requesting Accessibility permission from macOS");
         ribbon_macos::request_accessibility_permission();
     }
     loop {
         let accessibility = ribbon_macos::accessibility_trusted();
-        let backend = ribbon_macos::backend::Backend::connect()
-            .and_then(|b| b.status())
-            .is_ok_and(|s| s.version == 2 && s.capabilities.iter().any(|c| c == "sticky"));
+        let status = ribbon_macos::backend::Backend::connect().and_then(|b| b.status());
+        let backend = status.as_ref().is_ok_and(|s| {
+            s.version == 2
+                && s.capabilities.iter().any(|c| c == "sticky")
+                && expected.as_ref().is_none_or(|build| *build == s.build)
+        });
         if accessibility && backend {
             break;
         }
@@ -66,6 +74,9 @@ pub fn run(user: String, config: PathBuf, exclude_apps: Vec<String>) -> Result<(
             "Waiting: Accessibility={accessibility}, sticky backend={backend}; grant Accessibility to {}",
             std::env::current_exe()?.display()
         );
+        if !backend {
+            eprintln!("Backend preflight: {status:?}; expected {expected:?}");
+        }
         std::thread::sleep(Duration::from_secs(5));
     }
     crate::daemon::run(crate::daemon::Options {

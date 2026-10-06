@@ -33,6 +33,15 @@ startup had different TCC attribution, so the module starts Rust directly.
 Local logs and screenshots are deliberately kept outside the published Git tree.
 They may contain desktop app titles. Build success alone is not runtime proof.
 
+The socket regression executes the payload's actual handoff function without
+Dock injection: missing/stale sockets, idle handoff, active controller retention
+and non-socket preservation. Packaged loader tests cover identity mismatches and
+delayed readiness. A disposable AppKit window verifies that a compositor
+translation leaves AX geometry independent, and resize/restoration use the saved
+AX frame. Native display conversion checks menu-bar reservations with positive
+and negative monitor origins. These checks do not prove arbitrary-app restoration
+or root-watcher recovery in the installed service.
+
 ## Known limits
 
 - App minimum/fixed-size negotiation is incomplete. An app refusing an AX resize
