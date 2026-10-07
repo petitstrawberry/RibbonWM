@@ -22,7 +22,10 @@ static NSDictionary *surfaceState(SkyLight sky,uint32_t wid,BOOL includeOrder) {
     for(NSDictionary *row in (__bridge NSArray *)list)if([row[(id)kCGWindowOwnerPID] intValue]==getpid())
         [order addObject:@{@"wid":row[(id)kCGWindowNumber],@"onscreen":@([row[(id)kCGWindowIsOnscreen] boolValue])}];
     if(list)CFRelease(list);
-    return @{@"event":@"state",@"errors":@[@(et),@(eb)],@"pid":@(ribbon_window_owner(wid)),@"transform":@[finiteNumber(t.a),finiteNumber(t.b),finiteNumber(t.c),finiteNumber(t.d),finiteNumber(t.tx),finiteNumber(t.ty)],
+    static CGError (*catenated)(int,uint32_t,CGAffineTransform *);
+    static dispatch_once_t once;dispatch_once(&once,^{catenated=dlsym(RTLD_DEFAULT,"SLSGetCatenatedWindowTransform");});
+    CGAffineTransform placement={0};CGError ep=catenated?catenated(sky.connection(),wid,&placement):kCGErrorFailure;
+    return @{@"scene_error":@(ep),@"scene_transform":@[finiteNumber(placement.a),finiteNumber(placement.b),finiteNumber(placement.c),finiteNumber(placement.d),finiteNumber(placement.tx),finiteNumber(placement.ty)],@"event":@"state",@"errors":@[@(et),@(eb)],@"pid":@(ribbon_window_owner(wid)),@"transform":@[finiteNumber(t.a),finiteNumber(t.b),finiteNumber(t.c),finiteNumber(t.d),finiteNumber(t.tx),finiteNumber(t.ty)],
         @"order":order,
         @"clip_error":@(ec),@"clip_bounds":@[finiteNumber(clip.origin.x),finiteNumber(clip.origin.y),finiteNumber(clip.size.width),finiteNumber(clip.size.height)],
         @"frame":@{@"x":finiteNumber(b.origin.x),@"y":finiteNumber(b.origin.y),@"width":finiteNumber(b.size.width),@"height":finiteNumber(b.size.height)}};

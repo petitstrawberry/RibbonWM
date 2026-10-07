@@ -571,6 +571,23 @@ struct NativeFocus {
     reveal_selection: bool,
 }
 impl NativeFocus {
+    fn update_overview(&mut self, engine: &mut Engine, pid: i32, window: Option<WindowId>) {
+        let changed = self.last != Some((pid, window));
+        self.update(engine, pid, window, false);
+        if changed
+            && let Some(id) = window
+            && let Some((monitor, space)) = engine.window_context(id)
+        {
+            let m = &engine.monitors[monitor];
+            if !m.suspended && m.native_space == space {
+                let monitor = monitor.to_owned();
+                // Prepare the destination while Dock still displays its own
+                // scene. There must be no post-exit jump from the old viewport.
+                let _ = engine.focus_window(id);
+                let _ = engine.settle_scroll(&monitor);
+            }
+        }
+    }
     fn update(&mut self, engine: &mut Engine, pid: i32, window: Option<WindowId>, reveal: bool) {
         let contexts: BTreeMap<_, _> = engine
             .monitors
@@ -601,8 +618,8 @@ impl NativeFocus {
         if reveal && (selected_in_overview || (changed && !space_selection)) {
             let _ = engine.focus_window(id);
             if selected_in_overview {
-                // Dock has already animated to this selection. Publish it in
-                // the first resumed frame, without a second horizontal trip.
+                // Normally staged underneath Dock before exit. A selection
+                // delivered late still needs to be visible on handoff.
                 if let Some((monitor, _)) = engine.window_context(id) {
                     let monitor = monitor.to_owned();
                     let _ = engine.settle_scroll(&monitor);
@@ -618,6 +635,7 @@ fn observe_native_focus(
     geometry: &mut GeometryLease,
     options: &Options,
     reveal: bool,
+    prepare_overview: bool,
 ) {
     if options.dry_run {
         return;
@@ -631,7 +649,11 @@ fn observe_native_focus(
         .any(|w| w.pid == pid && !app_excluded(w, &options.exclude_apps))
         .then(|| ribbon_macos::focused_window(pid))
         .flatten();
-    geometry.focus.update(engine, pid, window, reveal);
+    if prepare_overview {
+        geometry.focus.update_overview(engine, pid, window);
+    } else {
+        geometry.focus.update(engine, pid, window, reveal);
+    }
 }
 
 fn forget_closed(engine: &mut Engine, geometry: &mut GeometryLease, id: WindowId) -> Result<()> {
@@ -829,7 +851,13 @@ fn synchronize(
         }
     }
     if geometry.dragged.is_none() {
-        observe_native_focus(engine, geometry, options, reveal_focus && !context_changed);
+        observe_native_focus(
+            engine,
+            geometry,
+            options,
+            reveal_focus && !context_changed,
+            false,
+        );
     }
     // CG inventories are in stacking order; window IDs give deterministic
     // creation order when several windows arrive between discovery polls.
@@ -928,7 +956,13 @@ fn synchronize(
         }
         geometry.originals.insert(w.id, w);
     }
-    observe_native_focus(engine, geometry, options, reveal_focus && !context_changed);
+    observe_native_focus(
+        engine,
+        geometry,
+        options,
+        reveal_focus && !context_changed,
+        false,
+    );
     Ok(())
 }
 
@@ -1535,8 +1569,15 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                     .expect("inventory notices poisoned")
                     .extend(source.changed_windows());
             }
+            let scene = if session_active {
+                backend
+                    .as_ref()
+                    .map_or(Ok((false, true)), |b| b.overview_scene())?
+            } else {
+                (false, false)
+            };
             let in_overview = if session_active {
-                !options.dry_run && ribbon_macos::mission_control_active()
+                !options.dry_run && (ribbon_macos::mission_control_active() || scene.0)
             } else {
                 overview
             };
@@ -1550,7 +1591,34 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                 inventory.invalidate();
                 sizes.cancel_settlement();
                 overview = true;
-            } else if !in_overview && overview {
+            }
+            if overview && session_active {
+                // Observe selection during the native animation, rather than
+                // after it has already returned to the stale base placement.
+                if notifications & ribbon_macos::EventSource::FOCUS != 0
+                    || start.duration_since(last_focus) >= Duration::from_millis(20)
+                {
+                    let contexts = ribbon_macos::displays()?;
+                    for d in &mut displays {
+                        if let Some(next) = contexts.iter().find(|n| n.id == d.id) {
+                            d.native_space = next.native_space;
+                            d.native_fullscreen = next.native_fullscreen;
+                        }
+                    }
+                    update_contexts(&mut engine, &displays)?;
+                    observe_native_focus(&mut engine, &mut geometry, &options, true, true);
+                    last_focus = start;
+                }
+                if let Some(backend) = &backend {
+                    let owners = geometry
+                        .originals
+                        .iter()
+                        .map(|(id, w)| (*id, w.pid))
+                        .collect();
+                    backend.prepare_overview(&engine.placements(), &owners)?;
+                }
+            }
+            if !in_overview && overview && scene.1 {
                 overview = false;
                 geometry.focus.reveal_selection = true;
                 overview_resume = start + Duration::from_millis(200);
@@ -1560,9 +1628,8 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                 last_focus = start - Duration::from_millis(100);
                 last_inventory = start - Duration::from_millis(100);
             }
-            // Delay stale AX geometry reconciliation, not native selection.
-            // Replaying `committed` here exposes the old app for 200 ms before
-            // revealing the window that the user actually chose in overview.
+            // Dock's actual scene ownership controls presentation handoff;
+            // this separate interval only rejects stale AX reconciliation.
             let reconciling_overview = start < overview_resume;
             let suspended = !session_active || overview;
             let phase = ControlPhase::new(
@@ -1820,7 +1887,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                 let reveal = !input
                     .as_ref()
                     .is_some_and(ribbon_macos::input::InputSource::active);
-                observe_native_focus(&mut engine, &mut geometry, &options, reveal);
+                observe_native_focus(&mut engine, &mut geometry, &options, reveal, false);
                 last_focus = start;
             }
             let after_inventory = Instant::now();
@@ -2241,6 +2308,60 @@ mod tests {
     use super::*;
     use ribbon_core::{NativeSpaceId, Rect};
 
+    #[test]
+    fn overview_selection_is_staged_before_presentation_handoff() {
+        let mut engine = Engine::new(Settings::default()).unwrap();
+        engine
+            .update_monitor(
+                "main",
+                Rect {
+                    x: 0.0,
+                    y: 30.0,
+                    width: 1200.0,
+                    height: 800.0,
+                },
+                NativeSpaceId(1),
+                false,
+            )
+            .unwrap();
+        for id in 1..=3 {
+            engine
+                .add_window("main", WindowId(id), Some(800.0))
+                .unwrap();
+        }
+        let mut focus = NativeFocus::default();
+        focus.update(&mut engine, 42, Some(WindowId(1)), true);
+        engine.tick(2.0);
+        focus.update_overview(&mut engine, 42, Some(WindowId(3)));
+        let staged = engine.placements();
+        let chosen = staged.iter().find(|p| p.window == WindowId(3)).unwrap();
+        assert_eq!(chosen.clip, Some(chosen.frame));
+        focus.reveal_selection = true;
+        focus.update(&mut engine, 42, Some(WindowId(3)), true);
+        assert_eq!(
+            serde_json::to_value(engine.placements()).unwrap(),
+            serde_json::to_value(staged).unwrap(),
+            "exit cannot introduce a second placement jump"
+        );
+        let scroll = engine.monitors["main"].layout().scroll.position;
+        focus.update_overview(&mut engine, 99, None); // Unmanaged activation.
+        assert_eq!(engine.monitors["main"].layout().scroll.position, scroll);
+        engine
+            .update_monitor(
+                "main",
+                engine.monitors["main"].viewport,
+                NativeSpaceId(2),
+                false,
+            )
+            .unwrap();
+        focus.update_overview(&mut engine, 42, Some(WindowId(1))); // Old-Space notification.
+        assert_eq!(
+            engine.monitors["main"].contexts[&NativeSpaceId(1)]
+                .scroll
+                .position,
+            scroll
+        );
+    }
     #[test]
     fn native_app_return_reveals_once_and_space_return_preserves_scroll() {
         let mut e = Engine::new(Settings::default()).unwrap();

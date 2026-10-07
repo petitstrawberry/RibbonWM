@@ -26,12 +26,19 @@ static CGError transientNullBounds(int cid,uint32_t wid,CGRect *bounds) {
     if(wid==nullBoundsID){*bounds=CGRectNull;return 0;}
     return actualGetBounds(cid,wid,bounds);
 }
+static BOOL simulatedOverviewScene;
+static CGError independentScene(int cid,uint32_t wid,CGAffineTransform *t) {
+    if(simulatedOverviewScene){*t=CGAffineTransformMake(2,0,0,2,-800,-300);return 0;}
+    return sky.getTransform(cid,wid,t);
+}
 int main(void) { @autoreleasepool {
     [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     [NSApp finishLaunching];
     check(loadSkyLight(&sky),"load own-window compositor API");
     void *library=dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",RTLD_NOW);
     getOwner=dlsym(library,"SLSGetWindowOwner");connectionPID=dlsym(library,"SLSConnectionGetPID");
+    getSceneTransform=dlsym(library,"SLSGetCatenatedWindowTransform");
+    check(getSceneTransform!=NULL,"load independent overview scene API");
     saved=[NSMutableDictionary dictionary];stickySaved=[NSMutableDictionary dictionary];
     topmostSaved=[NSMutableDictionary dictionary];topmostRoots=[NSMutableDictionary dictionary];
     hasLevelAPI=loadLevelAPI(&levelAPI);check(hasLevelAPI,"load native stacking API");
@@ -39,6 +46,12 @@ int main(void) { @autoreleasepool {
         styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
     window.releasedWhenClosed=NO;[window orderFrontRegardless];[window displayIfNeeded];
     [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+    NSWindow *peer=[[NSWindow alloc] initWithContentRect:NSMakeRect(740,400,120,120)
+        styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
+    peer.releasedWhenClosed=NO;[peer orderFrontRegardless];
+    [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+    uint32_t peerID=(uint32_t)peer.windowNumber;CGRect peerBounds;CGAffineTransform peerTransform;
+    sky.getBounds(sky.connection(),peerID,&peerBounds);sky.getTransform(sky.connection(),peerID,&peerTransform);
     uint32_t wid=(uint32_t)window.windowNumber;
     check(wid>0&&ownerPID(wid)==getpid(),"actual surface belongs to this test process");
     NSWindow *child=[[NSWindow alloc] initWithContentRect:NSMakeRect(320,320,66,20)
@@ -112,6 +125,27 @@ int main(void) { @autoreleasepool {
     sky.getTransform(sky.connection(),wid,&released);
     check(CGAffineTransformEqualToTransform(dock,released),"overview preserves the in-flight Dock transform");
     update[@"clip"]=rectangle(200,200,400,400);
+    CGError (*actualScene)(int,uint32_t,CGAffineTransform *)=getSceneTransform;
+    getSceneTransform=independentScene;simulatedOverviewScene=YES;
+    check(![overviewReady()[@"ready"] boolValue]&&[overviewReady()[@"animated"] boolValue],
+        "independent Dock scene blocks handoff even before native notification");
+    actualSetTransform=sky.setTransform;transformWrites=0;sky.setTransform=countTransformWrites;
+    check([prepareOverview(request)[@"ok"] boolValue],"prepare leased destinations underneath Dock scene");
+    sky.setTransform=actualSetTransform;
+    check(transformWrites==2,"prepare translates only the already leased explicit family");
+    check(!sky.copyClip(sky.connection(),wid,&full)&&!regionBounds(full,&fullBounds),"read prepared overview clip");
+    sky.releaseRegion(full);
+    check(fullBounds.size.width==400&&fullBounds.size.height==400,"preparation retains the full overview thumbnail");
+    CGAffineTransform scene;getSceneTransform(sky.connection(),wid,&scene);
+    check(scene.a==2&&scene.tx==-800,"preparing base placement preserves independent Dock scene");
+    simulatedOverviewScene=NO;
+    check([overviewReady()[@"ready"] boolValue]&&![overviewReady()[@"animated"] boolValue],
+        "handoff opens only when Dock scene has returned to prepared base");
+    actualSetTransform=sky.setTransform;transformWrites=0;sky.setTransform=countTransformWrites;
+    check([prepareOverview(request)[@"ok"] boolValue],"prepare accepts a nonparticipating family");
+    sky.setTransform=actualSetTransform;
+    check(transformWrites==0,"prepare cannot visibly move a surface outside Dock overview");
+    getSceneTransform=actualScene;
     check([frame(request)[@"ok"] boolValue],"layout resumes after overview");
     NSMutableDictionary *bad=[update mutableCopy];bad[@"pid"]=@(getpid()+1);
     check(![finish(@{@"updates":@[bad]})[@"ok"] boolValue]&&saved.count==2,"release rejects a changed owner before writing");
@@ -158,6 +192,10 @@ int main(void) { @autoreleasepool {
     check(parentBounds.origin.x==240&&parentBounds.origin.y==260&&parentBounds.size.width==400&&parentBounds.size.height==400,
         "idle anchor changes native origin only");
     check(released.tx==-240&&released.ty==-260,"idle native and presentation coordinates agree");
+    CGRect untouchedPeer;CGAffineTransform untouchedTransform;
+    sky.getBounds(sky.connection(),peerID,&untouchedPeer);sky.getTransform(sky.connection(),peerID,&untouchedTransform);
+    check(CGRectEqualToRect(peerBounds,untouchedPeer)&&CGAffineTransformEqualToTransform(peerTransform,untouchedTransform),
+        "native group anchoring does not move an unrelated window of the same application");
     [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
     NSRect ownerFrame=window.frame;
     printf("owner frame after anchor=(%g,%g,%g,%g)\n",ownerFrame.origin.x,ownerFrame.origin.y,ownerFrame.size.width,ownerFrame.size.height);

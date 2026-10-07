@@ -22,6 +22,13 @@
 @end
 
 static SkyLight sky;
+static CGError (*getSceneTransform)(int,uint32_t,CGAffineTransform *);
+static BOOL sceneDiffers(CGAffineTransform a,CGAffineTransform b) {
+    if(!isfinite(a.a)||!isfinite(a.b)||!isfinite(a.c)||!isfinite(a.d)||!isfinite(a.tx)||!isfinite(a.ty)||
+       !isfinite(b.a)||!isfinite(b.b)||!isfinite(b.c)||!isfinite(b.d)||!isfinite(b.tx)||!isfinite(b.ty))return YES;
+    return fabs(a.a-b.a)>1e-5||fabs(a.b-b.b)>1e-5||fabs(a.c-b.c)>1e-5||fabs(a.d-b.d)>1e-5||
+        fabs(a.tx-b.tx)>0.25||fabs(a.ty-b.ty)>0.25;
+}
 static NSMutableDictionary<NSNumber *, RibbonSavedWindowV4 *> *saved;
 static NSMutableDictionary<NSNumber *,NSDictionary *> *stickySaved;
 static NSMutableDictionary<NSNumber *,NSDictionary *> *topmostSaved;
@@ -422,6 +429,11 @@ static NSDictionary *frame(NSDictionary *r) {
     } @finally { sky.enableUpdates(sky.connection()); }
 }
 static NSDictionary *overview(void) {
+    // Expose the entire leased strip in one bounded compositor transaction.
+    // Otherwise overview can capture a mixture of full and still-clipped
+    // surfaces while the per-window loop is running.
+    if(sky.disableUpdates(sky.connection()))return error(@"Cannot begin overview update");
+    @try {
     for(RibbonSavedWindowV4 *w in saved.allValues) {
         if(ownerPID(w.wid)!=w.pid){forgetWindow(w.wid);continue;}
         CGRect b;CGError eb=sky.getBounds(sky.connection(),w.wid,&b);
@@ -437,6 +449,71 @@ static NSDictionary *overview(void) {
     }
     lastUpdate=NSProcessInfo.processInfo.systemUptime;
     return @{@"ok":@YES};
+    } @finally {sky.enableUpdates(sky.connection());}
+}
+// Dock's overview placement overrides the base placement. Prepare the next
+// strip underneath it; changing that base must never replace the live scene or
+// cut the overview thumbnail. Only already-leased, Dock-owned surfaces qualify.
+static NSDictionary *prepareOverview(NSDictionary *r) {
+    if(!getSceneTransform)return error(@"Overview scene API unavailable");
+    NSArray *roots=r[@"updates"];
+    if(![roots isKindOfClass:NSArray.class]||roots.count>128)return error(@"Expected at most 128 overview roots");
+    NSMutableSet *ids=[NSMutableSet set];
+    for(id u in roots) {
+        double wid,pid;CGRect f;
+        if(![u isKindOfClass:NSDictionary.class]||!identifier(u[@"wid"],UINT32_MAX,&wid)||
+            !identifier(u[@"pid"],INT_MAX,&pid)||!rect(u[@"frame"],&f)||[ids containsObject:@((uint32_t)wid)])
+            return error(@"Invalid overview placement");
+        [ids addObject:@((uint32_t)wid)];
+    }
+    NSMutableArray *eligible=[NSMutableArray array];
+    for(NSDictionary *u in roots) {
+        uint32_t wid=[u[@"wid"] unsignedIntValue];RibbonSavedWindowV4 *w=saved[@(wid)];CGRect b;
+        if(!w||ownerPID(wid)!=w.pid||[u[@"pid"] intValue]!=w.pid||
+            sky.getBounds(sky.connection(),wid,&b)||!validSurfaceBounds(b))continue;
+        [eligible addObject:u];
+    }
+    NSArray *updates=expandFamilies(eligible);
+    // A disappearing family is a lifecycle event, not a reason to tear down
+    // the live controller in the middle of overview. Retry on the next frame.
+    if(!updates){lastUpdate=NSProcessInfo.processInfo.systemUptime;return @{@"ok":@YES,@"prepared":@0};}
+    if(sky.disableUpdates(sky.connection()))return error(@"Cannot begin overview preparation");
+    unsigned prepared=0;
+    @try {
+        for(NSDictionary *u in updates) {
+            uint32_t wid=[u[@"wid"] unsignedIntValue];RibbonSavedWindowV4 *w=saved[@(wid)];
+            if(!w||ownerPID(wid)!=w.pid||[u[@"pid"] intValue]!=w.pid)continue;
+            CGAffineTransform base,scene;CGRect f;
+            if(sky.getTransform(sky.connection(),wid,&base)||getSceneTransform(sky.connection(),wid,&scene))continue;
+            // A root not participating in overview must not visibly move.
+            if(!sceneDiffers(base,scene))continue;
+            rect(u[@"frame"],&f);
+            if(sky.setTransform(sky.connection(),wid,CGAffineTransformMakeTranslation(-f.origin.x,-f.origin.y)))
+                return error(@"Cannot prepare overview placement");
+            prepared++;
+        }
+        lastUpdate=NSProcessInfo.processInfo.systemUptime;
+        return @{@"ok":@YES,@"prepared":@(prepared)};
+    } @finally {sky.enableUpdates(sky.connection());}
+}
+static NSDictionary *overviewReady(void) {
+    if(!getSceneTransform)return error(@"Overview scene API unavailable");
+    BOOL ready=YES,animated=NO;
+    for(RibbonSavedWindowV4 *w in saved.allValues) {
+        if(ownerPID(w.wid)!=w.pid){forgetWindow(w.wid);continue;}
+        CGRect b;if(sky.getBounds(sky.connection(),w.wid,&b)||!validSurfaceBounds(b))continue;
+        CGAffineTransform base,scene;
+        if(sky.getTransform(sky.connection(),w.wid,&base)||getSceneTransform(sky.connection(),w.wid,&scene)) {
+            ready=NO;continue;
+        }
+        if(sceneDiffers(base,scene))ready=NO;
+        // Overview's scale/shear placement appears before the AX/layer
+        // notification. Translation-only native drags are not this signal.
+        if(fabs(base.a-scene.a)>1e-5||fabs(base.b-scene.b)>1e-5||
+           fabs(base.c-scene.c)>1e-5||fabs(base.d-scene.d)>1e-5)animated=YES;
+    }
+    lastUpdate=NSProcessInfo.processInfo.systemUptime;
+    return @{@"ok":@YES,@"ready":@(ready),@"animated":@(animated)};
 }
 static NSDictionary *releaseFrames(NSDictionary *r,BOOL all) {
     NSArray *updates=r[@"updates"];
@@ -489,6 +566,7 @@ static NSDictionary *handle(id r) {
     }
     if([r[@"op"] isEqual:@"hello"]) {
         NSMutableArray *capabilities=[@[@"interactive_clip",@"overview",@"finish",@"pointer_drag",@"window_groups",@"native_anchor",@"resize_anchor"] mutableCopy];
+        if(getSceneTransform)[capabilities addObject:@"overview_prepare"];
         if(hasStickyAPI)[capabilities addObject:@"sticky"];
         if(hasLevelAPI)[capabilities addObject:@"topmost"];
         return @{@"ok":@YES,@"version":@2,@"capabilities":capabilities,@"build":buildName?:@"",@"pid":@(getpid()),@"uid":@(getuid()),@"controlled":@(controlledCount())};
@@ -501,6 +579,8 @@ static NSDictionary *handle(id r) {
     if([r[@"op"] isEqual:@"sticky"])return setSticky(r[@"window"],session);
     if([r[@"op"] isEqual:@"topmost"])return setTopmost(r[@"window"],session);
     if([r[@"op"] isEqual:@"overview"])return overview();
+    if([r[@"op"] isEqual:@"overview_prepare"])return prepareOverview(r);
+    if([r[@"op"] isEqual:@"overview_ready"])return overviewReady();
     if([r[@"op"] isEqual:@"heartbeat"]) {lastUpdate=NSProcessInfo.processInfo.systemUptime;return @{@"ok":@YES};}
     if([r[@"op"] isEqual:@"finish"])return finish(r);
     if([r[@"op"] isEqual:@"detach"])return releaseFrames(r,NO);
@@ -622,6 +702,7 @@ __attribute__((constructor)) static void load(void) { @autoreleasepool {
     if (![NSBundle.mainBundle.bundleIdentifier isEqual:@"com.apple.dock"]) return;
     if(!loadSkyLight(&sky)){NSLog(@"[RibbonWM] required SkyLight API unavailable");return;}
     void *h=dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",RTLD_NOW);
+    getSceneTransform=dlsym(h,"SLSGetCatenatedWindowTransform");
     getOwner=dlsym(h,"SLSGetWindowOwner");connectionPID=dlsym(h,"SLSConnectionGetPID");
     if(!getOwner||!connectionPID){NSLog(@"[RibbonWM] owner API unavailable");return;}
     Dl_info image;

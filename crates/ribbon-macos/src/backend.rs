@@ -111,6 +111,7 @@ impl Backend {
         let status = b.status()?;
         b.lifecycle.set(
             status.capabilities.iter().any(|c| c == "overview")
+                && status.capabilities.iter().any(|c| c == "overview_prepare")
                 && status.capabilities.iter().any(|c| c == "finish")
                 && status.capabilities.iter().any(|c| c == "pointer_drag")
                 && status.capabilities.iter().any(|c| c == "window_groups")
@@ -176,7 +177,7 @@ impl Backend {
     pub fn require_live_version(&self) -> Result<()> {
         if self.version.get() != 2 || !self.interactive.get() || !self.lifecycle.get() {
             bail!(
-                "Reload the Dock backend with nix develop -c sh scripts/load-backend.sh (protocol 2, interactive_clip, overview, finish, pointer_drag, window_groups, native_anchor and resize_anchor required)"
+                "Reload the Dock backend with nix develop -c sh scripts/load-backend.sh (protocol 2, interactive_clip, overview, overview_prepare, finish, pointer_drag, window_groups, native_anchor and resize_anchor required)"
             );
         }
         Ok(())
@@ -331,6 +332,44 @@ impl Backend {
     pub fn overview(&self) -> Result<()> {
         self.request("overview", None, None, None)?;
         Ok(())
+    }
+    /// Stage base translations underneath Dock's independent overview scene.
+    /// This does not resize, anchor, enroll, or clip any window.
+    pub fn prepare_overview(
+        &self,
+        placements: &[Placement],
+        owners: &BTreeMap<WindowId, i32>,
+    ) -> Result<()> {
+        let updates = placements
+            .iter()
+            .map(|p| {
+                Ok(Update {
+                    wid: p.window.0,
+                    pid: *owners.get(&p.window).context("Missing overview owner")?,
+                    frame: p.frame,
+                    clip: Some(p.frame),
+                    viewport: None,
+                    drag_frame: None,
+                    clip_viewport: None,
+                    anchor: false,
+                    native_frame: None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.request("overview_prepare", Some(updates), None, None)?;
+        Ok(())
+    }
+    /// (independent scaled scene exists, all leased scenes returned to base).
+    pub fn overview_scene(&self) -> Result<(bool, bool)> {
+        let reply = self.request("overview_ready", None, None, None)?;
+        Ok((
+            reply["animated"]
+                .as_bool()
+                .context("Invalid overview scene response")?,
+            reply["ready"]
+                .as_bool()
+                .context("Invalid overview handoff response")?,
+        ))
     }
     pub fn heartbeat(&self) -> Result<()> {
         self.request("heartbeat", None, None, None)?;

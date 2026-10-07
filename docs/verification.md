@@ -579,3 +579,34 @@ floating level3, and matching AppKit/native/presentation coordinates. Unfloat
 restored level0 and rejoined tiling, while sticky-only preserved level0. Owned
 fixtures closed and the service remained live. This run does not add runtime
 multi-monitor coverage beyond the negative-origin layout tests.
+
+
+## Final PoC checkpoint (2026-10-07)
+
+Development concluded at the proof-of-concept stage. Persistent user-reported
+resize, drag and Mission Control problems mean the project is not a stable
+daily-driver window manager. Earlier bounded checks must not be read as general
+visual acceptance. The development desktop is being switched back to yabai;
+the final experimental payload is not being installed there.
+
+The final source passed 79 Rust tests (42 core, 9 macOS and 28 CLI), formatting,
+Clippy, the workspace/native build, owned-surface interactive regressions, socket
+lifecycle checks and a Nix package build. The overview probe script passed Python
+syntax checking. Local diagnostic recordings and traces remain unpublished.
+
+A controlled owned-window Mission Control experiment distinguished the base
+window transform from the catenated Dock scene transform. Changing the fixture's
+base translation by 200 points while Dock's scaled scene was stable left the
+sampled scene unchanged. That supports staging the eventual layout beneath the
+scene; it does not prove seamless desktop animation.
+
+The final implementation stages only already-leased surfaces while their scene
+transform differs from their base. Native regressions verify the independent
+scene remains untouched, full clips remain exposed, unrelated same-app windows
+are not moved, and readiness waits for scene/base agreement. A Rust regression
+checks that the selected window's planned geometry is unchanged across the
+handoff. These tests do not inject the final candidate into production Dock.
+Live Mission Control visual acceptance, arbitrary-app behavior and sustained
+frame pacing remain unverified. The previously deployed width-transition
+sampling still showed brief errors up to 500 points; those were not resolved by
+this checkpoint.
