@@ -92,6 +92,33 @@ def main():
         status = wait(lambda s: presented(s, child))
         monitor = next(p["monitor"] for p in status["placements"] if p["window"] == wid)
         time.sleep(.4)
+        if os.environ.get("RIBBONWM_QA_RESIZE") == "1":
+            cli("focus-window", wid)
+            wait(lambda s: s["native_focused_window"] == wid)
+            steps = []
+            for width in [620, 940, 740, 1020, 520, 800]:
+                assert cli("status")["native_focused_window"] == wid, "User focus interrupted resize measurement"
+                began = time.monotonic()
+                cli("--monitor", monitor, "resize", width)
+                status = wait(lambda s: presented(s, wid) and any(
+                    p["window"] == wid and abs(p["frame"]["width"] - width) <= 2
+                    for p in s["placements"]))
+                # Observe physical size independently from the WM's ledger.
+                actual = command("state")
+                plan = next(p for p in status["placements"] if p["window"] == wid)
+                assert abs(actual["frame"]["width"] - width) <= 2, (width, actual)
+                assert abs(actual["frame"]["height"] - plan["frame"]["height"]) <= 2, actual
+                assert -actual["transform"][5] >= status["state"]["monitors"][monitor]["viewport"]["y"], actual
+                steps.append(dict(width=width, completion_ms=round((time.monotonic()-began)*1000, 1)))
+            before_moves = cli("status")["native_size_requests"]
+            for direction in ["next", "prev", "next", "prev"]:
+                assert cli("status")["native_focused_window"] == wid, "User focus interrupted move measurement"
+                cli("--monitor", monitor, "move", direction)
+                time.sleep(.2)
+                current = cli("status")
+                assert current["native_size_requests"] == before_moves, current["native_size_requests"]
+                assert abs(command("state")["frame"]["width"] - 800) <= 2
+            print(json.dumps(dict(resize_steps=steps, moves=4, move_native_resize_delta=0)), flush=True)
         requests_before = cli("status").get("native_size_requests")
         sampler = subprocess.Popen([str(HELPER), "--trace-window", str(wid), str(pid), "3"],
                                    stdout=subprocess.PIPE, text=True)

@@ -313,7 +313,7 @@ creation, but does not reproduce the reported focus-size jitter. Updated runtime
 results must be recorded separately; passing unit tests cannot establish physical
 drag stability.
 
-### Selective discovery and polled settlement (candidate, not deployed)
+### Selective discovery and polled settlement
 
 The installed `730acf5` baseline measured create/enrollment times of
 267.0–320.7 ms (five cycles; median 306.7 ms), removals of 15.7–51.7 ms,
@@ -339,8 +339,8 @@ The Mac was locked during subsequent enrollment attempts. CUA explicitly
 reported the lock, and an isolated read-only AX probe returned an AXApplication
 placeholder from AXWindows. Those failed attempts are **not** valid unlocked
 creation timing runs. No production service was stopped/reset for this
-investigation. GUI verification is pending manual unlock; the candidate has
-not replaced the installed service.
+investigation. At that point GUI verification was pending manual unlock and the candidate had
+not replaced the service. Subsequent deployment and measurements follow below.
 
 `smoke-live-pipeline.py` now checks session state before creating owned windows
 and on every wait. Twenty create/remove cycles measure `presented_windows` when
@@ -351,7 +351,7 @@ physical drag/resize, floating transitions, native Space/Mission Control return,
 and multi-monitor clipping checks. The synchronous initial AX acceptance and
 next-batch probe wait remain explicit limitations.
 
-### Native activation and IPC follow-up (candidate)
+### Native activation and IPC follow-up
 
 The `4bab26b` package was activated and the service resumed in the same process
 after permissions became ready. Live fixture attempts exposed intermittent
@@ -375,3 +375,38 @@ hold sending only heartbeats after overview had removed transforms. The candidat
 restores committed compositor frames during that hold, while still deferring AX
 writes and inventory reconciliation. This removes that explicit display gap;
 physical Mission Control exit animation remains a required live check.
+
+
+### Deployed settlement: owned width and move measurements
+
+`4bab26b` was activated on 2026-10-07. The existing production daemon was kept
+running throughout the owned-fixture measurements. Three creation cycles reached
+committed presentation in 208.1, 249.3 and 230.8 ms, with removals in 21.0, 33.8
+and 31.9 ms. The initial width run then failed in the fixture's diagnostic code:
+a missing onscreen metadata value was inserted into an Objective-C dictionary.
+That run is not a width pass. The helper now treats absent onscreen metadata as
+false; it does not change production code.
+
+A complete retry reached presentation in 310.8 ms and removal in 25.3 ms.
+Six requested widths (620, 940, 740, 1020, 520, 800 points) were independently
+confirmed through the owned surface's physical dimensions. Completion took
+132.8–183.0 ms. Height matched the planned 901 points and presentation stayed
+below the usable viewport top. Four next/previous moves issued zero native size
+requests. During subsequent focus/scroll, all 343 physical samples remained
+800×901 and the native size request count did not increase. Fixtures were
+removed and the original daemon remained running.
+
+The new CLI also completed 100 consecutive status requests against that service
+without the intermittent IPC error. These tests establish accepted dimensions
+and absence of redundant resizing for this fixture, not physical drag smoothness,
+Mission Control exit visuals, or arbitrary application behavior. The activation
+and overview changes described above still need their own deployed visual check.
+
+
+The activation/overview release `54be178` was subsequently installed through
+nix-darwin. The new service entered live mode after its permission gate without
+relaunching; the loaded Dock payload matched the packaged identity. The actual
+LaunchAgent arguments no longer excluded ChatGPT. Status reported one presented
+window. The width/move measurements above apply to `4bab26b`, not this later
+release. Physical Mission Control exit and Dock selection behavior have not yet
+been verified against the installed follow-up.

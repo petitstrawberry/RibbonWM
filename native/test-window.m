@@ -20,7 +20,7 @@ static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
     NSMutableArray *order=[NSMutableArray array];
     CFArrayRef list=CGWindowListCopyWindowInfo(kCGWindowListOptionAll|kCGWindowListExcludeDesktopElements,kCGNullWindowID);
     for(NSDictionary *row in (__bridge NSArray *)list)if([row[(id)kCGWindowOwnerPID] intValue]==getpid())
-        [order addObject:@{@"wid":row[(id)kCGWindowNumber],@"onscreen":row[(id)kCGWindowIsOnscreen]}];
+        [order addObject:@{@"wid":row[(id)kCGWindowNumber],@"onscreen":@([row[(id)kCGWindowIsOnscreen] boolValue])}];
     if(list)CFRelease(list);
     return @{@"event":@"state",@"errors":@[@(et),@(eb)],@"pid":@(ribbon_window_owner(wid)),@"transform":@[finiteNumber(t.a),finiteNumber(t.b),finiteNumber(t.c),finiteNumber(t.d),finiteNumber(t.tx),finiteNumber(t.ty)],
         @"order":order,
