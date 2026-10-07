@@ -135,6 +135,10 @@ static NSDictionary *associatedState(SkyLight sky,uint32_t wid) {
         NSMutableDictionary *state=[windowState(self.sky,(uint32_t)self.target.windowNumber) mutableCopy];
         state[@"alpha"]=@(self.target.alphaValue);state[@"visible"]=@(self.target.visible);
         state[@"ignores_mouse"]=@(self.target.ignoresMouseEvents);state[@"occlusion"]=@(self.target.occlusionState);
+        RibbonLevelAPI levels;int level=0;
+        if(loadLevelAPI(&levels)&&!levels.get(self.sky.connection(),(uint32_t)self.target.windowNumber,&level))state[@"level"]=@(level);
+        NSRect logical=self.target.frame;CGFloat screenHeight=NSScreen.screens.firstObject.frame.size.height;
+        state[@"appkit_frame"]=@{@"x":@(logical.origin.x),@"y":@(screenHeight-NSMaxY(logical)),@"width":@(logical.size.width),@"height":@(logical.size.height)};
         reply(state);return;
     }
     if([op isEqual:@"translate"]&&[self.configuration[@"geometry_test"] boolValue]) {

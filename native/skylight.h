@@ -79,11 +79,15 @@ typedef struct {
 // The legacy GetWindowLevel symbol can return stale values on newer macOS.
 // Use WindowServer's iterator, as with the existing sticky tag query.
 static inline CGError readWindowLevel(int cid,uint32_t wid,int *level) {
-    void *h=dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",RTLD_NOW);
-    CFTypeRef (*query)(int,CFArrayRef,int)=dlsym(h,"SLSWindowQueryWindows");
-    CFTypeRef (*iterator)(CFTypeRef)=dlsym(h,"SLSWindowQueryResultCopyWindows");
-    bool (*advance)(CFTypeRef)=dlsym(h,"SLSWindowIteratorAdvance");
-    int (*getLevel)(CFTypeRef)=dlsym(h,"SLSWindowIteratorGetLevel");
+    static CFTypeRef (*query)(int,CFArrayRef,int),(*iterator)(CFTypeRef);
+    static bool (*advance)(CFTypeRef);
+    static int (*getLevel)(CFTypeRef);
+    static dispatch_once_t once;
+    dispatch_once(&once,^{
+        void *h=dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",RTLD_NOW);
+        query=dlsym(h,"SLSWindowQueryWindows");iterator=dlsym(h,"SLSWindowQueryResultCopyWindows");
+        advance=dlsym(h,"SLSWindowIteratorAdvance");getLevel=dlsym(h,"SLSWindowIteratorGetLevel");
+    });
     if(!query||!iterator||!advance||!getLevel)return kCGErrorFailure;
     CFTypeRef q=query(cid,(__bridge CFArrayRef)@[@(wid)],1),i=q?iterator(q):NULL;
     bool ok=i&&advance(i);if(ok)*level=getLevel(i);
