@@ -15,6 +15,39 @@ pub struct SizeSettlement {
     pub transaction: ribbon_macos::PendingResize,
 }
 impl NativeSizes {
+    /// Requested layout, AX acknowledgement, and WindowServer surface size are
+    /// distinct. Only the last of these describes drawable pixels this frame.
+    pub fn presentation(
+        &self,
+        engine: &Engine,
+        desired: &[Placement],
+        owners: &BTreeMap<WindowId, i32>,
+        mut surface: impl FnMut(WindowId, i32) -> anyhow::Result<Rect>,
+    ) -> Vec<Placement> {
+        let waiting = self.unsettled_columns(engine, desired, owners);
+        let mut shown = desired.to_vec();
+        for p in &mut shown {
+            let monitor = &engine.monitors[&p.monitor];
+            if waiting.contains(&p.window)
+                && !monitor.suspended
+                && monitor.native_space == p.native_space
+            {
+                if let Ok(native) = surface(p.window, owners[&p.window])
+                    && native.valid()
+                {
+                    p.frame.width = native.width;
+                    p.frame.height = native.height;
+                } else if let Some(&(_, width, height)) = self.get(&p.window) {
+                    // Destruction can race a sample. Keep the last accepted
+                    // extent; the payload verifies ownership before writing.
+                    p.frame.width = width;
+                    p.frame.height = height;
+                }
+            }
+        }
+        reflow_presented_columns(engine, desired, &mut shown);
+        shown
+    }
     /// Commit the owner's final mouse geometry before a layout frame can issue
     /// another size request. Inventory snapshots may predate mouse-up.
     pub fn finish_user_resize(
@@ -56,65 +89,25 @@ impl NativeSizes {
             owner != pid || (width - frame.width).abs() > 2.0 || (height - frame.height).abs() > 2.0
         })
     }
-    /// A stacked column changes presentation atomically after every row accepts
-    /// its new size. Other columns/monitors can continue animating meanwhile.
+    /// Rows of an unsettled column need actual surface measurements together.
+    /// Other columns/monitors can continue animating meanwhile.
     pub fn unsettled_columns(
         &self,
         engine: &Engine,
         plans: &[Placement],
         owners: &BTreeMap<WindowId, i32>,
     ) -> BTreeSet<WindowId> {
-        self.waiting_columns(
-            engine,
-            plans,
-            owners,
-            true,
-            self.pending.as_ref().map(|p| (p.window, p.size)),
-        )
-    }
-    /// AX acceptance and temporal settlement are different milestones. Once
-    /// the owner has accepted a size, displaying the old width would leave a
-    /// hole beside it until the settlement timer expires.
-    pub fn unaccepted_columns(
-        &self,
-        engine: &Engine,
-        plans: &[Placement],
-        owners: &BTreeMap<WindowId, i32>,
-    ) -> BTreeSet<WindowId> {
-        self.waiting_columns(
-            engine,
-            plans,
-            owners,
-            false,
-            self.pending.as_ref().map(|p| (p.window, p.size)),
-        )
-    }
-    fn waiting_columns(
-        &self,
-        engine: &Engine,
-        plans: &[Placement],
-        owners: &BTreeMap<WindowId, i32>,
-        settling: bool,
-        pending: Option<(WindowId, (i32, f64, f64))>,
-    ) -> BTreeSet<WindowId> {
         let mut waiting: BTreeSet<_> = plans
             .iter()
             .filter(|p| {
-                owners.get(&p.window).is_some_and(|&pid| {
-                    self.needs_resize(p.window, pid, p.frame)
-                        && (settling
-                            || !pending.is_some_and(|(window, size)| {
-                                window == p.window
-                                    && size.0 == pid
-                                    && (size.1 - p.frame.width).abs() <= 2.0
-                                    && (size.2 - p.frame.height).abs() <= 2.0
-                            }))
-                })
+                owners
+                    .get(&p.window)
+                    .is_some_and(|&pid| self.needs_resize(p.window, pid, p.frame))
             })
             .map(|p| p.window)
             .collect();
-        if settling && let Some((window, _)) = pending {
-            waiting.insert(window);
+        if let Some(pending) = &self.pending {
+            waiting.insert(pending.window);
         }
         for monitor in engine.monitors.values().filter(|m| !m.suspended) {
             for column in &monitor.layout().columns {
@@ -184,12 +177,17 @@ pub fn reflow_presented_columns(engine: &Engine, desired: &[Placement], shown: &
                     .map(|p| p.frame.width)
                     .reduce(f64::max)
                     .unwrap_or(column.width);
-                for p in shown
-                    .iter_mut()
-                    .filter(|p| column.windows.contains(&p.window))
-                {
-                    p.frame.x = x;
-                    p.clip = p.frame.intersection(monitor.viewport);
+                let mut y = desired
+                    .iter()
+                    .find(|p| column.windows.first() == Some(&p.window))
+                    .map_or(monitor.viewport.y, |p| p.frame.y);
+                for id in &column.windows {
+                    if let Some(p) = shown.iter_mut().find(|p| p.window == *id) {
+                        p.frame.x = x;
+                        p.frame.y = y;
+                        p.clip = p.frame.intersection(monitor.viewport);
+                        y += p.frame.height + engine.settings.gap;
+                    }
                 }
                 x += width + engine.settings.gap;
             }
@@ -325,23 +323,26 @@ mod tests {
             assert_eq!(shown[0].frame.x, desired[0].frame.x); // Held column shares scrolling.
             assert_eq!(shown[3].frame, desired[3].frame); // Independent monitor.
             assert_eq!(shown[0].frame.width, 800.0);
-            let pending = Some((WindowId(1), (42, width, desired[0].frame.height)));
+            // AX may accept before the actual surface changes. Projection must
+            // retain the observed width in that interval, not the future width.
+            let mut actual = committed[0].frame;
+            let before_surface = sizes.presentation(&engine, &desired, &owners, |_, _| Ok(actual));
+            assert_eq!(before_surface[0].frame.width, 800.0);
             assert!(
-                sizes
-                    .waiting_columns(&engine, &desired, &owners, false, pending)
-                    .is_empty()
+                (before_surface[1].frame.x
+                    - before_surface[0].frame.x
+                    - 800.0
+                    - engine.settings.gap)
+                    .abs()
+                    < 1e-6
             );
-            assert_eq!(
-                sizes.waiting_columns(&engine, &desired, &owners, true, pending),
-                BTreeSet::from([WindowId(1)])
-            );
-            // Acceptance publishes the width and its neighbours together;
-            // the transaction can still be under temporal observation.
-            shown.clone_from(&desired);
-            reflow_presented_columns(&engine, &desired, &mut shown);
-            assert_eq!(shown[0].frame.width, width);
+            actual.width = width;
+            let after_surface = sizes.presentation(&engine, &desired, &owners, |_, _| Ok(actual));
+            assert_eq!(after_surface[0].frame.width, width);
             assert!(
-                (shown[1].frame.x - shown[0].frame.x - width - engine.settings.gap).abs() < 1e-6
+                (after_surface[1].frame.x - after_surface[0].frame.x - width - engine.settings.gap)
+                    .abs()
+                    < 1e-6
             );
         }
     }
@@ -383,8 +384,14 @@ mod tests {
         let first = plans.iter().find(|p| p.window == WindowId(1)).unwrap();
         sizes.insert(first.window, (42, first.frame.width, first.frame.height));
         assert_eq!(sizes.unsettled_columns(&engine, &plans, &owners), column);
-        // Even the first acknowledged row stays at its committed presentation
-        // until the second row accepts; unrelated window 2 never joins the hold.
+        // Read both actual row sizes until settlement; window 2 is independent.
+        let mut shown = plans.clone();
+        let a = shown.iter_mut().find(|p| p.window == WindowId(1)).unwrap();
+        a.frame.height = 300.0;
+        reflow_presented_columns(&engine, &plans, &mut shown);
+        let a = shown.iter().find(|p| p.window == WindowId(1)).unwrap();
+        let b = shown.iter().find(|p| p.window == WindowId(3)).unwrap();
+        assert_eq!(b.frame.y, a.frame.y + 300.0 + engine.settings.gap);
         let second = plans.iter().find(|p| p.window == WindowId(3)).unwrap();
         sizes.insert(second.window, (42, second.frame.width, second.frame.height));
         assert!(sizes.unsettled_columns(&engine, &plans, &owners).is_empty());

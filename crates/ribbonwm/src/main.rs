@@ -1,4 +1,5 @@
 mod compat;
+mod control;
 mod daemon;
 mod geometry;
 mod ipc;

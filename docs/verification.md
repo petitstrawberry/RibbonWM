@@ -474,3 +474,24 @@ and child offsets during anchoring, refusing anchors for clipped/interactive
 windows, balancing display-update suspension after an injected failure, and no
 AX resize request when accepting a completed user width change. Candidate
 production deployment and intermediate-frame width validation remain pending.
+
+
+### Explicit writer policy and surface acceptance
+
+The follow-up replaces future-width presentation with observed surface sizes,
+including stacked-row spacing, and freezes unrelated placements during a native
+drag. The writer policy covers all combinations of inactive session, overview,
+mouse press and overview reconciliation. 78 Rust tests, Clippy and native tests
+pass. An independent floating fixture (only its own ID was exempted from the
+running WM) passed three native anchors followed by calibrated AX resizes at
+(520,250), (220,170), and (650,190), retaining the requested origins and widths.
+The initial fixture trials were invalid because the running service enrolled
+it; those are not counted as independent geometry passes.
+
+A separate-process sampler now records both owned adjacent surfaces during six
+live width changes. The old deployed version produced substantial intermediate
+gap/overlap even though final dimensions settled. The sampler avoids work on
+the fixture's AppKit event loop, which would perturb the AX responsiveness being
+measured. Candidate comparison and deployment results remain to be recorded.
+Only the built-in display is currently connected; multi-monitor revalidation is
+not covered by this run.

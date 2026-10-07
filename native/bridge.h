@@ -35,7 +35,7 @@ int ribbon_ax_request_permission(void);
 int ribbon_resize_window(uint32_t wid,int expected_pid,RibbonRect rect);
 typedef int (*RibbonGeometryProgress)(void *);
 int ribbon_resize_window_observed(uint32_t wid,int expected_pid,RibbonRect rect,RibbonGeometryProgress progress,void *context);
-int ribbon_resize_begin(uint32_t wid,int expected_pid,RibbonRect rect,RibbonGeometryProgress progress,void *context,void **pending);
+int ribbon_resize_begin(uint32_t wid,int expected_pid,RibbonRect rect,RibbonRect calibrationAX,RibbonRect calibrationNative,RibbonGeometryProgress progress,void *context,void **pending);
 int ribbon_settlement_poll(void *context);
 void ribbon_settlement_release(void *context);
 int ribbon_window_geometry(uint32_t wid,int expected_pid,RibbonRect *rect);

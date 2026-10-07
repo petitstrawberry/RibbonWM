@@ -1,3 +1,4 @@
+use crate::control::ControlPhase;
 use crate::geometry::{NativeSizes, SizeSettlement};
 use crate::ipc::{self, Request, SocketLease};
 use crate::modes::{ModeKind, WindowMode};
@@ -106,7 +107,11 @@ impl MouseCapture {
         // Activation can arrive after mouse-down. Retry with the original
         // press position, never retarget an established capture under a drag.
         if self.window.is_none() {
-            let plans = engine.placements();
+            let plans = if committed.is_empty() {
+                engine.placements()
+            } else {
+                committed.to_vec()
+            };
             if let Some(p) = pressed_placement(
                 &plans,
                 geometry,
@@ -1043,7 +1048,7 @@ fn set_mode(
                 let shown = ribbon_macos::window_presentation(id, original.pid)?;
                 released.frame = released_frame(engine, &released.monitor, shown, 0);
                 released.clip = Some(released.frame);
-                let owners = geometry
+                let owners: BTreeMap<WindowId, i32> = geometry
                     .originals
                     .iter()
                     .map(|(id, w)| (*id, w.pid))
@@ -1481,6 +1486,12 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
             // revealing the window that the user actually chose in overview.
             let reconciling_overview = start < overview_resume;
             let suspended = !session_active || overview;
+            let phase = ControlPhase::new(
+                session_active,
+                overview,
+                ribbon_macos::left_mouse_down(),
+                reconciling_overview,
+            );
             if ribbon_macos::left_mouse_down() {
                 sizes.cancel_settlement();
             }
@@ -1564,9 +1575,9 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                             continue;
                         }
                         let response = request.and_then(|r| {
-                                if (suspended || reconciling_overview) && !matches!(r, Request::Status {} | Request::Quit {})
+                                if !phase.owns_geometry() && !matches!(r, Request::Status {} | Request::Quit {})
                                 {
-                                    bail!("Window operations are paused while the session is locked/inactive or Mission Control is open");
+                                    bail!("Window operations are paused during native interaction ({phase:?})");
                                 }
                                 if geometry.dragged.is_some()
                                     && !matches!(r, Request::Status {} | Request::Quit {})
@@ -1588,6 +1599,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                                     &mut quit,
                                 )?;
                                 if status {
+                                    response["control_phase"] = json!(phase);
                                     let plans = engine.placements();
                                     let owners = geometry.originals.iter().map(|(id,w)| (*id,w.pid)).collect();
                                     let waiting = sizes.unsettled_columns(&engine, &plans, &owners);
@@ -1707,7 +1719,9 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                     }
                 }
             }
-            if !reconciling_overview && let Some(windows) = inventory.poll()? {
+            if phase.owns_geometry()
+                && let Some(windows) = inventory.poll()?
+            {
                 let reveal = !input
                     .as_ref()
                     .is_some_and(ribbon_macos::input::InputSource::active);
@@ -1754,7 +1768,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
             }
             // Do not recenter underneath the pointer during a border drag. Keep
             // adopting native sizes, then animate the final target after release.
-            if geometry.dragged.is_none() && !ribbon_macos::left_mouse_down() {
+            if phase.presents_layout() {
                 engine.tick(start.duration_since(last_tick).as_secs_f64());
             }
             last_tick = start;
@@ -1771,7 +1785,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                     }
                 }
                 sizes.retain(|id, _| geometry.originals.contains_key(id));
-                let owners = geometry
+                let owners: BTreeMap<WindowId, i32> = geometry
                     .originals
                     .iter()
                     .map(|(id, w)| (*id, w.pid))
@@ -1785,8 +1799,13 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                         .iter()
                         .map(|(id, m)| (id.clone(), m.viewport))
                         .collect();
+                    let held: Vec<_> = committed
+                        .iter()
+                        .filter(|p| owners.contains_key(&p.window))
+                        .cloned()
+                        .collect();
                     backend.interactive_frame(
-                        &plans,
+                        &held,
                         &owners,
                         &sticky_leases(&geometry),
                         &viewports,
@@ -1826,40 +1845,11 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                 let mut geometry_changed = false;
                 // Publish every row of a resized column together. Waiting on
                 // that column does not stop animations on independent columns.
-                let waiting = sizes.unaccepted_columns(&engine, &plans, &owners);
-                let pending = !waiting.is_empty();
-                let mut held = plans.clone();
+                let pending = !sizes.unsettled_columns(&engine, &plans, &owners).is_empty();
+                let measure =
+                    |id, pid| ribbon_macos::window_drag_geometry(id, pid).map(|(native, _)| native);
                 if pending {
-                    for p in &mut held {
-                        if !waiting.contains(&p.window) {
-                            continue;
-                        }
-                        let w = geometry
-                            .originals
-                            .get(&p.window)
-                            .context("Missing original geometry")?;
-                        if let Some(previous) = committed
-                            .iter()
-                            .find(|old| {
-                                old.window == p.window && old.native_space == p.native_space
-                            })
-                            .filter(|_| {
-                                sizes.get(&p.window).is_some_and(|s| s.0 == w.pid)
-                                    || sizes.pending.as_ref().is_some_and(|job| {
-                                        job.window == p.window && job.size.0 == w.pid
-                                    })
-                            })
-                        {
-                            *p = previous.clone();
-                        } else {
-                            p.frame =
-                                ribbon_macos::window_presentation(w.id, w.pid).unwrap_or(w.bounds);
-                            p.clip = p.frame.intersection(engine.monitors[&p.monitor].viewport);
-                        }
-                    }
-                    crate::geometry::reflow_presented_columns(&engine, &plans, &mut held);
-                    // Drag captures already took the interactive-only branch
-                    // above. Save originals before AX changes the transform.
+                    let held = sizes.presentation(&engine, &plans, &owners, measure);
                     backend.frame_with_sticky_in_viewports(
                         &held,
                         &owners,
@@ -1910,6 +1900,13 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                                 } else {
                                     resize_anchor(viewport, w.bounds, size.1, size.2)
                                 },
+                                ribbon_macos::FrameCalibration {
+                                    logical: *geometry
+                                        .logical_originals
+                                        .get(&p.window)
+                                        .context("Missing native frame calibration")?,
+                                    surface: w.surface_bounds.unwrap_or(w.bounds),
+                                },
                                 || {
                                     if !ribbon_macos::session_active()
                                         || ribbon_macos::left_mouse_down()
@@ -1918,6 +1915,8 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                                             "Session suspended or native mouse interaction began during geometry update"
                                         );
                                     }
+                                    let held =
+                                        sizes.presentation(&engine, &plans, &owners, measure);
                                     backend.frame_with_sticky_in_viewports(
                                         &held,
                                         &owners,
@@ -2002,21 +2001,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                     // displayed position rather than jumping over that stalled time.
                     last_tick = Instant::now();
                 }
-                let waiting = sizes.unaccepted_columns(&engine, &plans, &owners);
-                let mut shown: Vec<_> = plans
-                    .iter()
-                    .cloned()
-                    .zip(held)
-                    .map(|(plan, previous)| {
-                        if waiting.contains(&plan.window) {
-                            previous
-                        } else {
-                            plan
-                        }
-                    })
-                    .collect();
-                crate::geometry::reflow_presented_columns(&engine, &plans, &mut shown);
-                let plans = shown;
+                let plans = sizes.presentation(&engine, &plans, &owners, measure);
                 // Focus/native selection metadata does not change compositor geometry.
                 let frame = serde_json::to_vec(
                     &plans

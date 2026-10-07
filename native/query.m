@@ -361,7 +361,7 @@ static AXError acceptedSize(AXUIElementRef window,CGSize expected,CGSize *accept
         usleep(5000);
     }
 }
-static int resizeWindow(uint32_t wid,int expected_pid,RibbonRect target,BOOL logicalTarget,RibbonGeometryProgress progress,void *context,void **pending) { @autoreleasepool {
+static int resizeWindow(uint32_t wid,int expected_pid,RibbonRect target,BOOL logicalTarget,const RibbonRect *calibrationAX,const RibbonRect *calibrationNative,RibbonGeometryProgress progress,void *context,void **pending) { @autoreleasepool {
     if(!ribbon_session_active())return kAXErrorCannotComplete;
     pid_t pid=0;AXUIElementRef w=findAXWindow(wid,expected_pid,&pid);if(!w)return kAXErrorInvalidUIElement;
     __attribute__((objc_precise_lifetime)) RibbonAXFrameGuard *guard=[[RibbonAXFrameGuard alloc] initWithPID:pid];
@@ -373,7 +373,11 @@ static int resizeWindow(uint32_t wid,int expected_pid,RibbonRect target,BOOL log
     // AX can describe an inset client frame. Layout/clipping describes the
     // outer WindowServer surface. Convert both origin and size through the
     // measured per-window difference rather than assuming identical frames.
-    RibbonRect rect=logicalTarget?target:ribbon_outer_to_ax(target,ax,native);
+    // Geometry calibration is captured before compositor control. Re-measuring
+    // position insets after a native group move would mistake AppKit's stale
+    // origin for window chrome and apply the entire old scroll offset again.
+    RibbonRect rect=logicalTarget?target:ribbon_outer_to_ax(target,
+        calibrationAX?*calibrationAX:ax,calibrationNative?*calibrationNative:native);
     RibbonRect outer=logicalTarget?(RibbonRect){target.x+native.x-ax.x,target.y+native.y-ax.y,
         target.width+native.width-ax.width,target.height+native.height-ax.height}:target;
     if(!isfinite(rect.x)||!isfinite(rect.y)||!isfinite(rect.width)||!isfinite(rect.height)||rect.width<=0||rect.height<=0){CFRelease(w);return kAXErrorIllegalArgument;}
@@ -410,21 +414,21 @@ static int resizeWindow(uint32_t wid,int expected_pid,RibbonRect target,BOOL log
     } else if(!error)error=settleWindow(w,wid,rect,outer,NO,progress,context);
     CFRelease(w);return error;
 } }
-int ribbon_resize_begin(uint32_t wid,int expected_pid,RibbonRect rect,RibbonGeometryProgress progress,void *context,void **pending) {
-    *pending=NULL;return resizeWindow(wid,expected_pid,rect,NO,progress,context,pending);
+int ribbon_resize_begin(uint32_t wid,int expected_pid,RibbonRect rect,RibbonRect calibrationAX,RibbonRect calibrationNative,RibbonGeometryProgress progress,void *context,void **pending) {
+    *pending=NULL;return resizeWindow(wid,expected_pid,rect,NO,&calibrationAX,&calibrationNative,progress,context,pending);
 }
 int ribbon_resize_window(uint32_t wid,int expected_pid,RibbonRect rect) {
     return ribbon_resize_window_observed(wid,expected_pid,rect,NULL,NULL);
 }
 int ribbon_resize_window_observed(uint32_t wid,int expected_pid,RibbonRect rect,RibbonGeometryProgress progress,void *context) {
-    int error=resizeWindow(wid,expected_pid,rect,NO,progress,context,NULL);
+    int error=resizeWindow(wid,expected_pid,rect,NO,NULL,NULL,progress,context,NULL);
     // Owner-side chrome can change its inset during the first resize. Measure
     // it again once; a genuine minimum-size refusal still remains an error.
-    if(error==kAXErrorCannotComplete)error=resizeWindow(wid,expected_pid,rect,NO,progress,context,NULL);
+    if(error==kAXErrorCannotComplete)error=resizeWindow(wid,expected_pid,rect,NO,NULL,NULL,progress,context,NULL);
     return error;
 }
 int ribbon_restore_window(uint32_t wid,int expected_pid,RibbonRect rect) { @autoreleasepool {
-    int resized=resizeWindow(wid,expected_pid,rect,YES,NULL,NULL,NULL);if(resized)return resized;
+    int resized=resizeWindow(wid,expected_pid,rect,YES,NULL,NULL,NULL,NULL,NULL);if(resized)return resized;
     pid_t pid=0;AXUIElementRef w=findAXWindow(wid,expected_pid,&pid);if(!w)return kAXErrorInvalidUIElement;
     // Reapply the exact original position only after the size has settled, so
     // AppKit doesn't constrain it against the larger managed size.

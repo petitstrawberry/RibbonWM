@@ -110,3 +110,25 @@ inventory generation is invalidated and discovery resumes. Locked-session AX
 placeholders are not interpreted as vanished windows. A pending acknowledged
 resize is cancelled without automatically rebasing it after unlock or a mouse
 press. Real lock/unlock interaction still requires runtime verification.
+
+
+## Geometry ownership and observed presentation
+
+The control phase is explicit: inactive, Dock overview, pointer interaction,
+overview reconciliation, or layout. Only layout admits mutating commands and
+inventory geometry adoption. Reconciliation can publish the selected layout but
+cannot issue AX geometry writes. A pointer press blocks geometry commands even
+before its target is known; interactive clipping uses the last committed strip
+rather than sending new placements to unrelated windows during the drag.
+
+A requested layout, an AX-accepted size, and a drawable WindowServer surface are
+three different states. While a column is settling, presentation samples its
+actual surface dimensions. Neighbours and stacked rows follow those dimensions;
+acceptance alone cannot publish a future size. This sampling also occurs inside
+AX progress callbacks, not just after the call returns.
+
+The outer-surface to AX-frame calibration comes from the pre-control snapshots.
+It is not re-measured from an AppKit origin left behind by a native group move:
+that would interpret the scroll displacement as a titlebar/chrome inset. The
+snapshot assumes stable client-frame decoration during a lease; applications
+that change their chrome need separate calibration lifecycle verification.

@@ -9,7 +9,7 @@ static void reply(NSDictionary *value) {
     fwrite(data.bytes,1,data.length,stdout);putchar('\n');fflush(stdout);
 }
 static id finiteNumber(double value) {return isfinite(value)?@(value):NSNull.null;}
-static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
+static NSDictionary *surfaceState(SkyLight sky,uint32_t wid,BOOL includeOrder) {
     CGAffineTransform t={0};CGRect b=CGRectZero;
     CGError et=sky.getTransform(sky.connection(),wid,&t),eb=sky.getBounds(sky.connection(),wid,&b);
     CFTypeRef region=NULL;CGRect clip=CGRectZero;
@@ -18,7 +18,7 @@ static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
     if(!ec&&region&&regionBounds)ec=regionBounds(region,&clip);
     if(region)sky.releaseRegion(region);
     NSMutableArray *order=[NSMutableArray array];
-    CFArrayRef list=CGWindowListCopyWindowInfo(kCGWindowListOptionAll|kCGWindowListExcludeDesktopElements,kCGNullWindowID);
+    CFArrayRef list=includeOrder?CGWindowListCopyWindowInfo(kCGWindowListOptionAll|kCGWindowListExcludeDesktopElements,kCGNullWindowID):NULL;
     for(NSDictionary *row in (__bridge NSArray *)list)if([row[(id)kCGWindowOwnerPID] intValue]==getpid())
         [order addObject:@{@"wid":row[(id)kCGWindowNumber],@"onscreen":@([row[(id)kCGWindowIsOnscreen] boolValue])}];
     if(list)CFRelease(list);
@@ -27,6 +27,7 @@ static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
         @"clip_error":@(ec),@"clip_bounds":@[finiteNumber(clip.origin.x),finiteNumber(clip.origin.y),finiteNumber(clip.size.width),finiteNumber(clip.size.height)],
         @"frame":@{@"x":finiteNumber(b.origin.x),@"y":finiteNumber(b.origin.y),@"width":finiteNumber(b.size.width),@"height":finiteNumber(b.size.height)}};
 }
+static NSDictionary *windowState(SkyLight sky,uint32_t wid) {return surfaceState(sky,wid,YES);}
 static NSDictionary *associatedState(SkyLight sky,uint32_t wid) {
     void *h=dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",RTLD_NOW);
     CFArrayRef (*associated)(int,uint32_t)=dlsym(h,"SLSCopyAssociatedWindows");
@@ -126,6 +127,7 @@ static NSDictionary *associatedState(SkyLight sky,uint32_t wid) {
     }
     if([op isEqual:@"quit"]) {[self stop];return;}
     if([op isEqual:@"present"]) {self.target.alphaValue=1;self.target.ignoresMouseEvents=NO;reply(@{@"presented":@YES});return;}
+    if([op isEqual:@"anchor-now"]&&[self.configuration[@"geometry_test"] boolValue]) {[self anchorNative];return;}
     if([op isEqual:@"state"]) {
         NSMutableDictionary *state=[windowState(self.sky,(uint32_t)self.target.windowNumber) mutableCopy];
         state[@"alpha"]=@(self.target.alphaValue);state[@"visible"]=@(self.target.visible);
@@ -202,6 +204,7 @@ static NSDictionary *associatedState(SkyLight sky,uint32_t wid) {
     [self.target orderFrontRegardless];[self.target displayIfNeeded];
     if([self.configuration[@"anchor_idle"] boolValue])
         [NSTimer scheduledTimerWithTimeInterval:0.016 target:self selector:@selector(anchorNative) userInfo:nil repeats:YES];
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,200*NSEC_PER_MSEC),dispatch_get_main_queue(),^{
         reply(@{@"ready":@YES,@"pid":@(getpid()),@"wid":@(self.target.windowNumber)});
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
@@ -227,6 +230,23 @@ int main(int argc,char **argv) {@autoreleasepool {
         uint32_t wid=(uint32_t)strtoul(argv[2],NULL,10);SkyLight sky;
         if(!wid||!loadSkyLight(&sky))return 1;
         reply(associatedState(sky,wid));return 0;
+    }
+    if(argc==5&&!strcmp(argv[1],"--trace-pair")) {
+        id ids=[NSJSONSerialization JSONObjectWithData:[[NSString stringWithUTF8String:argv[2]] dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+        int pid=atoi(argv[3]);double seconds=strtod(argv[4],NULL);
+        char own[PROC_PIDPATHINFO_MAXSIZE]={0},other[PROC_PIDPATHINFO_MAXSIZE]={0};
+        if(![ids isKindOfClass:NSArray.class]||[ids count]!=2||pid<=0||!isfinite(seconds)||seconds<=0||seconds>30||
+            proc_pidpath(getpid(),own,sizeof(own))<=0||proc_pidpath(pid,other,sizeof(other))<=0||strcmp(own,other))return 1;
+        for(id value in ids)if(![value isKindOfClass:NSNumber.class]||![value unsignedIntValue]||ribbon_window_owner([value unsignedIntValue])!=pid)return 1;
+        SkyLight sky;if(!loadSkyLight(&sky))return 1;double until=ribbon_input_time()+seconds;
+        while(ribbon_input_time()<until) {@autoreleasepool {
+            NSMutableArray *rows=[NSMutableArray array];
+            for(NSNumber *value in ids) {
+                uint32_t wid=value.unsignedIntValue;if(ribbon_window_owner(wid)!=pid)return 1;
+                NSMutableDictionary *row=[surfaceState(sky,wid,NO) mutableCopy];row[@"wid"]=value;[rows addObject:row];
+            }
+            reply(@{@"event":@"frame-sample",@"time":@(ribbon_input_time()),@"windows":rows});usleep(4000);
+        }}return 0;
     }
     if(argc==5&&!strcmp(argv[1],"--trace-window")) {
         // Diagnostic only: observe the exact owner without AX, input synthesis,
@@ -334,9 +354,11 @@ int main(int argc,char **argv) {@autoreleasepool {
     // Alacritty window is eligible, never a user's ordinary terminal or Codex.
     if((argc==4&&(strcmp(argv[1],"--focus-fixture")==0||strcmp(argv[1],"--click-fixture")==0||strcmp(argv[1],"--geometry-fixture")==0))||
        (argc==6&&(strcmp(argv[1],"--resize-fixture")==0||strcmp(argv[1],"--drag-fixture")==0||strcmp(argv[1],"--move-drag-fixture")==0||strcmp(argv[1],"--scroll-fixture")==0))||
+       (argc==7&&strcmp(argv[1],"--resize-calibrated-fixture")==0)||
        (argc==8&&strcmp(argv[1],"--restore-fixture")==0)) {
         BOOL click=strcmp(argv[1],"--click-fixture")==0;
-        BOOL resize=strcmp(argv[1],"--resize-fixture")==0;
+        BOOL calibrated=strcmp(argv[1],"--resize-calibrated-fixture")==0;
+        BOOL resize=strcmp(argv[1],"--resize-fixture")==0||calibrated;
         BOOL moveDrag=strcmp(argv[1],"--move-drag-fixture")==0;
         BOOL drag=strcmp(argv[1],"--drag-fixture")==0||moveDrag;
         BOOL scroll=strcmp(argv[1],"--scroll-fixture")==0;
@@ -396,7 +418,22 @@ int main(int argc,char **argv) {@autoreleasepool {
             double height=strtod(argv[5],&end);if(*end||!isfinite(height)||height<100||height>10000)return 1;
             SkyLight sky;if(!loadSkyLight(&sky))return 1;CGRect frame;
             if(sky.getBounds(sky.connection(),(uint32_t)wid,&frame))return 1;
-            int result=ribbon_resize_window((uint32_t)wid,(int)pid,(RibbonRect){frame.origin.x,frame.origin.y,width,height});
+            int result=0;
+            if(calibrated) {
+                if(!ownFixture)return 1;
+                id data=[NSJSONSerialization JSONObjectWithData:[[NSString stringWithUTF8String:argv[6]] dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+                if(![data isKindOfClass:NSArray.class]||[data count]!=8)return 1;
+                double v[8];for(int i=0;i<8;i++) {
+                    if(![data[i] isKindOfClass:NSNumber.class])return 1;
+                    v[i]=[data[i] doubleValue];if(!isfinite(v[i])||fabs(v[i])>100000)return 1;
+                }
+                if(v[2]<=0||v[3]<=0||v[6]<=0||v[7]<=0)return 1;
+                void *pending=NULL;
+                result=ribbon_resize_begin((uint32_t)wid,(int)pid,(RibbonRect){frame.origin.x,frame.origin.y,width,height},
+                    (RibbonRect){v[0],v[1],v[2],v[3]},(RibbonRect){v[4],v[5],v[6],v[7]},NULL,NULL,&pending);
+                if(!result){do {result=ribbon_settlement_poll(pending);if(!result)usleep(5000);}while(!result);if(result==1)result=0;}
+                if(pending)ribbon_settlement_release(pending);
+            } else result=ribbon_resize_window((uint32_t)wid,(int)pid,(RibbonRect){frame.origin.x,frame.origin.y,width,height});
             reply(@{@"resize_error":@(result),@"state":windowState(sky,(uint32_t)wid)});return result?1:0;
         }
         if(click||drag||scroll) {

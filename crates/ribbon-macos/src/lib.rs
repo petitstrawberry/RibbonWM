@@ -74,6 +74,8 @@ unsafe extern "C" {
         wid: u32,
         pid: i32,
         rect: Rect,
+        calibration_ax: Rect,
+        calibration_surface: Rect,
         progress: extern "C" fn(*mut c_void) -> i32,
         context: *mut c_void,
         pending: *mut *mut c_void,
@@ -364,20 +366,36 @@ impl Drop for PendingResize {
         unsafe { ribbon_settlement_release(self.raw.as_ptr()) };
     }
 }
+pub struct FrameCalibration {
+    pub logical: Rect,
+    pub surface: Rect,
+}
 pub fn begin_resize_window(
     id: WindowId,
     pid: i32,
     frame: Rect,
+    calibration: FrameCalibration,
     progress: impl FnMut() -> Result<()>,
 ) -> Result<PendingResize> {
-    if !frame.valid() {
+    if !frame.valid() || !calibration.logical.valid() || !calibration.surface.valid() {
         bail!("Invalid window dimensions");
     }
     let mut raw = std::ptr::null_mut();
     geometry_progress(progress, |tick, context| {
         // SAFETY: progress and output pointers live through the call; native
         // transfers its settlement allocation only on success.
-        unsafe { ribbon_resize_begin(id.0, pid, frame, tick, context, &mut raw) }
+        unsafe {
+            ribbon_resize_begin(
+                id.0,
+                pid,
+                frame,
+                calibration.logical,
+                calibration.surface,
+                tick,
+                context,
+                &mut raw,
+            )
+        }
     })?;
     Ok(PendingResize {
         raw: std::ptr::NonNull::new(raw).context("Missing settlement context")?,
