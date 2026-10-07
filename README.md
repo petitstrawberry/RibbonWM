@@ -4,6 +4,12 @@ An experimental Rust proof of concept for a PaperWM/Niri-style scrolling window
 manager on macOS. Windows form horizontal columns with optional vertical stacks.
 Each native macOS **Space × monitor** retains its own layout and scroll position.
 
+Inspired by [yabai](https://github.com/asmvik/yabai) and
+[PaperWM](https://github.com/paperwm/PaperWM): PaperWM informs the scrolling-column
+workflow, while yabai informs the native macOS integration and privileged backend
+approach. RibbonWM also **reuses and adapts yabai's Dock-injection loader**, rather
+than taking only conceptual inspiration. See [credits](#credits-and-license).
+
 **Development concluded at the PoC stage. This is not a stable daily-driver
 replacement for an established window manager.** The implementation demonstrates
 real-window scrolling and clipping, but resize transitions, dragging, native
@@ -57,6 +63,10 @@ RibbonWM manipulates real WindowServer surfaces through a small backend injected
 into Dock. Rust owns layout, selection, scrolling, window tracking and IPC. The
 native layer provides Accessibility/AppKit integration and privileged SkyLight
 operations.
+
+The Dock injection mechanism uses a Mach/PAC loader derived from yabai's scripting
+addition. RibbonWM injects its own backend payload through that loader and uses
+private SkyLight/WindowServer operations for real-window transforms and clipping.
 
 The backend combines presentation transforms, monitor clipping and selective
 native window anchoring. Accessibility requests negotiate application sizes.
@@ -318,7 +328,22 @@ The final suite passed 79 Rust tests, formatting, Clippy, the native build,
 owned-surface regression and socket lifecycle checks, plus a Nix package build.
 Those bounded checks do not establish desktop stability or visual smoothness.
 
-MIT licensed. The Mach loader includes yabai-derived code with its original
-copyright and attribution; the [upstream license](native/vendor/yabai-LICENSE.txt)
-is included. PaperWM/Niri inspire the interaction model; the Rust layout
-implementation is independent.
+## Credits and license
+
+- **[yabai](https://github.com/asmvik/yabai)** inspires the macOS window-manager
+  integration, command compatibility and Dock-injected privileged backend approach.
+  RibbonWM uses and adapts its injection technology: [native/loader.m](native/loader.m)
+  is derived from yabai's [Mach/PAC loader at commit
+  dd845723416f5fe92af49fad5ebab00369e07edd](https://github.com/asmvik/yabai/blob/dd845723416f5fe92af49fad5ebab00369e07edd/src/osax/loader.m).
+  The original MIT copyright notice (Åsmund Vikane) is retained in the included
+  [yabai license](native/vendor/yabai-LICENSE.txt). The loader also preserves the
+  upstream credit to [Jeremy Legendre](https://github.com/jslegendre) for the arm64e
+  injection path.
+- **[PaperWM](https://github.com/paperwm/PaperWM)** inspires the horizontal scrolling
+  columns, vertical stacks and interaction model.
+- **[Niri](https://github.com/YaLTeR/niri)** also inspires the scrolling interaction
+  and per-monitor viewport model.
+
+RibbonWM's Rust layout implementation, control protocol and backend payload are
+implemented separately from the reused yabai loader. RibbonWM is [MIT licensed](LICENSE);
+the original notices for the reused code remain in place.
