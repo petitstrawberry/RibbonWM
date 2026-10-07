@@ -112,7 +112,30 @@ fn read_frame(stream: &mut UnixStream, timeout: Duration) -> Result<Vec<u8>> {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .context("IPC deadline exceeded")?;
-        stream.set_read_timeout(Some(remaining))?;
+        // Darwin can reject SO_RCVTIMEO after the peer closes, even while
+        // a complete reply is buffered. Wait for readability/HUP with poll;
+        // the absolute deadline bounds fragmented and idle requests too.
+        let mut ready = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = remaining
+            .as_millis()
+            .saturating_add(1)
+            .min(i32::MAX as u128) as i32;
+        // SAFETY: one valid pollfd lives through the synchronous syscall.
+        let polled = unsafe { libc::poll(&mut ready, 1, timeout_ms) };
+        if polled == 0 {
+            bail!("IPC deadline exceeded");
+        }
+        if polled < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
         let count = match stream.read(&mut chunk) {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             result => result?,
@@ -166,6 +189,16 @@ pub fn send(request: Request) -> Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn complete_message_survives_peer_closing_before_read() {
+        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        sender.write_all(b"{\"op\":\"status\"}\n").unwrap();
+        drop(sender);
+        assert!(matches!(
+            receive(&mut receiver).unwrap(),
+            Request::Status {}
+        ));
+    }
     #[test]
     fn fragmented_requests_are_reassembled() {
         let (mut a, mut b) = UnixStream::pair().unwrap();

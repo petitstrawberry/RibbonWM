@@ -350,3 +350,28 @@ replace the running WM. Live acceptance still requires that run, owned-window
 physical drag/resize, floating transitions, native Space/Mission Control return,
 and multi-monitor clipping checks. The synchronous initial AX acceptance and
 next-batch probe wait remain explicit limitations.
+
+### Native activation and IPC follow-up (candidate)
+
+The `4bab26b` package was activated and the service resumed in the same process
+after permissions became ready. Live fixture attempts exposed intermittent
+`Invalid argument (os error 22)` from the CLI: on this macOS, setting the receive
+timeout after the peer closes can fail even though the reply remains buffered.
+The IPC reader now uses `poll` with the original absolute deadline. A Unix socket
+pair regression writes a complete frame, closes the peer, and then reads it;
+fragmented, oversized and idle-connection tests remain in place. An initial
+rounding hypothesis was disproved and that proposed fix was discarded.
+
+Native-focus regression coverage distinguishes repeated observations, return
+from an unmanaged app, automatic selection in another Space (including a delayed
+old-Space observation), and Mission Control return. Only the last of those
+forces reveal of an unchanged selection. The normal module defaults no longer
+exclude assistant apps; the user's normal service configuration also removes
+those exclusions. Diagnostic fixture guards still exclude protected apps.
+
+The supplied Mission Control recording shows a transient pile of native windows
+before tiled presentation returns. Code review found a 200 ms reconciliation
+hold sending only heartbeats after overview had removed transforms. The candidate
+restores committed compositor frames during that hold, while still deferring AX
+writes and inventory reconciliation. This removes that explicit display gap;
+physical Mission Control exit animation remains a required live check.

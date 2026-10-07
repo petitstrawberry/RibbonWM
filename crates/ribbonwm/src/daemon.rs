@@ -25,6 +25,7 @@ pub struct Options {
     pub settings: Settings,
 }
 struct GeometryLease {
+    focus: NativeFocus,
     modes: BTreeMap<WindowId, WindowMode>,
     originals: BTreeMap<WindowId, Window>,
     logical_originals: BTreeMap<WindowId, Rect>,
@@ -557,9 +558,51 @@ impl Drop for GeometryLease {
         }
     }
 }
+#[derive(Default)]
+struct NativeFocus {
+    last: Option<(i32, Option<WindowId>)>,
+    contexts: Option<BTreeMap<String, ribbon_core::NativeSpaceId>>,
+    context_selection_pending: bool,
+    reveal_selection: bool,
+}
+impl NativeFocus {
+    fn update(&mut self, engine: &mut Engine, pid: i32, window: Option<WindowId>, reveal: bool) {
+        let contexts: BTreeMap<_, _> = engine
+            .monitors
+            .iter()
+            .map(|(id, m)| (id.clone(), m.native_space))
+            .collect();
+        if self.contexts.as_ref().is_some_and(|old| *old != contexts) {
+            self.context_selection_pending = true;
+        }
+        self.contexts = Some(contexts);
+        let changed = self.last != Some((pid, window));
+        self.last = Some((pid, window));
+        let Some(id) = window else {
+            return;
+        };
+        let active = engine.window_context(id).is_some_and(|(monitor, space)| {
+            let m = &engine.monitors[monitor];
+            !m.suspended && m.native_space == space
+        });
+        if !active {
+            return;
+        }
+        let space_selection = std::mem::take(&mut self.context_selection_pending);
+        let selected_in_overview = std::mem::take(&mut self.reveal_selection);
+        // App activation (Dock/Cmd-Tab) can return to an already-selected
+        // column. Reveal once for that native transition, never on every poll.
+        // The first valid selection in a new Space retains its saved viewport.
+        if reveal && (selected_in_overview || (changed && !space_selection)) {
+            let _ = engine.focus_window(id);
+        } else {
+            let _ = engine.observe_focus(id, false);
+        }
+    }
+}
 fn observe_native_focus(
     engine: &mut Engine,
-    geometry: &GeometryLease,
+    geometry: &mut GeometryLease,
     options: &Options,
     reveal: bool,
 ) {
@@ -567,27 +610,17 @@ fn observe_native_focus(
         return;
     }
     let pid = ribbon_macos::frontmost_pid();
-    // Exclusions are checked before any AX query, including focus observation.
-    if geometry
+    // Unmanaged activations still update identity, without querying their AX
+    // tree. A later return to a managed app is a new native transition.
+    let window = geometry
         .originals
         .values()
         .any(|w| w.pid == pid && !app_excluded(w, &options.exclude_apps))
-        && let Some(id) = ribbon_macos::focused_window(pid)
-    {
-        // App activation and Space switching select windows automatically.
-        // Observe that selection without overriding the saved viewport. Only a
-        // recent click in the selected window requests native focus reveal;
-        // explicit WM focus commands already reveal through Engine::apply.
-        let click_age = ribbon_macos::left_mouse_down_age();
-        let pointer = ribbon_macos::pointer();
-        let clicked = click_age.is_finite()
-            && (0.0..=0.25).contains(&click_age)
-            && engine.placements().iter().any(|p| {
-                p.window == id && p.clip.is_some_and(|c| c.contains(pointer.0, pointer.1))
-            });
-        let _ = engine.observe_focus(id, reveal && clicked);
-    }
+        .then(|| ribbon_macos::focused_window(pid))
+        .flatten();
+    geometry.focus.update(engine, pid, window, reveal);
 }
+
 fn forget_closed(engine: &mut Engine, geometry: &mut GeometryLease, id: WindowId) -> Result<()> {
     if engine.window_ids().contains(&id) {
         engine.remove_window(id)?;
@@ -1299,6 +1332,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
         Some(backend)
     };
     let mut geometry = GeometryLease {
+        focus: NativeFocus::default(),
         modes: BTreeMap::new(),
         originals: BTreeMap::new(),
         logical_originals: BTreeMap::new(),
@@ -1426,10 +1460,32 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                 overview = true;
             } else if !in_overview && overview {
                 overview = false;
+                geometry.focus.reveal_selection = true;
                 overview_resume = start + Duration::from_millis(200);
                 inventory.invalidate();
                 last_frame.clear();
                 mouse = MouseCapture::default();
+            }
+            // Overview released transforms to expose full real windows. Once
+            // macOS exits, restore the last committed presentation immediately,
+            // even while AX/inventory reconciliation is held for 200 ms. Waiting
+            // with only heartbeats exposes all owners at their physical anchors.
+            if session_active
+                && !overview
+                && start < overview_resume
+                && let Some(backend) = &backend
+            {
+                let owners = geometry
+                    .originals
+                    .iter()
+                    .map(|(id, w)| (*id, w.pid))
+                    .collect();
+                backend.frame_with_sticky_in_viewports(
+                    &committed,
+                    &owners,
+                    &sticky_leases(&geometry),
+                    &monitor_viewports(&engine),
+                )?;
             }
             let suspended = !session_active || overview || start < overview_resume;
             if ribbon_macos::left_mouse_down() {
@@ -1670,7 +1726,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                 let reveal = !input
                     .as_ref()
                     .is_some_and(ribbon_macos::input::InputSource::active);
-                observe_native_focus(&mut engine, &geometry, &options, reveal);
+                observe_native_focus(&mut engine, &mut geometry, &options, reveal);
                 last_focus = start;
             }
             let after_inventory = Instant::now();
@@ -2075,6 +2131,54 @@ mod tests {
     use ribbon_core::{NativeSpaceId, Rect};
 
     #[test]
+    fn native_app_return_reveals_once_and_space_return_preserves_scroll() {
+        let mut e = Engine::new(Settings::default()).unwrap();
+        let viewport = Rect {
+            x: 0.0,
+            y: 30.0,
+            width: 1200.0,
+            height: 800.0,
+        };
+        e.update_monitor("main", viewport, ribbon_core::NativeSpaceId(1), false)
+            .unwrap();
+        for id in 1..=3 {
+            e.add_window("main", WindowId(id), Some(800.0)).unwrap();
+        }
+        let mut focus = NativeFocus::default();
+        focus.update(&mut e, 42, Some(WindowId(1)), true);
+        let revealed = e.monitors["main"].layout().scroll.target;
+        e.tick(2.0);
+        e.apply("main", &Action::Scroll { delta: 700.0 }).unwrap();
+        let manual = e.monitors["main"].layout().scroll.target;
+        assert_ne!(manual, revealed);
+        focus.update(&mut e, 42, Some(WindowId(1)), true);
+        assert_eq!(e.monitors["main"].layout().scroll.target, manual);
+        focus.update(&mut e, 43, None, true); // An unmanaged application.
+        assert_eq!(e.monitors["main"].layout().scroll.target, manual);
+        focus.update(&mut e, 42, Some(WindowId(1)), true); // Dock/Cmd-Tab return.
+        assert_eq!(e.monitors["main"].layout().scroll.target, revealed);
+        e.tick(2.0);
+        e.apply("main", &Action::Scroll { delta: 700.0 }).unwrap();
+        e.update_monitor("main", viewport, ribbon_core::NativeSpaceId(2), false)
+            .unwrap();
+        e.add_window("main", WindowId(4), Some(800.0)).unwrap();
+        focus.update(&mut e, 42, Some(WindowId(1)), true); // Delayed old-Space focus.
+        focus.update(&mut e, 44, Some(WindowId(4)), true);
+        e.update_monitor("main", viewport, ribbon_core::NativeSpaceId(1), false)
+            .unwrap();
+        focus.update(&mut e, 42, Some(WindowId(1)), true);
+        assert_eq!(e.monitors["main"].layout().scroll.target, manual);
+        // Mission Control selection may select the same window or another
+        // Space, but it is an explicit reveal unlike ordinary Space return.
+        focus.reveal_selection = true;
+        focus.update(&mut e, 42, Some(WindowId(1)), true);
+        assert_eq!(e.monitors["main"].layout().scroll.target, revealed);
+        e.tick(2.0);
+        e.apply("main", &Action::Scroll { delta: 700.0 }).unwrap();
+        focus.update(&mut e, 42, Some(WindowId(1)), true);
+        assert_eq!(e.monitors["main"].layout().scroll.target, manual);
+    }
+    #[test]
     fn failed_initial_frame_never_releases_unowned_geometry() {
         let mut engine = Engine::new(Settings::default()).unwrap();
         engine
@@ -2228,6 +2332,7 @@ mod tests {
             focused: false,
         }];
         let mut geometry = GeometryLease {
+            focus: NativeFocus::default(),
             modes: BTreeMap::new(),
             originals: BTreeMap::new(),
             logical_originals: BTreeMap::new(),
@@ -2290,6 +2395,7 @@ mod tests {
         let id = WindowId(1);
         engine.add_window("main", id, Some(800.0)).unwrap();
         let mut geometry = GeometryLease {
+            focus: NativeFocus::default(),
             modes: BTreeMap::new(),
             originals: BTreeMap::new(),
             logical_originals: BTreeMap::new(),

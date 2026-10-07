@@ -7,3 +7,26 @@ These are inspected implementations, not runtime comparisons on this host.
 - [OmniWM parking](https://github.com/OmniNull/OmniWM/blob/ee9ba550e28137be325808eacf49f0b16faa4d33/Sources/OmniWM/Core/Controller/LayoutRefreshController%2BWindowParking.swift#L104) and [display diagnostics](https://github.com/OmniNull/OmniWM/blob/ee9ba550e28137be325808eacf49f0b16faa4d33/Sources/OmniWM/Core/Diagnostics/DiagnosticsIssue.swift#L143): its parking path applies SkyLight positions and AX frames; diagnostics identify neighboring-display leakage under vertically overlapping arrangements. This is evidence of that documented constraint, not a claim that all multi-monitor configurations fail. RibbonWM instead keeps actual surfaces under Dock-owned transforms and explicit drawing/input clips, including while an owner is dragging.
 
 PaperWM and OmniWM source is used as design research; no GPL source is copied into RibbonWM.
+
+## Focus and overview follow-up (2026-10-07)
+
+- OmniWM inspected at `2e08501ec4e0759d6f6a0cfa2ca3f2005fa062c0`:
+  [GPL-2.0-only source notice and activation observation](https://github.com/OmniNull/OmniWM/blob/2e08501ec4e0759d6f6a0cfa2ca3f2005fa062c0/Sources/OmniWM/Core/Controller/AXEventHandler%2BFocusObservation.swift).
+  Its observation path distinguishes native activation, focus changes and probes,
+  and guards against background observations overruling the active application.
+  This is design research only; no OmniWM source was copied or translated.
+- paneru inspected at `b1b6abbd3f1a4be138152b6f0389c9ff1b27a269`:
+  [MIT license](https://github.com/karinushka/paneru/blob/b1b6abbd3f1a4be138152b6f0389c9ff1b27a269/LICENSE.txt),
+  [activation and Mission Control triggers](https://github.com/karinushka/paneru/blob/b1b6abbd3f1a4be138152b6f0389c9ff1b27a269/src/ecs/triggers.rs#L414).
+  It suspends scrolling during native overview and reconciles membership on exit.
+  No source was copied; future substantial reuse must retain its copyright and
+  permission notice.
+
+RibbonWM's independent implementation records native PID/window transitions,
+reveals an application on return even when its column was already selected, and
+retains the offset for automatic selection on a native Space change. Mission
+Control return requests one explicit reveal. Its Dock compositor also restores
+cached committed placements immediately during the reconciliation hold, rather
+than leaving windows at their common physical resize anchors for 200 ms. Those
+transform/clip details are specific to RibbonWM; the other projects' behavior
+is not runtime evidence for this backend.

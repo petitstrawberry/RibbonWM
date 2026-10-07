@@ -71,7 +71,6 @@ modules = [
         frame_rate = 120;
       };
       excludeApps = [
-        "com.openai.*" "ChatGPT*"
         "com.apple.systempreferences" "com.apple.calculator"
         "Raycast" "CLIP STUDIO PAINT*"
       ];

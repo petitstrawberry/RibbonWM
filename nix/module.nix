@@ -30,7 +30,7 @@ in {
     };
     excludeApps = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [ "com.openai.*" "ChatGPT*" ];
+      default = [ ];
       description = "Bundle IDs or app names excluded before Accessibility queries.";
     };
     enableDockInjection = lib.mkEnableOption "root Dock backend loader, including Dock restart recovery (requires relaxed SIP)";
