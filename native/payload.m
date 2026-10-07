@@ -9,19 +9,20 @@
 #include <math.h>
 #include <limits.h>
 
-@interface RibbonSavedWindowV3 : NSObject
+@interface RibbonSavedWindowV4 : NSObject
 @property uint32_t wid;
 @property CGRect bounds;
+@property CGRect nativeBounds;
 @property CGAffineTransform transform;
 @property CFTypeRef clip;
 @property pid_t pid;
 @property uint32_t root;
 @end
-@implementation RibbonSavedWindowV3
+@implementation RibbonSavedWindowV4
 @end
 
 static SkyLight sky;
-static NSMutableDictionary<NSNumber *, RibbonSavedWindowV3 *> *saved;
+static NSMutableDictionary<NSNumber *, RibbonSavedWindowV4 *> *saved;
 static NSMutableDictionary<NSNumber *,NSDictionary *> *stickySaved;
 static RibbonStickyAPI stickyAPI;
 static bool hasStickyAPI;
@@ -45,11 +46,16 @@ static BOOL validSurfaceBounds(CGRect b) {
 
 static unsigned restoreWindows(NSSet<NSNumber *> *retained) {
     unsigned failed=0;
-    for (RibbonSavedWindowV3 *w in saved.allValues) {
+    for (RibbonSavedWindowV4 *w in saved.allValues) {
         if ([retained containsObject:@(w.wid)]) continue;
         if (ownerPID(w.wid)==w.pid) {
             CGRect b;
-            if(sky.getBounds(sky.connection(),w.wid,&b)||!validSurfaceBounds(b)){failed++;continue;}
+            CGError eb=sky.getBounds(sky.connection(),w.wid,&b);
+            // A withdrawn attached surface may keep its owner while reporting
+            // a null rectangle. Its last finite native bounds remain the only
+            // usable anchor; never feed the null sentinel into a transform.
+            if(eb||!validSurfaceBounds(b))b=w.nativeBounds;
+            if(!validSurfaceBounds(b)){failed++;NSLog(@"[RibbonWM] restore bounds unavailable wid=%u root=%u error=%d",w.wid,w.root,eb);continue;}
             // A lease may have started with a stale translated surface. The
             // current owner bounds are the native desktop position; replaying
             // that old absolute transform can send a moved window off-screen.
@@ -87,7 +93,7 @@ static unsigned restoreSticky(NSSet<NSNumber *> *retained) {
 }
 static unsigned restoreAll(void) {return restoreWindows([NSSet set])+restoreSticky([NSSet set]);}
 static void forgetWindow(uint32_t wid) {
-    RibbonSavedWindowV3 *w=saved[@(wid)];
+    RibbonSavedWindowV4 *w=saved[@(wid)];
     if(w){sky.releaseRegion(w.clip);[saved removeObjectForKey:@(wid)];}
 }
 
@@ -252,7 +258,7 @@ static NSDictionary *frame(NSDictionary *r) {
     for(NSDictionary *u in updates) {
         uint32_t wid=[u[@"wid"] unsignedIntValue];CGRect f,c;
         rect(u[@"frame"],&f);
-        RibbonSavedWindowV3 *w=saved[@(wid)];pid_t pid=ownerPID(wid);
+        RibbonSavedWindowV4 *w=saved[@(wid)];pid_t pid=ownerPID(wid);
         // Closing/reused IDs are normal lifecycle events. Release their stale
         // snapshots without restoring or touching the new owner's window.
         if(!pid||(w&&w.pid!=pid)) {forgetWindow(wid);continue;}
@@ -263,7 +269,7 @@ static NSDictionary *frame(NSDictionary *r) {
         if(!w) {
             CGRect b;CGAffineTransform t;CFTypeRef clip=NULL;
             CGError eb=sky.getBounds(sky.connection(),wid,&b),et=sky.getTransform(sky.connection(),wid,&t),ec=sky.copyClip(sky.connection(),wid,&clip);
-            if(eb||et||ec||!clip) {
+            if(eb||et||ec||!clip||!validSurfaceBounds(b)) {
                 if(clip)sky.releaseRegion(clip);
                 if(ownerPID(wid)!=pid)continue;
                 return error(@"Cannot save original window state");
@@ -274,9 +280,11 @@ static NSDictionary *frame(NSDictionary *r) {
             if(fabs(t.a-1)>1e-6||fabs(t.b)>1e-6||fabs(t.c)>1e-6||fabs(t.d-1)>1e-6||!isfinite(t.tx)||!isfinite(t.ty)) {
                 sky.releaseRegion(clip);return error(@"Window already has a custom transform");
             }
-            w=[RibbonSavedWindowV3 new];w.wid=wid;w.bounds=b;w.transform=t;w.clip=clip;w.pid=pid;
+            w=[RibbonSavedWindowV4 new];w.wid=wid;w.bounds=b;w.nativeBounds=b;w.transform=t;w.clip=clip;w.pid=pid;
             w.root=[u[@"group_root"] unsignedIntValue];saved[@(wid)]=w;
         }
+        CGRect observed;
+        if(!sky.getBounds(sky.connection(),wid,&observed)&&validSurfaceBounds(observed))w.nativeBounds=observed;
         CGRect local=CGRectZero;
         BOOL interactive=u[@"viewport"]!=nil;
         BOOL pointerDrag=u[@"drag_frame"]!=nil;
@@ -312,7 +320,7 @@ static NSDictionary *frame(NSDictionary *r) {
     return @{@"ok":@YES,@"controlled":@(controlledCount())};
 }
 static NSDictionary *overview(void) {
-    for(RibbonSavedWindowV3 *w in saved.allValues) {
+    for(RibbonSavedWindowV4 *w in saved.allValues) {
         if(ownerPID(w.wid)!=w.pid){forgetWindow(w.wid);continue;}
         CGRect b;CGError eb=sky.getBounds(sky.connection(),w.wid,&b);
         if(eb||!isfinite(b.size.width)||!isfinite(b.size.height)||b.size.width<=0||b.size.height<=0)return error(@"Cannot read overview surface");
@@ -335,7 +343,7 @@ static NSDictionary *releaseFrames(NSDictionary *r,BOOL all) {
         double wid=0,pid=0;CGRect f;
         if(![u isKindOfClass:NSDictionary.class]||!identifier(u[@"wid"],UINT32_MAX,&wid)||
            !identifier(u[@"pid"],INT_MAX,&pid)||!rect(u[@"frame"],&f)||[ids containsObject:@((uint32_t)wid)])return error(@"Invalid release descriptor");
-        RibbonSavedWindowV3 *old=saved[@((uint32_t)wid)];
+        RibbonSavedWindowV4 *old=saved[@((uint32_t)wid)];
         if(old&&old.pid!=(int)pid)return error(@"Release requires a matching lease");
         [ids addObject:@((uint32_t)wid)];
     }
@@ -366,6 +374,16 @@ static NSDictionary *releaseFrames(NSDictionary *r,BOOL all) {
 static NSDictionary *finish(NSDictionary *r) {return releaseFrames(r,YES);}
 static NSDictionary *handle(id r) {
     if(![r isKindOfClass:NSDictionary.class])return error(@"Expected JSON object");
+    if([r[@"op"] isEqual:@"diagnostics"]) {
+        NSMutableArray *leases=[NSMutableArray array];
+        for(RibbonSavedWindowV4 *w in saved.allValues) {
+            CGRect b;CGError eb=sky.getBounds(sky.connection(),w.wid,&b);
+            [leases addObject:@{@"wid":@(w.wid),@"root":@(w.root),@"pid":@(w.pid),@"current_pid":@(ownerPID(w.wid)),
+                @"bounds_error":@(eb),@"bounds_valid":@(!eb&&validSurfaceBounds(b)),
+                @"native_bounds_valid":@(validSurfaceBounds(w.nativeBounds))}];
+        }
+        return @{@"ok":@YES,@"leases":leases,@"idle_seconds":@(NSProcessInfo.processInfo.systemUptime-lastUpdate)};
+    }
     if([r[@"op"] isEqual:@"hello"])return @{@"ok":@YES,@"version":@2,@"capabilities":hasStickyAPI?@[@"sticky",@"interactive_clip",@"overview",@"finish",@"pointer_drag",@"window_groups"]:@[@"interactive_clip",@"overview",@"finish",@"pointer_drag",@"window_groups"],@"build":buildName?:@"",@"pid":@(getpid()),@"uid":@(getuid()),@"controlled":@(controlledCount())};
     NSString *session=r[@"session"];
     if(![session isKindOfClass:NSString.class]||session.length==0||session.length>128)return error(@"Invalid session");

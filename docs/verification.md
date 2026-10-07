@@ -245,3 +245,14 @@ Native overview uses current physical geometry instead of an obsolete absolute
 translation. This is an owned-surface test, not Dock injection or proof of
 arbitrary-application drag stability. The new live backend still needs desktop
 verification; the recorded broken service was kept running throughout diagnosis.
+
+### Attached-surface withdrawal follow-up
+
+The installed build encountered a failed removed-surface restoration followed by a
+stuck controller lease during actual desktop capture. This is not a passing
+desktop verification. A regression now injects a null WindowServer rectangle for
+an owned attached surface and checks that release uses its last finite native
+bounds and clears the lease. Ordinary attached-window withdrawal also passes.
+The payload provides a read-only `diagnostics` operation with per-surface owner
+and bounds availability so a further failure can be identified rather than
+inferred. Live drag and Mission Control smoothness remain unverified.

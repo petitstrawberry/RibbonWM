@@ -8,6 +8,7 @@ static void reply(NSDictionary *value) {
     NSData *data=[NSJSONSerialization dataWithJSONObject:value options:0 error:nil];
     fwrite(data.bytes,1,data.length,stdout);putchar('\n');fflush(stdout);
 }
+static id finiteNumber(double value) {return isfinite(value)?@(value):NSNull.null;}
 static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
     CGAffineTransform t={0};CGRect b=CGRectZero;
     CGError et=sky.getTransform(sky.connection(),wid,&t),eb=sky.getBounds(sky.connection(),wid,&b);
@@ -21,10 +22,10 @@ static NSDictionary *windowState(SkyLight sky,uint32_t wid) {
     for(NSDictionary *row in (__bridge NSArray *)list)if([row[(id)kCGWindowOwnerPID] intValue]==getpid())
         [order addObject:@{@"wid":row[(id)kCGWindowNumber],@"onscreen":row[(id)kCGWindowIsOnscreen]}];
     if(list)CFRelease(list);
-    return @{@"event":@"state",@"errors":@[@(et),@(eb)],@"transform":@[@(t.a),@(t.b),@(t.c),@(t.d),@(t.tx),@(t.ty)],
+    return @{@"event":@"state",@"errors":@[@(et),@(eb)],@"pid":@(ribbon_window_owner(wid)),@"transform":@[finiteNumber(t.a),finiteNumber(t.b),finiteNumber(t.c),finiteNumber(t.d),finiteNumber(t.tx),finiteNumber(t.ty)],
         @"order":order,
-        @"clip_error":@(ec),@"clip_bounds":@[@(clip.origin.x),@(clip.origin.y),@(clip.size.width),@(clip.size.height)],
-        @"frame":@{@"x":@(b.origin.x),@"y":@(b.origin.y),@"width":@(b.size.width),@"height":@(b.size.height)}};
+        @"clip_error":@(ec),@"clip_bounds":@[finiteNumber(clip.origin.x),finiteNumber(clip.origin.y),finiteNumber(clip.size.width),finiteNumber(clip.size.height)],
+        @"frame":@{@"x":finiteNumber(b.origin.x),@"y":finiteNumber(b.origin.y),@"width":finiteNumber(b.size.width),@"height":finiteNumber(b.size.height)}};
 }
 static NSDictionary *associatedState(SkyLight sky,uint32_t wid) {
     void *h=dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",RTLD_NOW);
@@ -259,7 +260,7 @@ int main(int argc,char **argv) {@autoreleasepool {
             if(region)sky.releaseRegion(region);
             [samples addObject:@{@"time":@(ribbon_input_time()),@"errors":@[@(et),@(eb)],
                 @"transform":@[@(transform.a),@(transform.b),@(transform.c),@(transform.d),@(transform.tx),@(transform.ty)],
-                @"clip_error":@(ec),@"clip_bounds":@[@(clip.origin.x),@(clip.origin.y),@(clip.size.width),@(clip.size.height)]}];usleep(2000);
+                @"clip_error":@(ec),@"clip_bounds":@[finiteNumber(clip.origin.x),finiteNumber(clip.origin.y),finiteNumber(clip.size.width),finiteNumber(clip.size.height)]}];usleep(2000);
         }
         reply(@{@"samples":samples});return 0;
     }

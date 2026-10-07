@@ -7,6 +7,12 @@ static void check(BOOL condition,const char *message) {
 static NSDictionary *rectangle(double x,double y,double width,double height) {
     return @{@"x":@(x),@"y":@(y),@"width":@(width),@"height":@(height)};
 }
+static CGError (*actualGetBounds)(int,uint32_t,CGRect *);
+static uint32_t nullBoundsID;
+static CGError transientNullBounds(int cid,uint32_t wid,CGRect *bounds) {
+    if(wid==nullBoundsID){*bounds=CGRectNull;return 0;}
+    return actualGetBounds(cid,wid,bounds);
+}
 int main(void) { @autoreleasepool {
     [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     [NSApp finishLaunching];
@@ -93,5 +99,23 @@ int main(void) { @autoreleasepool {
     check(fabs(released.tx+parentBounds.origin.x)<1&&fabs(released.ty+parentBounds.origin.y)<1,
         "overview uses current native position rather than an obsolete absolute snapshot");
     check([finish(request)[@"ok"] boolValue]&&saved.count==0,"release moved family without stale child snapshots");
-    [window removeChildWindow:child];[child close];[window close];return 0;
+    check([frame(request)[@"ok"] boolValue],"lease before child withdrawal");
+    [window removeChildWindow:child];[child orderOut:nil];
+    [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+    CGRect hiddenBounds;CGError hiddenError=sky.getBounds(sky.connection(),childID,&hiddenBounds);
+    printf("hidden child pid=%d bounds_error=%d bounds=(%g,%g,%g,%g)\n",ownerPID(childID),hiddenError,hiddenBounds.origin.x,hiddenBounds.origin.y,hiddenBounds.size.width,hiddenBounds.size.height);
+    check([frame(request)[@"ok"] boolValue],"child withdrawal does not terminate the root lease");
+    check(!restoreAll(),"withdrawn child leaves no stuck lease");
+    [window addChildWindow:child ordered:NSWindowAbove];[child orderFrontRegardless];
+    [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+    check([frame(request)[@"ok"] boolValue],"lease before transient null child bounds");
+    CGRect lastNative=saved[@(childID)].nativeBounds;
+    actualGetBounds=sky.getBounds;nullBoundsID=childID;sky.getBounds=transientNullBounds;
+    check(!restoreAll()&&saved.count==0&&!controller,"null child bounds cannot strand the controller lease");
+    sky.getBounds=actualGetBounds;
+    sky.getTransform(sky.connection(),childID,&childTransform);
+    check(fabs(childTransform.tx+lastNative.origin.x)<1&&fabs(childTransform.ty+lastNative.origin.y)<1,
+        "null bounds release uses last observed finite native position");
+    [window removeChildWindow:child];
+    [child close];[window close];return 0;
 } }
