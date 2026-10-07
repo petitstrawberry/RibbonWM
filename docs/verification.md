@@ -622,3 +622,14 @@ immediately, but a subsequent Dock restart and owner movement invalidated that
 static check, including surfaces reported at (0,0). That attempt is a failed
 recovery check, not successful desktop restoration. Normal quit and Dock restart
 must not be treated as proof of safe handoff to another WM.
+
+
+A second release after the final Dock restart left all eight affected surfaces
+with matching native/presentation origins. The recovery backend retained zero
+leases and both RibbonWM launchd services remained unloaded. A 30-second read-only
+trace included owner movements and Mission Control scaling; intermediate query
+mismatches are not a display-synchronized smoothness measurement. The user then
+confirmed normal dragging and release behavior under yabai. The recovery image
+remains idle in Dock: it was deliberately not removed through another restart,
+which had reproduced the corruption. Safe cleanup across a future Dock restart
+is still not established.
