@@ -514,27 +514,44 @@ static bool replaceIdleSocket(struct sockaddr_un *addr) {
     return ok&&!lstat(addr->sun_path,&after)&&before.st_dev==after.st_dev&&before.st_ino==after.st_ino&&!unlink(addr->sun_path);
 }
 
-__attribute__((constructor)) static void load(void) { @autoreleasepool {
-    // The payload must only be loaded into Dock; no arbitrary host mode.
-    if (![NSRunningApplication.currentApplication.bundleIdentifier isEqual:@"com.apple.dock"] || !loadSkyLight(&sky)) return;
-    void *h=dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",RTLD_NOW);
-    getOwner=dlsym(h,"SLSGetWindowOwner");connectionPID=dlsym(h,"SLSConnectionGetPID");
-    if(!getOwner||!connectionPID)return;
-    Dl_info image;
-    if(dladdr((void *)&load,&image)&&image.dli_fname)buildName=[[NSString stringWithUTF8String:image.dli_fname] lastPathComponent];
+static bool startServer(void) { @autoreleasepool {
     char directory[80]; snprintf(directory,sizeof(directory),"/tmp/ribbonwm-%u",getuid());
-    if (mkdir(directory,0700) && errno!=EEXIST) return;
+    if (mkdir(directory,0700) && errno!=EEXIST) return false;
     struct stat st;
-    if (lstat(directory,&st) || !S_ISDIR(st.st_mode) || st.st_uid!=getuid() || (st.st_mode&0777)!=0700) return;
+    if (lstat(directory,&st) || !S_ISDIR(st.st_mode) || st.st_uid!=getuid() || (st.st_mode&0777)!=0700) return false;
     struct sockaddr_un addr = {.sun_family=AF_UNIX};
     snprintf(addr.sun_path,sizeof(addr.sun_path),"%s/backend.sock",directory);
     int fd = socket(AF_UNIX,SOCK_STREAM,0);
-    if (fd<0) return;
-    if(!replaceIdleSocket(&addr)){close(fd);return;}
-    if (bind(fd,(struct sockaddr *)&addr,sizeof(addr)) || chmod(addr.sun_path,0600) || listen(fd,8)) { close(fd); return; }
+    if (fd<0) return false;
+    if(!replaceIdleSocket(&addr)){close(fd);return false;}
+    if (bind(fd,(struct sockaddr *)&addr,sizeof(addr)) || chmod(addr.sun_path,0600) || listen(fd,8)) { close(fd); return false; }
     saved = [NSMutableDictionary dictionary];stickySaved=[NSMutableDictionary dictionary];hasStickyAPI=loadStickyAPI(&stickyAPI);
     pthread_t thread;
-    if (pthread_create(&thread,NULL,server,(void *)(intptr_t)fd)) { close(fd); unlink(addr.sun_path); return; }
+    if (pthread_create(&thread,NULL,server,(void *)(intptr_t)fd)) { close(fd); unlink(addr.sun_path); return false; }
     pthread_detach(thread);
     NSLog(@"[RibbonWM] ready at %s (state resets after 2s without apply)",addr.sun_path);
+    return true;
+} }
+
+__attribute__((constructor)) static void load(void) { @autoreleasepool {
+    // NSRunningApplication can be incomplete during Dock startup. The host
+    // bundle identity is available before its workspace registration finishes.
+    if (![NSBundle.mainBundle.bundleIdentifier isEqual:@"com.apple.dock"]) return;
+    if(!loadSkyLight(&sky)){NSLog(@"[RibbonWM] required SkyLight API unavailable");return;}
+    void *h=dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",RTLD_NOW);
+    getOwner=dlsym(h,"SLSGetWindowOwner");connectionPID=dlsym(h,"SLSConnectionGetPID");
+    if(!getOwner||!connectionPID){NSLog(@"[RibbonWM] owner API unavailable");return;}
+    Dl_info image;
+    if(dladdr((void *)&load,&image)&&image.dli_fname)buildName=[[NSString stringWithUTF8String:image.dli_fname] lastPathComponent];
+    // dlopen invokes a constructor only once for this image. A transient socket
+    // handover failure must therefore retry here, not by injecting it again.
+    // Never replace another process's live socket or an active controller.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
+        for(unsigned attempt=0;attempt<40;attempt++) {
+            if(startServer())return;
+            if(attempt==0)NSLog(@"[RibbonWM] waiting for safe socket handover");
+            usleep(250000);
+        }
+        NSLog(@"[RibbonWM] listener initialization exhausted safe retries");
+    });
 } }

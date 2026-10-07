@@ -495,3 +495,13 @@ the fixture's AppKit event loop, which would perturb the AX responsiveness being
 measured. Candidate comparison and deployment results remain to be recorded.
 Only the built-in display is currently connected; multi-monitor revalidation is
 not covered by this run.
+
+
+During deployment the new payload image was mapped into Dock but did not open
+its listener. The same arm64e APIs passed the owned test. Startup now checks the
+host's main bundle (rather than relying on workspace registration being ready)
+and retries safe socket handover outside the constructor's loading thread.
+Loading this candidate into the existing Dock process started a zero-lease
+listener without restarting Dock. Native active-controller/non-socket handover
+regressions still pass. The exact original early-return branch was not recorded,
+so no narrower root-cause claim is made.
