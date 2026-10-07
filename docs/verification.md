@@ -610,3 +610,15 @@ Live Mission Control visual acceptance, arbitrary-app behavior and sustained
 frame pacing remain unverified. The previously deployed width-transition
 sampling still showed brief errors up to 500 points; those were not resolved by
 this checkpoint.
+
+### Shutdown and rollback failure
+
+Switching the development desktop back to yabai exposed a further serious defect:
+RibbonWM had exited normally, yet multiple surfaces retained presentation offsets
+relative to their physical frames. For example, a native frame at (24,55) was
+reported on screen at (-1048,1). Restarting Dock did not remove this state.
+An explicit owner-checked compositor release matched native/presented coordinates
+immediately, but a subsequent Dock restart and owner movement invalidated that
+static check, including surfaces reported at (0,0). That attempt is a failed
+recovery check, not successful desktop restoration. Normal quit and Dock restart
+must not be treated as proof of safe handoff to another WM.
