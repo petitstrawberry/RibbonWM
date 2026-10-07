@@ -10,6 +10,47 @@ real-window scrolling and clipping, but resize transitions, dragging, native
 activation and Mission Control still have visible failures. The final experimental
 Mission Control changes are committed without production visual acceptance.
 
+## Why this PoC exists
+
+**Scrolling real windows without rearranging your monitors to make room for
+hidden windows.** RibbonWM explores a compositor-level route to scrollable tiling:
+clip each window's drawing and input to its owning monitor, and keep the macOS
+display arrangement that matches your desk.
+
+- **No parking-induced monitor arrangement rules.** The clipping model does not
+  need an empty corner, a vertical-only arrangement or a staircase of displays.
+  Monitor rectangles retain their native positions, including negative origins
+  and vertical offsets. A column can extend beyond its viewport while its real
+  surface is clipped at that monitor's boundary.
+- **A scrolling strip on each existing native Space.** Keep using macOS Spaces;
+  each monitor/Space pair owns its own columns and scroll position. There is no
+  separate virtual-workspace layer to navigate.
+- **Live surfaces and clipped input.** The experiment operates on application
+  windows themselves, including their input regions, without captured-window
+  substitutes or a visible edge sliver used as a hiding workaround.
+- **Rust policy with a small privileged backend.** Layout and lifecycle remain in
+  Rust; Dock injection supplies the compositor operations that the experiment
+  depends on. This requires relaxed SIP restrictions and fragile private APIs.
+
+### Comparison of monitor placement approaches
+
+The following summarizes upstream documentation checked on **2026-10-07**.
+These projects offer much broader functionality; this comparison concerns the
+specific monitor-placement problem that motivated RibbonWM.
+
+| Project | Documented display arrangement considerations | RibbonWM's experimental approach |
+| --- | --- | --- |
+| [OmniWM](https://github.com/OmniNull/OmniWM#multi-monitor-setup) | Uses a technical staircase in macOS's display map and a separate desk-oriented routing map. | Uses the native display rectangles directly; no alternate routing map or staircase is required by the clipping model. |
+| [Paneru](https://github.com/karinushka/paneru#recommended-system-options) | Documents offscreen hiding, visible edge slivers, and placing additional displays above/below to avoid macOS relocating windows onto adjacent displays. | Clips the scrolled real surfaces to their monitor, without hiding them through edge parking. Native Space strips are shared ground with Paneru. |
+| [AeroSpace](https://nikitabobko.github.io/AeroSpace/guide#proper-monitor-arrangement) | Its emulated workspaces hide windows at bottom corners; every monitor needs a free bottom-left or bottom-right corner. | Keeps native Spaces and clips the scrolling viewport instead of reserving corners for hidden-workspace windows. |
+
+The design does not impose those offscreen-parking arrangement rules. Owned-window
+experiments exercised adjacent monitors, clipping/input at the seam and scrolling
+in both directions; coordinate tests include negative monitor origins. **Every
+possible monitor arrangement has not been certified**, and live display topology
+changes still need work. The serious drag, resize, overview and shutdown defects
+listed below limit practical use despite this architectural advantage.
+
 ## Approach
 
 RibbonWM manipulates real WindowServer surfaces through a small backend injected
