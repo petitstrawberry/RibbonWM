@@ -549,3 +549,21 @@ using that exact executable reported both permissions granted, while the older
 service did not. The service had zero managed leases and was relaunched once,
 then started immediately. This must not be reported as seamless permission
 resumption; refreshing stale permission state remains necessary.
+
+
+### Floating placement and stacking
+
+Entering explicit float centers the released window within the owning monitor's
+usable viewport and configured margins, then leases the native floating level
+for the root and explicit same-owner child windows. Disabling float restores
+their original levels; sticky-only mode does not change the level. Watchdog and
+normal finish also release level leases. Higher original application levels are
+preserved. Geometry release uses the saved AX/surface calibration so a settled
+native anchor is not misinterpreted as a chrome offset.
+
+78 Rust tests and Clippy pass. The owned native fixture verifies layer changes
+without geometry writes, ordinary-window raising leaves the float in front,
+parent/child restoration, idempotence, owner/controller checks, and restoring
+a pre-existing modal level. Centering is covered for a monitor above/left of
+the primary display and for an oversized surface. Dock service deployment and
+its live float/center transitions remain pending for this change.

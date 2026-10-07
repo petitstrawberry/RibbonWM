@@ -33,6 +33,8 @@ int main(void) { @autoreleasepool {
     void *library=dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",RTLD_NOW);
     getOwner=dlsym(library,"SLSGetWindowOwner");connectionPID=dlsym(library,"SLSConnectionGetPID");
     saved=[NSMutableDictionary dictionary];stickySaved=[NSMutableDictionary dictionary];
+    topmostSaved=[NSMutableDictionary dictionary];topmostRoots=[NSMutableDictionary dictionary];
+    hasLevelAPI=loadLevelAPI(&levelAPI);check(hasLevelAPI,"load native stacking API");
     NSWindow *window=[[NSWindow alloc] initWithContentRect:NSMakeRect(300,300,400,400)
         styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
     window.releasedWhenClosed=NO;[window orderFrontRegardless];[window displayIfNeeded];
@@ -205,6 +207,44 @@ int main(void) { @autoreleasepool {
     check(disabledUpdates==2&&enabledUpdates==2,"successful frame also balances display updates");
     sky.disableUpdates=actualDisableUpdates;sky.enableUpdates=actualEnableUpdates;
     check(!restoreAll(),"anchored fixture releases its lease");
+    int originalLevel=0,childLevel=0,level=0;
+    check(!levelAPI.get(sky.connection(),wid,&originalLevel)&&!levelAPI.get(sky.connection(),childID,&childLevel),"read original parent and child levels");
+    CGRect originalBounds;CGAffineTransform originalShown;sky.getBounds(sky.connection(),wid,&originalBounds);sky.getTransform(sky.connection(),wid,&originalShown);
+    NSDictionary *above=@{@"wid":@(wid),@"pid":@(getpid()),@"enabled":@YES};
+    check([setTopmost(above,@"owned-topmost-test")[@"ok"] boolValue],"floating family becomes topmost");
+    check(!levelAPI.get(sky.connection(),wid,&level)&&level==MAX(originalLevel,CGWindowLevelForKey(kCGFloatingWindowLevelKey)),"parent uses floating level");
+    check(!levelAPI.get(sky.connection(),childID,&level)&&level==MAX(childLevel,CGWindowLevelForKey(kCGFloatingWindowLevelKey)),"child stays above ordinary windows with its parent");
+    CGRect unchanged;CGAffineTransform shown;sky.getBounds(sky.connection(),wid,&unchanged);sky.getTransform(sky.connection(),wid,&shown);
+    check(CGRectEqualToRect(originalBounds,unchanged)&&CGAffineTransformEqualToTransform(originalShown,shown),"topmost never writes size or coordinates");
+    check(![handle(@{@"op":@"topmost",@"session":@"foreign",@"window":above})[@"ok"] boolValue],"foreign controller cannot change floating layers");
+    check(![setTopmost(@{@"wid":@(wid),@"pid":@(getpid()+1),@"enabled":@NO},@"owned-topmost-test")[@"ok"] boolValue],"changed owner rejected before level restore");
+    check([setTopmost(above,@"owned-topmost-test")[@"ok"] boolValue],"repeated float retains original level snapshot");
+    NSWindow *ordinary=[[NSWindow alloc] initWithContentRect:NSMakeRect(180,350,400,400) styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
+    ordinary.releasedWhenClosed=NO;[ordinary orderFrontRegardless];[ordinary displayIfNeeded];
+    [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+    CFArrayRef ordered=CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly|kCGWindowListExcludeDesktopElements,kCGNullWindowID);
+    NSInteger rootIndex=-1,normalIndex=-1,index=0;
+    for(NSDictionary *row in (__bridge NSArray *)ordered) {
+        uint32_t listedID=[row[(id)kCGWindowNumber] unsignedIntValue];
+        if(listedID==wid)rootIndex=index;if(listedID==(uint32_t)ordinary.windowNumber)normalIndex=index;index++;
+    }
+    if(ordered)CFRelease(ordered);
+    check(rootIndex>=0&&normalIndex>=0&&rootIndex<normalIndex,"floating stays in front after an ordinary window is raised");
+    [ordinary close];
+    check(stickySaved.count==0,"floating topmost does not add sticky membership");
+    check([setTopmost(@{@"wid":@(wid),@"pid":@(getpid()),@"enabled":@NO},@"owned-topmost-test")[@"ok"] boolValue],"unfloat restores family levels");
+    check(!levelAPI.get(sky.connection(),wid,&level)&&level==originalLevel,"parent original level restored");
+    check(!levelAPI.get(sky.connection(),childID,&level)&&level==childLevel,"child original level restored");
+    [window setLevel:NSModalPanelWindowLevel];
+    [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+    int modalLevel=0;check(!levelAPI.get(sky.connection(),wid,&modalLevel),"read existing higher application level");
+    check([setTopmost(above,@"owned-topmost-test")[@"ok"] boolValue],"higher-level application can float");
+    CGError levelError=levelAPI.get(sky.connection(),wid,&level);
+    printf("higher level snapshot=%d current=%d error=%d expected AppKit=%ld\n",modalLevel,level,levelError,(long)NSModalPanelWindowLevel);
+    check(!levelError&&level==MAX(modalLevel,CGWindowLevelForKey(kCGFloatingWindowLevelKey)),"floating preserves a pre-existing higher level");
+    check(!restoreAll()&&topmostSaved.count==0&&topmostRoots.count==0,"shutdown or watchdog restores all layer leases");
+    check(!levelAPI.get(sky.connection(),wid,&level)&&level==modalLevel,"shutdown preserves original application level");
+    [window setLevel:originalLevel];
     [window removeChildWindow:child];
     [child close];[window close];return 0;
 } }

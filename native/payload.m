@@ -1,4 +1,4 @@
-// Minimal Dock payload: transform and clipping only. No symbol-pattern scanning.
+// Minimal Dock payload: native geometry, clip, sticky and stacking leases.
 #import "skylight.h"
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -24,11 +24,15 @@
 static SkyLight sky;
 static NSMutableDictionary<NSNumber *, RibbonSavedWindowV4 *> *saved;
 static NSMutableDictionary<NSNumber *,NSDictionary *> *stickySaved;
+static NSMutableDictionary<NSNumber *,NSDictionary *> *topmostSaved;
+static NSMutableDictionary<NSNumber *,NSNumber *> *topmostRoots;
+static RibbonLevelAPI levelAPI;
+static bool hasLevelAPI;
 static RibbonStickyAPI stickyAPI;
 static bool hasStickyAPI;
 static NSUInteger controlledCount(void) {
     NSMutableSet *ids=[NSMutableSet setWithArray:saved.allKeys];
-    [ids addObjectsFromArray:stickySaved.allKeys];return ids.count;
+    [ids addObjectsFromArray:stickySaved.allKeys];[ids addObjectsFromArray:topmostSaved.allKeys];return ids.count;
 }
 static double lastUpdate;
 static NSString *controller;
@@ -91,7 +95,27 @@ static unsigned restoreSticky(NSSet<NSNumber *> *retained) {
     if(controlledCount()==0)controller=nil;
     return failed;
 }
-static unsigned restoreAll(void) {return restoreWindows([NSSet set])+restoreSticky([NSSet set]);}
+static unsigned restoreTopmost(NSSet<NSNumber *> *retained) {
+    unsigned failed=0;
+    for(NSNumber *wid in topmostSaved.allKeys) {
+        NSDictionary *old=topmostSaved[wid];NSNumber *root=old[@"root"];
+        if([retained containsObject:root])continue;
+        if(ownerPID(wid.unsignedIntValue)==[old[@"pid"] intValue]) {
+            int actual=0;
+            if(levelAPI.set(sky.connection(),wid.unsignedIntValue,[old[@"level"] intValue])||
+                levelAPI.get(sky.connection(),wid.unsignedIntValue,&actual)||actual!=[old[@"level"] intValue]){failed++;continue;}
+        }
+        [topmostSaved removeObjectForKey:wid];
+    }
+    for(NSNumber *root in topmostRoots.allKeys) {
+        if([retained containsObject:root])continue;
+        BOOL outstanding=NO;for(NSDictionary *old in topmostSaved.allValues)if([old[@"root"] isEqual:root])outstanding=YES;
+        if(!outstanding)[topmostRoots removeObjectForKey:root];
+    }
+    if(controlledCount()==0)controller=nil;
+    return failed;
+}
+static unsigned restoreAll(void) {return restoreWindows([NSSet set])+restoreSticky([NSSet set])+restoreTopmost([NSSet set]);}
 static void forgetWindow(uint32_t wid) {
     RibbonSavedWindowV4 *w=saved[@(wid)];
     if(w){sky.releaseRegion(w.clip);[saved removeObjectForKey:@(wid)];}
@@ -203,6 +227,47 @@ static NSArray *expandFamilies(NSArray *roots) {
     }
     return updates;
 }
+static NSDictionary *enforceTopmost(void) {
+    NSMutableSet *alive=[NSMutableSet set];
+    for(NSNumber *root in topmostRoots.allKeys) {
+        pid_t pid=[topmostRoots[root] intValue];uint32_t wid=root.unsignedIntValue;
+        if(ownerPID(wid)!=pid)continue;
+        [alive addObject:root];
+        NSDictionary *family=familyBounds(wid,pid);if(!family)return error(@"Cannot resolve floating window family");
+        NSMutableSet *ids=[NSMutableSet setWithArray:family.allKeys];[ids addObject:root];
+        for(NSNumber *id in ids) {
+            if(ownerPID(id.unsignedIntValue)!=pid)continue;
+            NSDictionary *old=topmostSaved[id];int actual=0;
+            if(levelAPI.get(sky.connection(),id.unsignedIntValue,&actual))return error(@"Cannot read floating window level");
+            if(old&&[old[@"pid"] intValue]!=pid){[topmostSaved removeObjectForKey:id];old=nil;}
+            if(!old) {
+                if(topmostSaved.count>=512)return error(@"At most 512 floating family surfaces");
+                old=@{@"pid":@(pid),@"root":root,@"level":@(actual)};topmostSaved[id]=old;
+            }
+            int target=MAX([old[@"level"] intValue],CGWindowLevelForKey(kCGFloatingWindowLevelKey));
+            if(actual!=target&&(levelAPI.set(sky.connection(),id.unsignedIntValue,target)||
+                levelAPI.get(sky.connection(),id.unsignedIntValue,&actual)||actual!=target))return error(@"Floating window level was not accepted");
+        }
+    }
+    return restoreTopmost(alive)?error(@"Cannot restore closed floating family"):@{@"ok":@YES};
+}
+static NSDictionary *setTopmost(NSDictionary *u,NSString *session) {
+    if(!hasLevelAPI)return error(@"Floating window level API unavailable");
+    if(!stickyDescriptor(u))return error(@"Invalid floating level descriptor");
+    NSNumber *root=u[@"wid"];pid_t pid=[u[@"pid"] intValue];
+    if(ownerPID(root.unsignedIntValue)!=pid)return error(@"Floating level owner changed");
+    if(topmostRoots[root]&&[topmostRoots[root] intValue]!=pid) {
+        NSMutableSet *retained=[NSMutableSet setWithArray:topmostRoots.allKeys];[retained removeObject:root];
+        if(restoreTopmost(retained))return error(@"Cannot release previous floating owner");
+    }
+    controller=session;lastUpdate=NSProcessInfo.processInfo.systemUptime;
+    if(![u[@"enabled"] boolValue]) {
+        NSMutableSet *retained=[NSMutableSet setWithArray:topmostRoots.allKeys];[retained removeObject:root];
+        return restoreTopmost(retained)?error(@"Cannot restore floating level"):@{@"ok":@YES};
+    }
+    if(!topmostRoots[root]&&topmostRoots.count>=128)return error(@"At most 128 floating roots");
+    topmostRoots[root]=@(pid);return enforceTopmost();
+}
 static NSDictionary *setSticky(NSDictionary *u,NSString *session) {
     if(!hasStickyAPI)return error(@"Sticky API unavailable");
     if(!stickyDescriptor(u))return error(@"Invalid sticky descriptor");
@@ -266,6 +331,7 @@ static NSDictionary *frame(NSDictionary *r) {
         NSDictionary *reply=setSticky(u,r[@"session"]);if(![reply[@"ok"] boolValue])return reply;
     }
     if(restoreWindows(ids))return error(@"Could not restore windows removed from the frame");
+    if(topmostRoots.count){NSDictionary *levels=enforceTopmost();if(![levels[@"ok"] boolValue])return levels;}
     controller=r[@"session"];
     for(NSDictionary *u in updates) {
         uint32_t wid=[u[@"wid"] unsignedIntValue];CGRect f,c;
@@ -421,13 +487,19 @@ static NSDictionary *handle(id r) {
         }
         return @{@"ok":@YES,@"leases":leases,@"idle_seconds":@(NSProcessInfo.processInfo.systemUptime-lastUpdate)};
     }
-    if([r[@"op"] isEqual:@"hello"])return @{@"ok":@YES,@"version":@2,@"capabilities":hasStickyAPI?@[@"sticky",@"interactive_clip",@"overview",@"finish",@"pointer_drag",@"window_groups",@"native_anchor",@"resize_anchor"]:@[@"interactive_clip",@"overview",@"finish",@"pointer_drag",@"window_groups",@"native_anchor",@"resize_anchor"],@"build":buildName?:@"",@"pid":@(getpid()),@"uid":@(getuid()),@"controlled":@(controlledCount())};
+    if([r[@"op"] isEqual:@"hello"]) {
+        NSMutableArray *capabilities=[@[@"interactive_clip",@"overview",@"finish",@"pointer_drag",@"window_groups",@"native_anchor",@"resize_anchor"] mutableCopy];
+        if(hasStickyAPI)[capabilities addObject:@"sticky"];
+        if(hasLevelAPI)[capabilities addObject:@"topmost"];
+        return @{@"ok":@YES,@"version":@2,@"capabilities":capabilities,@"build":buildName?:@"",@"pid":@(getpid()),@"uid":@(getuid()),@"controlled":@(controlledCount())};
+    }
     NSString *session=r[@"session"];
     if(![session isKindOfClass:NSString.class]||session.length==0||session.length>128)return error(@"Invalid session");
     if(controller&&![controller isEqual:session])return error(@"Another controller holds the lease");
     if([r[@"op"] isEqual:@"reset"]) {unsigned failed=restoreAll();return failed?error(@"Restore failed; watchdog will retry"):@{@"ok":@YES};}
     if([r[@"op"] isEqual:@"frame"])return frame(r);
     if([r[@"op"] isEqual:@"sticky"])return setSticky(r[@"window"],session);
+    if([r[@"op"] isEqual:@"topmost"])return setTopmost(r[@"window"],session);
     if([r[@"op"] isEqual:@"overview"])return overview();
     if([r[@"op"] isEqual:@"heartbeat"]) {lastUpdate=NSProcessInfo.processInfo.systemUptime;return @{@"ok":@YES};}
     if([r[@"op"] isEqual:@"finish"])return finish(r);
@@ -536,6 +608,7 @@ static bool startServer(void) { @autoreleasepool {
     if(!replaceIdleSocket(&addr)){close(fd);return false;}
     if (bind(fd,(struct sockaddr *)&addr,sizeof(addr)) || chmod(addr.sun_path,0600) || listen(fd,8)) { close(fd); return false; }
     saved = [NSMutableDictionary dictionary];stickySaved=[NSMutableDictionary dictionary];hasStickyAPI=loadStickyAPI(&stickyAPI);
+    topmostSaved=[NSMutableDictionary dictionary];topmostRoots=[NSMutableDictionary dictionary];hasLevelAPI=loadLevelAPI(&levelAPI);
     pthread_t thread;
     if (pthread_create(&thread,NULL,server,(void *)(intptr_t)fd)) { close(fd); unlink(addr.sun_path); return false; }
     pthread_detach(thread);

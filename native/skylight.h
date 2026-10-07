@@ -70,3 +70,28 @@ static inline bool readSticky(RibbonStickyAPI *s,int cid,uint32_t wid,bool *valu
     if(ok)*value=(s->tags(i)&(UINT64_C(1)<<11))!=0;
     if(i)CFRelease(i);CFRelease(q);return ok;
 }
+
+// Optional normal/floating window-level operations, independent of geometry.
+typedef struct {
+    CGError (*get)(int,uint32_t,int *);
+    CGError (*set)(int,uint32_t,int);
+} RibbonLevelAPI;
+// The legacy GetWindowLevel symbol can return stale values on newer macOS.
+// Use WindowServer's iterator, as with the existing sticky tag query.
+static inline CGError readWindowLevel(int cid,uint32_t wid,int *level) {
+    void *h=dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",RTLD_NOW);
+    CFTypeRef (*query)(int,CFArrayRef,int)=dlsym(h,"SLSWindowQueryWindows");
+    CFTypeRef (*iterator)(CFTypeRef)=dlsym(h,"SLSWindowQueryResultCopyWindows");
+    bool (*advance)(CFTypeRef)=dlsym(h,"SLSWindowIteratorAdvance");
+    int (*getLevel)(CFTypeRef)=dlsym(h,"SLSWindowIteratorGetLevel");
+    if(!query||!iterator||!advance||!getLevel)return kCGErrorFailure;
+    CFTypeRef q=query(cid,(__bridge CFArrayRef)@[@(wid)],1),i=q?iterator(q):NULL;
+    bool ok=i&&advance(i);if(ok)*level=getLevel(i);
+    if(i)CFRelease(i);if(q)CFRelease(q);return ok?kCGErrorSuccess:kCGErrorFailure;
+}
+static inline bool loadLevelAPI(RibbonLevelAPI *api) {
+    void *h=dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",RTLD_NOW);
+    if(!h)return false;
+    api->get=readWindowLevel;api->set=dlsym(h,"SLSSetWindowLevel");
+    return api->get&&api->set;
+}

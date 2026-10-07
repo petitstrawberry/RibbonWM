@@ -774,6 +774,17 @@ fn released_frame(engine: &Engine, monitor: &str, mut frame: Rect, index: usize)
         frame.height.min(inner.height),
     )
 }
+fn centered_floating_frame(engine: &Engine, monitor: &str, frame: Rect) -> Rect {
+    let mut frame = released_frame(engine, monitor, frame, 0);
+    let viewport = engine.monitors[monitor].viewport;
+    let x = viewport.x + engine.settings.left_margin();
+    let y = viewport.y + engine.settings.top_margin();
+    let width = viewport.width - engine.settings.left_margin() - engine.settings.right_margin();
+    let height = viewport.height - engine.settings.top_margin() - engine.settings.bottom_margin();
+    frame.x = x + (width - frame.width).max(0.0) / 2.0;
+    frame.y = y + (height - frame.height).max(0.0) / 2.0;
+    frame
+}
 fn synchronize(
     engine: &mut Engine,
     geometry: &mut GeometryLease,
@@ -1022,6 +1033,11 @@ fn set_mode(
     if !current.onscreen {
         bail!("Mode changes require a visible window");
     }
+    if next.floating != old.floating && !dry_run {
+        backend
+            .context("Dock backend required")?
+            .require_topmost()?;
+    }
     if matches!(kind, ModeKind::Sticky) && next.sticky != old.sticky && !dry_run {
         backend
             .context("Dock backend required")?
@@ -1046,21 +1062,57 @@ fn set_mode(
                     .context("Missing placement")?
                     .clone();
                 let shown = ribbon_macos::window_presentation(id, original.pid)?;
-                released.frame = released_frame(engine, &released.monitor, shown, 0);
+                released.frame = if next.floating && !old.floating {
+                    centered_floating_frame(engine, &released.monitor, shown)
+                } else {
+                    released_frame(engine, &released.monitor, shown, 0)
+                };
                 released.clip = Some(released.frame);
                 let owners: BTreeMap<WindowId, i32> = geometry
                     .originals
                     .iter()
                     .map(|(id, w)| (*id, w.pid))
                     .collect();
-                ribbon_macos::resize_window_observed(id, original.pid, released.frame, || {
+                backend.prepare_resize(
+                    &held,
+                    &owners,
+                    &sticky_leases(geometry),
+                    &monitor_viewports(engine),
+                    id,
+                    released.frame,
+                )?;
+                let mut resize = ribbon_macos::begin_resize_window(
+                    id,
+                    original.pid,
+                    released.frame,
+                    ribbon_macos::FrameCalibration {
+                        logical: *geometry
+                            .logical_originals
+                            .get(&id)
+                            .context("Missing floating calibration")?,
+                        surface: original.surface_bounds.unwrap_or(original.bounds),
+                    },
+                    || {
+                        if ribbon_macos::left_mouse_down() || !ribbon_macos::session_active() {
+                            bail!("Native interaction began during floating placement");
+                        }
+                        backend.frame_with_sticky_in_viewports(
+                            &held,
+                            &owners,
+                            &sticky_leases(geometry),
+                            &monitor_viewports(engine),
+                        )
+                    },
+                )?;
+                while !resize.poll()? {
                     backend.frame_with_sticky_in_viewports(
                         &held,
                         &owners,
                         &sticky_leases(geometry),
                         &monitor_viewports(engine),
-                    )
-                })?;
+                    )?;
+                    ribbon_macos::wait_for_events(0.005);
+                }
                 backend.detach(&released, original.pid)?;
             }
             engine.remove_window(id)?;
@@ -1085,6 +1137,23 @@ fn set_mode(
                 }
                 geometry.originals.insert(id, current);
             }
+        }
+        if !dry_run && next.floating && !old.floating && !before.window_ids().contains(&id) {
+            let shown = ribbon_macos::window_presentation(id, original.pid)?;
+            let displays = ribbon_macos::displays()?;
+            let display = display_for(&current, &displays).context("Missing floating monitor")?;
+            let monitor = &display.id;
+            let centered = centered_floating_frame(engine, monitor, shown);
+            ribbon_macos::resize_window(id, original.pid, centered)?;
+        }
+        if !dry_run && next.floating != old.floating {
+            backend
+                .context("Dock backend required")?
+                .set_topmost(&StickyWindow {
+                    wid: id.0,
+                    pid: original.pid,
+                    enabled: next.floating,
+                })?;
         }
         if let Some(backend) = backend {
             let owners = geometry
@@ -1119,6 +1188,16 @@ fn set_mode(
                 wid: id.0,
                 pid: original.pid,
                 enabled: old.sticky,
+            });
+        }
+        if next.floating != old.floating
+            && !dry_run
+            && let Some(backend) = backend
+        {
+            let _ = backend.set_topmost(&StickyWindow {
+                wid: id.0,
+                pid: original.pid,
+                enabled: old.floating,
             });
         }
         return Err(error);
@@ -1988,6 +2067,11 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                                 .get_mut(&p.window)
                                 .context("Missing window mode")?
                                 .floating = true;
+                            backend.set_topmost(&StickyWindow {
+                                wid: p.window.0,
+                                pid: w.pid,
+                                enabled: true,
+                            })?;
                             geometry.resized.remove(&p.window);
                             sizes.remove(&p.window);
                             let owners = geometry
@@ -2815,5 +2899,23 @@ mod tests {
             0,
         );
         assert_eq!(upper.y, -840.0); // Never clamp another monitor to global y=0.
+        let centered = centered_floating_frame(&engine, "above", upper);
+        assert_eq!(centered.width, 800.0);
+        assert_eq!(centered.height, 600.0);
+        assert_eq!(centered.x, -1200.0);
+        assert_eq!(centered.y, -733.5);
+        let oversized = centered_floating_frame(
+            &engine,
+            "above",
+            Rect {
+                width: 2000.0,
+                height: 1500.0,
+                ..upper
+            },
+        );
+        assert_eq!(oversized.x, -1576.0);
+        assert_eq!(oversized.y, -843.0);
+        assert_eq!(oversized.width, 1552.0);
+        assert_eq!(oversized.height, 819.0);
     }
 }

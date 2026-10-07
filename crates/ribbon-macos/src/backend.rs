@@ -90,6 +90,7 @@ pub struct Backend {
     sticky: Cell<bool>,
     interactive: Cell<bool>,
     lifecycle: Cell<bool>,
+    topmost: Cell<bool>,
 }
 impl Backend {
     pub fn connect() -> Result<Self> {
@@ -99,6 +100,7 @@ impl Backend {
             sticky: Cell::new(false),
             interactive: Cell::new(false),
             lifecycle: Cell::new(false),
+            topmost: Cell::new(false),
             session: format!(
                 "{}-{}-{}",
                 uid(),
@@ -119,6 +121,8 @@ impl Backend {
             bail!("Unexpected payload version or user");
         }
         b.version.set(status.version);
+        b.topmost
+            .set(status.capabilities.iter().any(|c| c == "topmost"));
         b.sticky
             .set(status.capabilities.iter().any(|s| s == "sticky"));
         b.interactive
@@ -179,6 +183,18 @@ impl Backend {
     }
     pub fn frame(&self, placements: &[Placement], owners: &BTreeMap<WindowId, i32>) -> Result<()> {
         self.frame_with_sticky(placements, owners, &[])
+    }
+    pub fn require_topmost(&self) -> Result<()> {
+        if !self.topmost.get() {
+            bail!("Reload the Dock backend: topmost capability is required");
+        }
+        Ok(())
+    }
+    pub fn set_topmost(&self, window: &StickyWindow) -> Result<()> {
+        self.require_topmost()?;
+        self.armed.set(true);
+        self.request("topmost", None, None, Some(window))?;
+        Ok(())
     }
     pub fn set_sticky(&self, window: &StickyWindow) -> Result<()> {
         if !self.sticky.get() {
