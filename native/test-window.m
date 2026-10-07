@@ -60,7 +60,7 @@ static NSDictionary *associatedState(SkyLight sky,uint32_t wid) {
 @property double refusedWidth;
 @end
 @implementation GeometryWindow
-- (BOOL)canBecomeKeyWindow {return NO;}
+- (BOOL)canBecomeKeyWindow {return YES;}
 - (void)setFrame:(NSRect)frame display:(BOOL)display {
     if(self.refusedWidth>0&&fabs(frame.size.width-self.refusedWidth)<2)frame.size.width+=80;
     [super setFrame:frame display:display];
@@ -199,6 +199,9 @@ static NSDictionary *associatedState(SkyLight sky,uint32_t wid) {
 }
 @end
 int main(int argc,char **argv) {@autoreleasepool {
+    if(argc==2&&!strcmp(argv[1],"--session-state")) {
+        printf("{\"session_active\":%s}\n",ribbon_session_active()?"true":"false");return 0;
+    }
     if(argc==3&&!strcmp(argv[1],"--associated")) {
         uint32_t wid=(uint32_t)strtoul(argv[2],NULL,10);SkyLight sky;
         if(!wid||!loadSkyLight(&sky))return 1;
@@ -327,7 +330,25 @@ int main(int argc,char **argv) {@autoreleasepool {
         if(!fixture){reply(@{@"error":@"Not a named fixture window"});return 1;}
         if(geometry) {
             RibbonRect rect={0};int error=ribbon_window_geometry((uint32_t)wid,(int)pid,&rect);
-            reply(@{@"geometry_error":@(error),@"geometry":@{@"x":@(rect.x),@"y":@(rect.y),@"width":@(rect.width),@"height":@(rect.height)}});return error?1:0;
+            uint32_t candidate=(uint32_t)wid;char *raw=ribbon_probe_application((int)pid,&candidate,1);
+            AXUIElementRef application=AXUIElementCreateApplication((pid_t)pid);CFTypeRef members=NULL;
+            AXUIElementSetMessagingTimeout(application,0.25);
+            AXError membershipError=AXUIElementCopyAttributeValue(application,kAXWindowsAttribute,&members);
+            CFIndex memberCount=members&&CFGetTypeID(members)==CFArrayGetTypeID()?CFArrayGetCount(members):-1;
+            NSMutableArray *memberIDs=[NSMutableArray array];
+            CGError (*identifier)(AXUIElementRef,uint32_t *)=dlsym(RTLD_DEFAULT,"_AXUIElementGetWindow");
+            if(memberCount>0)for(id member in (__bridge NSArray *)members) {
+                uint32_t memberID=0;CGError error=identifier?identifier((__bridge AXUIElementRef)member,&memberID):-1;
+                CFTypeRef role=NULL,title=NULL;
+                AXError re=AXUIElementCopyAttributeValue((__bridge AXUIElementRef)member,kAXRoleAttribute,&role);
+                AXError te=AXUIElementCopyAttributeValue((__bridge AXUIElementRef)member,kAXTitleAttribute,&title);
+                [memberIDs addObject:@{@"id":@(memberID),@"error":@(error),@"role_error":@(re),@"title_error":@(te),@"role":role?(__bridge id)role:NSNull.null,@"title":title?(__bridge id)title:NSNull.null}];
+                if(role)CFRelease(role);if(title)CFRelease(title);
+            }
+            if(members)CFRelease(members);CFRelease(application);
+            id probe=raw?[NSJSONSerialization JSONObjectWithData:[[NSString stringWithUTF8String:raw] dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil]:NSNull.null;
+            if(raw)ribbon_free(raw);
+            reply(@{@"geometry_error":@(error),@"membership_error":@(membershipError),@"member_count":@(memberCount),@"members":memberIDs,@"probe":probe?:NSNull.null,@"manageable":@(ribbon_window_manageable((uint32_t)wid,(int)pid)),@"geometry":@{@"x":@(rect.x),@"y":@(rect.y),@"width":@(rect.width),@"height":@(rect.height)}});return error?1:0;
         }
         if(restore) {
             double values[4];for(int i=0;i<4;i++) {

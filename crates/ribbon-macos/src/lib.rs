@@ -54,6 +54,8 @@ pub struct Application {
 
 unsafe extern "C" {
     fn ribbon_query_json(kind: i32) -> *mut c_char;
+    fn ribbon_session_active() -> i32;
+    fn ribbon_query_windows_json(ids: *const u32, count: usize) -> *mut c_char;
     fn ribbon_free(pointer: *mut c_void);
     fn ribbon_ax_trusted() -> i32;
     fn ribbon_wait_for_events(seconds: f64);
@@ -68,6 +70,16 @@ unsafe extern "C" {
         progress: extern "C" fn(*mut c_void) -> i32,
         context: *mut c_void,
     ) -> i32;
+    fn ribbon_resize_begin(
+        wid: u32,
+        pid: i32,
+        rect: Rect,
+        progress: extern "C" fn(*mut c_void) -> i32,
+        context: *mut c_void,
+        pending: *mut *mut c_void,
+    ) -> i32;
+    fn ribbon_settlement_poll(context: *mut c_void) -> i32;
+    fn ribbon_settlement_release(context: *mut c_void);
     fn ribbon_probe_application(pid: i32, candidates: *const u32, count: usize) -> *mut c_char;
     fn ribbon_window_geometry(wid: u32, pid: i32, rect: *mut Rect) -> i32;
     fn ribbon_window_presentation(wid: u32, pid: i32, rect: *mut Rect, surface: *mut Rect) -> i32;
@@ -87,6 +99,7 @@ unsafe extern "C" {
     fn ribbon_unwatch_application(pid: i32);
     fn ribbon_events() -> u32;
     fn ribbon_take_closed_windows(windows: *mut ClosedWindow, capacity: usize) -> usize;
+    fn ribbon_take_changed_windows(windows: *mut u32, capacity: usize) -> usize;
     fn ribbon_stop_observing();
 }
 
@@ -108,8 +121,33 @@ pub fn displays() -> Result<Vec<Display>> {
 pub fn windows() -> Result<Vec<Window>> {
     query(1)
 }
+/// Cheap metadata only. No per-window Space, tag, or physical-bounds queries.
+pub fn window_summaries() -> Result<Vec<Window>> {
+    query(3)
+}
+/// Resolve only Rust-selected candidates and existing leases, including hidden ones.
+pub fn window_details(ids: &[WindowId]) -> Result<Vec<Window>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<u32> = ids.iter().map(|id| id.0).collect();
+    // SAFETY: native borrows this initialized ID array only during the call.
+    let raw = unsafe { ribbon_query_windows_json(ids.as_ptr(), ids.len()) };
+    if raw.is_null() {
+        bail!("Selected window inventory unavailable");
+    }
+    // SAFETY: non-null native result is an owned NUL-terminated buffer.
+    let result = serde_json::from_slice(unsafe { CStr::from_ptr(raw) }.to_bytes());
+    // SAFETY: release the buffer once after the deserializer has copied it.
+    unsafe { ribbon_free(raw.cast()) };
+    result.context("Invalid selected window inventory")
+}
 pub fn applications() -> Result<Vec<Application>> {
     query(2)
+}
+pub fn session_active() -> bool {
+    // SAFETY: read-only session dictionary query with no retained caller data.
+    unsafe { ribbon_session_active() != 0 }
 }
 #[derive(Debug, Deserialize)]
 pub struct WindowProbe {
@@ -118,7 +156,7 @@ pub struct WindowProbe {
 }
 #[derive(Debug, Deserialize)]
 pub struct ApplicationProbe {
-    pub members: Vec<WindowId>,
+    pub members: Option<Vec<WindowId>>,
     pub ready: Vec<WindowProbe>,
 }
 /// Caller must filter excluded applications before any AX access. This probe
@@ -168,6 +206,12 @@ impl EventSource {
         // SAFETY: native writes at most capacity initialized value-only records.
         let count = unsafe { ribbon_take_closed_windows(windows.as_mut_ptr(), windows.len()) };
         windows[..count].to_vec()
+    }
+    pub fn changed_windows(&self) -> Vec<WindowId> {
+        let mut windows = [0u32; 256];
+        // SAFETY: main-thread queue drain writes at most capacity u32 IDs.
+        let count = unsafe { ribbon_take_changed_windows(windows.as_mut_ptr(), windows.len()) };
+        windows[..count].iter().copied().map(WindowId).collect()
     }
 }
 impl Drop for EventSource {
@@ -244,15 +288,10 @@ pub fn resize_window(id: WindowId, pid: i32, logical_frame: Rect) -> Result<()> 
 }
 /// Keep the compositor lease visible while the owner accepts AX geometry.
 /// Native glue reports progress synchronously; the caller owns placement policy.
-pub fn resize_window_observed(
-    id: WindowId,
-    pid: i32,
-    frame: Rect,
+fn geometry_progress(
     mut progress: impl FnMut() -> Result<()>,
+    invoke: impl FnOnce(extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32,
 ) -> Result<()> {
-    if !frame.valid() {
-        bail!("Invalid window dimensions");
-    }
     struct Progress<'a> {
         callback: &'a mut dyn FnMut() -> Result<()>,
         error: Option<anyhow::Error>,
@@ -280,23 +319,70 @@ pub fn resize_window_observed(
         callback: &mut progress,
         error: None,
     };
-    // SAFETY: the callback context lives through this synchronous native call.
-    let code = unsafe {
-        ribbon_resize_window_observed(
-            id.0,
-            pid,
-            frame,
-            tick,
-            (&mut state as *mut Progress<'_>).cast(),
-        )
-    };
+    let code = invoke(tick, (&mut state as *mut Progress<'_>).cast());
     if let Some(error) = state.error {
         return Err(error.context("Compositor update during AX resize failed"));
     }
     if code != 0 {
-        bail!("Accessibility resize for window {} failed ({code})", id.0);
+        bail!("Accessibility geometry update failed ({code})");
     }
     Ok(())
+}
+pub fn resize_window_observed(
+    id: WindowId,
+    pid: i32,
+    frame: Rect,
+    progress: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    if !frame.valid() {
+        bail!("Invalid window dimensions");
+    }
+    geometry_progress(progress, |tick, context| {
+        // SAFETY: progress context lives through this synchronous call.
+        unsafe { ribbon_resize_window_observed(id.0, pid, frame, tick, context) }
+    })
+}
+/// Owns a main-thread settlement check; AX writes have already acknowledged.
+/// Polling checks one sample and never sleeps waiting for a future frame.
+pub struct PendingResize {
+    raw: std::ptr::NonNull<c_void>,
+    _main_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl PendingResize {
+    pub fn poll(&mut self) -> Result<bool> {
+        // SAFETY: this owned context is live until Drop and stays on main.
+        match unsafe { ribbon_settlement_poll(self.raw.as_ptr()) } {
+            0 => Ok(false),
+            1 => Ok(true),
+            code => bail!("Native geometry did not settle ({code})"),
+        }
+    }
+}
+impl Drop for PendingResize {
+    fn drop(&mut self) {
+        // SAFETY: exactly one release of the owned native settlement context.
+        unsafe { ribbon_settlement_release(self.raw.as_ptr()) };
+    }
+}
+pub fn begin_resize_window(
+    id: WindowId,
+    pid: i32,
+    frame: Rect,
+    progress: impl FnMut() -> Result<()>,
+) -> Result<PendingResize> {
+    if !frame.valid() {
+        bail!("Invalid window dimensions");
+    }
+    let mut raw = std::ptr::null_mut();
+    geometry_progress(progress, |tick, context| {
+        // SAFETY: progress and output pointers live through the call; native
+        // transfers its settlement allocation only on success.
+        unsafe { ribbon_resize_begin(id.0, pid, frame, tick, context, &mut raw) }
+    })?;
+    Ok(PendingResize {
+        raw: std::ptr::NonNull::new(raw).context("Missing settlement context")?,
+        _main_thread: std::marker::PhantomData,
+    })
 }
 pub fn window_geometry(id: WindowId, pid: i32) -> Result<Rect> {
     let mut rect = Rect {

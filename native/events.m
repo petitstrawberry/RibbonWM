@@ -8,6 +8,7 @@ static NSMutableArray *workspaceObservers;
 static uint32_t pendingEvents;
 static CFMutableDictionaryRef watchedElements;
 static NSMutableDictionary<NSNumber *,NSDictionary *> *closedWindows;
+static NSMutableSet<NSNumber *> *changedWindows;
 static AXObserverRef dockObserver;
 static AXUIElementRef dockElement;
 static pid_t dockPID;
@@ -107,6 +108,10 @@ void ribbon_watch_ax_element(const void *element,int pid) {
 }
 static void notification(AXObserverRef observer,AXUIElementRef element,CFStringRef name,void *context) {
     (void)observer;
+    if(CFEqual(name,kAXCreatedNotification)||CFEqual(name,kAXWindowMovedNotification)||CFEqual(name,kAXWindowResizedNotification)) {
+        uint32_t wid=ribbon_ax_window_id(element);
+        if(wid){if(!changedWindows)changedWindows=[NSMutableSet set];[changedWindows addObject:@(wid)];}
+    }
     if(CFEqual(name,kAXFocusedWindowChangedNotification))pendingEvents|=RIBBON_EVENT_FOCUS;
     else if(CFEqual(name,kAXWindowMovedNotification)||CFEqual(name,kAXWindowResizedNotification))pendingEvents|=RIBBON_EVENT_GEOMETRY;
     else {
@@ -182,6 +187,14 @@ size_t ribbon_take_closed_windows(RibbonClosedWindow *windows,size_t capacity) {
     }
     return count;
 }
+size_t ribbon_take_changed_windows(uint32_t *windows,size_t capacity) {
+    size_t count=0;
+    for(NSNumber *wid in changedWindows.allObjects) {
+        if(count==capacity)break;
+        windows[count++]=wid.unsignedIntValue;[changedWindows removeObject:wid];
+    }
+    return count;
+}
 void ribbon_forget_watched_window(uint32_t wid) {
     if(!watchedElements)return;
     NSDictionary *entries=(__bridge NSDictionary *)watchedElements;
@@ -199,7 +212,7 @@ void ribbon_stop_observing(void) {
     for(NSNumber *pid in observers.allKeys)ribbon_unwatch_application(pid.intValue);
     for(id token in workspaceObservers)[NSWorkspace.sharedWorkspace.notificationCenter removeObserver:token];
     observers=nil;workspaceObservers=nil;pendingEvents=0;
-    if(watchedElements)CFRelease(watchedElements);watchedElements=NULL;closedWindows=nil;
+    if(watchedElements)CFRelease(watchedElements);watchedElements=NULL;closedWindows=nil;changedWindows=nil;
     if(dockObserver){CFRunLoopRemoveSource(CFRunLoopGetMain(),AXObserverGetRunLoopSource(dockObserver),kCFRunLoopDefaultMode);CFRelease(dockObserver);dockObserver=NULL;}
     if(dockElement)CFRelease(dockElement);dockElement=NULL;dockPID=0;
     __atomic_store_n(&overviewActive,0,__ATOMIC_RELEASE);__atomic_store_n(&overviewSignal,0,__ATOMIC_RELEASE);

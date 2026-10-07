@@ -60,7 +60,7 @@ static NSDictionary *rectJSON(CGRect r) {
 static BOOL usableBounds(CGRect r) {
     return rectJSON(r)!=nil&&r.size.width>0&&r.size.height>0;
 }
-char *ribbon_query_json(int kind) { @autoreleasepool {
+static char *queryJSON(int kind,CFArrayRef selected) { @autoreleasepool {
     resolve(); NSMutableArray *rows=[NSMutableArray array];
     if (kind==0) {
         NSArray<NSScreen *> *screens=NSScreen.screens;
@@ -96,7 +96,8 @@ char *ribbon_query_json(int kind) { @autoreleasepool {
                 [rows addObject:@{@"pid":@(app.processIdentifier),@"app":app.localizedName?:@"",@"bundle_id":app.bundleIdentifier?:@""}];
     } else {
         NSMutableDictionary<NSNumber *,NSString *> *bundles=[NSMutableDictionary dictionary];
-        CFArrayRef windows=CGWindowListCopyWindowInfo(kCGWindowListOptionAll|kCGWindowListExcludeDesktopElements,kCGNullWindowID);
+        CFArrayRef windows=selected?CFRetain(selected):CGWindowListCopyWindowInfo(kCGWindowListOptionAll|kCGWindowListExcludeDesktopElements,kCGNullWindowID);
+        if(!windows)return NULL;
         for (NSDictionary *w in (__bridge NSArray *)windows) {
             CGRect b; if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)w[(id)kCGWindowBounds],&b)) continue;
             NSDictionary *presented=rectJSON(b);
@@ -108,11 +109,11 @@ char *ribbon_query_json(int kind) { @autoreleasepool {
                 bundle=[NSRunningApplication runningApplicationWithProcessIdentifier:owner.intValue].bundleIdentifier?:@"";
                 bundles[owner]=bundle;
             }
-            CFArrayRef spaces=connection&&windowSpaces?windowSpaces(connection(),7,(__bridge CFArrayRef)@[@(wid)]):NULL;
+            CFArrayRef spaces=kind!=3&&connection&&windowSpaces?windowSpaces(connection(),7,(__bridge CFArrayRef)@[@(wid)]):NULL;
             bool sticky=false;
-            bool stickyKnown=hasStickyAPI&&connection&&readSticky(&stickyAPI,connection(),wid,&sticky);
+            bool stickyKnown=kind!=3&&hasStickyAPI&&connection&&readSticky(&stickyAPI,connection(),wid,&sticky);
             CGRect surface=CGRectNull;
-            id physical=surfaceBounds&&connection&&!surfaceBounds(connection(),wid,&surface)?rectJSON(surface):nil;
+            id physical=kind!=3&&surfaceBounds&&connection&&!surfaceBounds(connection(),wid,&surface)?rectJSON(surface):nil;
             [rows addObject:@{@"id":@(wid),@"pid":w[(id)kCGWindowOwnerPID]?:@0,@"app":w[(id)kCGWindowOwnerName]?:@"",
                 @"title":w[(id)kCGWindowName]?:@"",@"layer":w[(id)kCGWindowLayer]?:@0,@"onscreen":[w[(id)kCGWindowIsOnscreen] boolValue]?@YES:@NO,
                 @"bundle_id":bundle,
@@ -129,7 +130,25 @@ char *ribbon_query_json(int kind) { @autoreleasepool {
     if(!json)return NULL;
     char *result=malloc(json.length+1);if(!result)return NULL;memcpy(result,json.bytes,json.length);result[json.length]=0;return result;
 } }
+char *ribbon_query_json(int kind) {return queryJSON(kind,NULL);}
+char *ribbon_query_windows_json(const uint32_t *ids,size_t count) { @autoreleasepool {
+    // CGWindowList arrays contain raw CGWindowID values, not CFNumbers.
+    CFMutableArrayRef numbers=CFArrayCreateMutable(NULL,(CFIndex)count,NULL);
+    for(size_t i=0;i<count;i++)CFArrayAppendValue(numbers,(const void *)(uintptr_t)ids[i]);
+    CFArrayRef descriptions=CGWindowListCreateDescriptionFromArray(numbers);CFRelease(numbers);
+    if(!descriptions)return NULL;
+    char *result=queryJSON(1,descriptions);CFRelease(descriptions);return result;
+} }
 void ribbon_free(void *pointer) {free(pointer);}
+static BOOL activeSession(NSDictionary *session) {
+    return session && [session[(__bridge NSString *)kCGSessionOnConsoleKey] boolValue] &&
+        ![session[@"CGSSessionScreenIsLocked"] boolValue];
+}
+int ribbon_session_active(void) { @autoreleasepool {
+    CFDictionaryRef session=CGSessionCopyCurrentDictionary();
+    BOOL active=activeSession((__bridge NSDictionary *)session);
+    if(session)CFRelease(session);return active;
+} }
 int ribbon_ax_trusted(void) { @autoreleasepool {
     // Refresh without reopening the asynchronous permission prompt.
     NSDictionary *options=@{(__bridge NSString *)kAXTrustedCheckOptionPrompt:@NO};
@@ -204,18 +223,20 @@ static AXError axGeometry(AXUIElementRef window,RibbonRect *rect) {
 // Read-only discovery/membership probe. Runs on the inventory worker and
 // deliberately does not touch the main-thread AX cache or observer tables.
 char *ribbon_probe_application(int pid,const uint32_t *candidates,size_t count) { @autoreleasepool {
+    if(!ribbon_session_active())return NULL;
     resolve();if(pid<=0||!axWindowId||count>512)return NULL;
     AXUIElementRef app=AXUIElementCreateApplication(pid);CFTypeRef windows=NULL;
     AXUIElementSetMessagingTimeout(app,0.05);
     AXError error=AXUIElementCopyAttributeValue(app,kAXWindowsAttribute,&windows);CFRelease(app);
     if(error||!windows||CFGetTypeID(windows)!=CFArrayGetTypeID()){if(windows)CFRelease(windows);return NULL;}
     NSMutableArray *members=[NSMutableArray array],*ready=[NSMutableArray array];
+    BOOL complete=YES;
     SkyLight sky;BOOL hasSky=loadSkyLight(&sky);
     for(id object in (__bridge NSArray *)windows) {
         AXUIElementRef w=(__bridge AXUIElementRef)object;uint32_t wid=0;
         AXUIElementSetMessagingTimeout(w,0.05);
         // An incomplete enumeration cannot prove that an old window closed.
-        if(axWindowId(w,&wid)||!wid){CFRelease(windows);return NULL;}
+        if(axWindowId(w,&wid)||!wid){complete=NO;continue;}
         [members addObject:@(wid)];BOOL candidate=NO;
         for(size_t i=0;i<count;i++)if(candidates[i]==wid){candidate=YES;break;}
         if(!candidate||ribbon_window_owner(wid)!=pid)continue;
@@ -235,7 +256,7 @@ char *ribbon_probe_application(int pid,const uint32_t *candidates,size_t count) 
         [ready addObject:@{@"id":@(wid),@"geometry":rectJSON(r)}];
     }
     CFRelease(windows);
-    NSData *data=[NSJSONSerialization dataWithJSONObject:@{@"members":members,@"ready":ready} options:0 error:nil];
+    NSData *data=[NSJSONSerialization dataWithJSONObject:@{@"members":complete?members:NSNull.null,@"ready":ready} options:0 error:nil];
     if(!data)return NULL;char *result=malloc(data.length+1);if(!result)return NULL;
     memcpy(result,data.bytes,data.length);result[data.length]=0;return result;
 } }
@@ -254,46 +275,78 @@ int ribbon_window_presentation(uint32_t wid,int expected_pid,RibbonRect *rect,Ri
     *rect=(RibbonRect){-transform.tx,-transform.ty,bounds.size.width,bounds.size.height};
     *surface=(RibbonRect){bounds.origin.x,bounds.origin.y,bounds.size.width,bounds.size.height};return 0;
 }
-static int settleWindow(AXUIElementRef window,uint32_t wid,RibbonRect rect,RibbonRect outer,BOOL exactPosition,RibbonGeometryProgress progress,void *context) {
-    // AX replies can precede the owner's WindowServer move transaction. That
-    // transaction translates the current transform relatively: resetting the
-    // compositor before it arrives would apply the original offset twice.
+typedef struct {
+    AXUIElementRef window;
+    CFTypeRef guard;
+    uint32_t wid;
+    pid_t pid;
+    RibbonRect rect,outer;
+    BOOL exactPosition,havePrevious;
+    CGAffineTransform previous;
+    double deadline,stable;
+} RibbonSettlement;
+static RibbonSettlement *newSettlement(AXUIElementRef window,uint32_t wid,RibbonRect rect,RibbonRect outer,BOOL exactPosition) {
+    RibbonSettlement *state=calloc(1,sizeof(*state));if(!state)return NULL;
+    state->window=(AXUIElementRef)CFRetain(window);AXUIElementGetPid(window,&state->pid);
+    AXUIElementSetMessagingTimeout(window,0.01);
+    state->wid=wid;state->rect=rect;state->outer=outer;
+    state->exactPosition=exactPosition;state->deadline=NSProcessInfo.processInfo.systemUptime+0.5;return state;
+}
+void ribbon_settlement_release(void *context) {
+    RibbonSettlement *state=context;if(!state)return;
+    AXUIElementSetMessagingTimeout(state->window,0.25);
+    CFRelease(state->window);if(state->guard)CFRelease(state->guard);free(state);
+}
+// Pure temporal check: every invalid sample resets the stable interval.
+static int sampleSettlement(RibbonSettlement *state,BOOL matches,CGAffineTransform transform,double now) {
+    if(now>=state->deadline)return kAXErrorCannotComplete;
+    if(matches&&state->havePrevious&&CGAffineTransformEqualToTransform(transform,state->previous)) {
+        if(!state->stable)state->stable=now;
+        if(now-state->stable>=0.05)return 1;
+    } else state->stable=0;
+    state->previous=transform;state->havePrevious=matches;
+    return 0;
+}
+int ribbon_settlement_poll(void *context) { @autoreleasepool {
+    RibbonSettlement *state=context;if(!state)return kAXErrorIllegalArgument;
+    if(!ribbon_session_active()||ribbon_left_mouse_down())return kAXErrorCannotComplete;
+    if(ribbon_window_owner(state->wid)!=state->pid)return kAXErrorInvalidUIElement;
     SkyLight sky;if(!loadSkyLight(&sky))return kAXErrorFailure;
-    double deadline=NSProcessInfo.processInfo.systemUptime+0.5,stable=0;
-    CGAffineTransform previous={0};BOOL havePrevious=NO;
-    do {
-        if(progress&&progress(context))return kAXErrorFailure;
-        CGRect bounds;CGAffineTransform transform;
-        CGError eb=sky.getBounds(sky.connection(),wid,&bounds),et=sky.getTransform(sky.connection(),wid,&transform);
-        if(eb||et||!usableBounds(bounds))return kAXErrorCannotComplete;
-        RibbonRect logical={0};AXError ax=axGeometry(window,&logical);
-        if(ax)return ax;
-        // AX positions need not equal SLS bounds (Chrome titlebar offsets).
-        // Verify the owner's position in the coordinate system we wrote.
-        BOOL position=fabs(logical.x-rect.x)<=2&&fabs(logical.y-rect.y)<=2;
-        if(!exactPosition) {
-            // AppKit may constrain the logical anchor. Visual placement belongs
-            // to Dock, so accept a stable anchor inside the intended display.
-            for(NSScreen *screen in NSScreen.screens) {
-                CGRect display=CGDisplayBounds([screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue]);
-                if(CGRectContainsPoint(display,CGPointMake(rect.x,rect.y))) {
-                    position=CGRectContainsPoint(display,CGPointMake(logical.x,logical.y));break;
-                }
+    CGRect bounds;CGAffineTransform transform;
+    CGError eb=sky.getBounds(sky.connection(),state->wid,&bounds),et=sky.getTransform(sky.connection(),state->wid,&transform);
+    if(eb||et||!usableBounds(bounds))return kAXErrorCannotComplete;
+    RibbonRect logical={0};AXError ax=axGeometry(state->window,&logical);
+    if(ax) {
+        state->stable=0;state->havePrevious=NO;
+        return ax==kAXErrorCannotComplete&&NSProcessInfo.processInfo.systemUptime<state->deadline?0:ax;
+    }
+    // AX positions need not equal SLS bounds (Chrome titlebar offsets).
+    // Verify the owner's position in the coordinate system we wrote.
+    BOOL position=fabs(logical.x-state->rect.x)<=2&&fabs(logical.y-state->rect.y)<=2;
+    if(!state->exactPosition) {
+        // AppKit may constrain the logical anchor. Visual placement belongs
+        // to Dock, so accept a stable anchor inside the intended display.
+        for(NSScreen *screen in NSScreen.screens) {
+            CGRect display=CGDisplayBounds([screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue]);
+            if(CGRectContainsPoint(display,CGPointMake(state->rect.x,state->rect.y))) {
+                position=CGRectContainsPoint(display,CGPointMake(logical.x,logical.y));break;
             }
         }
-        BOOL matches=position&&fabs(logical.width-rect.width)<=2&&fabs(logical.height-rect.height)<=2&&
-            fabs(bounds.size.width-outer.width)<=2&&fabs(bounds.size.height-outer.height)<=2;
-        double now=NSProcessInfo.processInfo.systemUptime;
-        if(matches&&havePrevious&&CGAffineTransformEqualToTransform(transform,previous)) {
-            if(!stable)stable=now;
-            if(now-stable>=0.05)return 0;
-        } else stable=0;
-        previous=transform;havePrevious=YES;usleep(5000);
-    } while(NSProcessInfo.processInfo.systemUptime<deadline);
-    CGRect finalBounds=CGRectZero;sky.getBounds(sky.connection(),wid,&finalBounds);
-    fprintf(stderr,"Window %u did not settle: requested=(%.1f,%.1f,%.1f,%.1f), native=(%.1f,%.1f,%.1f,%.1f)\n",
-        wid,rect.x,rect.y,rect.width,rect.height,finalBounds.origin.x,finalBounds.origin.y,finalBounds.size.width,finalBounds.size.height);
-    return kAXErrorCannotComplete;
+    }
+    BOOL matches=position&&fabs(logical.width-state->rect.width)<=2&&fabs(logical.height-state->rect.height)<=2&&
+        fabs(bounds.size.width-state->outer.width)<=2&&fabs(bounds.size.height-state->outer.height)<=2;
+    return sampleSettlement(state,matches,transform,NSProcessInfo.processInfo.systemUptime);
+} }
+static int settleWindow(AXUIElementRef window,uint32_t wid,RibbonRect rect,RibbonRect outer,BOOL exactPosition,RibbonGeometryProgress progress,void *context) {
+    RibbonSettlement *state=newSettlement(window,wid,rect,outer,exactPosition);
+    if(!state)return kAXErrorFailure;
+    int result;
+    do {
+        if(progress&&progress(context)){result=kAXErrorFailure;break;}
+        result=ribbon_settlement_poll(state);
+        if(!result)usleep(5000);
+    } while(!result);
+    ribbon_settlement_release(state);return result==1?0:result;
 }
 static AXError acceptedSize(AXUIElementRef window,CGSize expected,CGSize *accepted,RibbonGeometryProgress progress,void *context) {
     double deadline=NSProcessInfo.processInfo.systemUptime+0.25;
@@ -308,7 +361,8 @@ static AXError acceptedSize(AXUIElementRef window,CGSize expected,CGSize *accept
         usleep(5000);
     }
 }
-static int resizeWindow(uint32_t wid,int expected_pid,RibbonRect target,BOOL logicalTarget,RibbonGeometryProgress progress,void *context) { @autoreleasepool {
+static int resizeWindow(uint32_t wid,int expected_pid,RibbonRect target,BOOL logicalTarget,RibbonGeometryProgress progress,void *context,void **pending) { @autoreleasepool {
+    if(!ribbon_session_active())return kAXErrorCannotComplete;
     pid_t pid=0;AXUIElementRef w=findAXWindow(wid,expected_pid,&pid);if(!w)return kAXErrorInvalidUIElement;
     __attribute__((objc_precise_lifetime)) RibbonAXFrameGuard *guard=[[RibbonAXFrameGuard alloc] initWithPID:pid];
     (void)guard;
@@ -349,21 +403,28 @@ static int resizeWindow(uint32_t wid,int expected_pid,RibbonRect target,BOOL log
     if(!error&&(fabs(after.x-position.x)>2||fabs(after.y-position.y)>2))error=AXUIElementSetAttributeValue(w,kAXPositionAttribute,p);
     CFRelease(p);
     if(error)fprintf(stderr,"Window %u AX resize failed (%d): requested=(%.1f,%.1f), accepted=(%.1f,%.1f)\n",wid,error,size.width,size.height,accepted.width,accepted.height);
-    if(!error)error=settleWindow(w,wid,rect,outer,NO,progress,context);
+    if(!error&&pending) {
+        RibbonSettlement *state=newSettlement(w,wid,rect,outer,NO);
+        if(state){state->guard=CFBridgingRetain(guard);*pending=state;}
+        else error=kAXErrorFailure;
+    } else if(!error)error=settleWindow(w,wid,rect,outer,NO,progress,context);
     CFRelease(w);return error;
 } }
+int ribbon_resize_begin(uint32_t wid,int expected_pid,RibbonRect rect,RibbonGeometryProgress progress,void *context,void **pending) {
+    *pending=NULL;return resizeWindow(wid,expected_pid,rect,NO,progress,context,pending);
+}
 int ribbon_resize_window(uint32_t wid,int expected_pid,RibbonRect rect) {
     return ribbon_resize_window_observed(wid,expected_pid,rect,NULL,NULL);
 }
 int ribbon_resize_window_observed(uint32_t wid,int expected_pid,RibbonRect rect,RibbonGeometryProgress progress,void *context) {
-    int error=resizeWindow(wid,expected_pid,rect,NO,progress,context);
+    int error=resizeWindow(wid,expected_pid,rect,NO,progress,context,NULL);
     // Owner-side chrome can change its inset during the first resize. Measure
     // it again once; a genuine minimum-size refusal still remains an error.
-    if(error==kAXErrorCannotComplete)error=resizeWindow(wid,expected_pid,rect,NO,progress,context);
+    if(error==kAXErrorCannotComplete)error=resizeWindow(wid,expected_pid,rect,NO,progress,context,NULL);
     return error;
 }
 int ribbon_restore_window(uint32_t wid,int expected_pid,RibbonRect rect) { @autoreleasepool {
-    int resized=resizeWindow(wid,expected_pid,rect,YES,NULL,NULL);if(resized)return resized;
+    int resized=resizeWindow(wid,expected_pid,rect,YES,NULL,NULL,NULL);if(resized)return resized;
     pid_t pid=0;AXUIElementRef w=findAXWindow(wid,expected_pid,&pid);if(!w)return kAXErrorInvalidUIElement;
     // Reapply the exact original position only after the size has settled, so
     // AppKit doesn't constrain it against the larger managed size.

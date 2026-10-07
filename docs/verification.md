@@ -312,3 +312,41 @@ It never replaces or stops the service. The installed `ff30cf9` baseline measure
 creation, but does not reproduce the reported focus-size jitter. Updated runtime
 results must be recorded separately; passing unit tests cannot establish physical
 drag stability.
+
+### Selective discovery and polled settlement (candidate, not deployed)
+
+The installed `730acf5` baseline measured create/enrollment times of
+267.0–320.7 ms (five cycles; median 306.7 ms), removals of 15.7–51.7 ms,
+and unchanged 400×1362 native dimensions over 370 focus/scroll samples with
+zero new native resize requests. These are fixture measurements, not a claim
+that arbitrary application drag or Mission Control behavior is stable.
+
+A five-second service sample identified per-surface Space, sticky and bounds
+queries in the inventory worker. A read-only native comparison on this desktop
+measured full metadata for 550 surfaces at 26.36–59.85 ms; the cheap summary plus
+seven selected detailed rows took approximately 9–10 ms. This is only metadata
+query timing, not end-to-end creation latency.
+
+The candidate adds selected-window queries, targeted event IDs, four independent
+AX probe workers, partial application results, unknown incomplete membership,
+and generation rejection. Size settlement now returns a main-thread handle and
+is polled across frames; changed columns publish all rows together. Regression
+coverage includes a blocked app alongside a ready app, stale partial/final
+inventory, valid candidates from incomplete membership, stacked-row publication,
+and settlement restart on transform/size changes or invalid samples.
+
+The Mac was locked during subsequent enrollment attempts. CUA explicitly
+reported the lock, and an isolated read-only AX probe returned an AXApplication
+placeholder from AXWindows. Those failed attempts are **not** valid unlocked
+creation timing runs. No production service was stopped/reset for this
+investigation. GUI verification is pending manual unlock; the candidate has
+not replaced the installed service.
+
+`smoke-live-pipeline.py` now checks session state before creating owned windows
+and on every wait. Twenty create/remove cycles measure `presented_windows` when
+available, rather than reporting early enrollment as completed layout. Old
+release measurements are labelled `enrolled`. The script does not stop or
+replace the running WM. Live acceptance still requires that run, owned-window
+physical drag/resize, floating transitions, native Space/Mission Control return,
+and multi-monitor clipping checks. The synchronous initial AX acceptance and
+next-batch probe wait remain explicit limitations.

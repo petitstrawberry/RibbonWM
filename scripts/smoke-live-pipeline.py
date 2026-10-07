@@ -22,6 +22,10 @@ def cli(*args):
 
 def main():
     assert os.environ.get("IN_NIX_SHELL")
+    def session_active():
+        return json.loads(subprocess.check_output([str(HELPER), "--session-state"], timeout=3))["session_active"]
+
+    assert session_active(), "Unlock the Mac before running live GUI verification"
     assert cli("status")["mode"] == "live"
     fixture = subprocess.Popen([str(HELPER), "--fixture", json.dumps(dict(
         regular=True, geometry_test=True, backdrops=[], lifetime=120,
@@ -41,6 +45,7 @@ def main():
     def wait(predicate):
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
+            assert session_active(), "Session locked during measurement"
             status = cli("status")
             assert not status["native_overview"], "Mission Control interrupted measurement"
             if predicate(status):
@@ -51,29 +56,40 @@ def main():
     def exists(status, wid):
         return any(p["window"] == wid for p in status["placements"])
 
+    def presented(status, wid):
+        # Old releases expose no presentation acknowledgement; their historical
+        # timings measure enrollment only and must remain labelled accordingly.
+        return (wid in status["presented_windows"] if "presented_windows" in status
+                else exists(status, wid))
+
+    wid = None
     try:
         ready = read()
         assert ready.get("ready"), ready
         wid, pid = ready["wid"], ready["pid"]
         owned.add(wid)
         command("present")
-        wait(lambda s: exists(s, wid))
-        creations, removals = [], []
-        for _ in range(5):
+        wait(lambda s: presented(s, wid))
+        creations, removals, creation_commands, enrollments = [], [], [], []
+        for _ in range(int(os.environ.get("RIBBONWM_QA_CYCLES", "20"))):
             started = time.monotonic()
             child = command("new")["created"]
+            created = time.monotonic()
             owned.add(child)
-            wait(lambda s: exists(s, child))
+            wait(lambda s: presented(s, child))
             creations.append(round((time.monotonic() - started) * 1000, 1))
+            creation_commands.append(round((created - started) * 1000, 1))
+            enrollments.append(round((time.monotonic() - created) * 1000, 1))
             started = time.monotonic()
             command("close-new")
             wait(lambda s: not exists(s, child))
             removals.append(round((time.monotonic() - started) * 1000, 1))
-        print(json.dumps(dict(create_ms=creations, remove_ms=removals)), flush=True)
+        print(json.dumps(dict(completion="presented" if "presented_windows" in cli("status") else "enrolled", create_ms=creations, remove_ms=removals,
+                              app_creation_ms=creation_commands, after_creation_ms=enrollments)), flush=True)
 
         child = command("new")["created"]
         owned.add(child)
-        status = wait(lambda s: exists(s, child))
+        status = wait(lambda s: presented(s, child))
         monitor = next(p["monitor"] for p in status["placements"] if p["window"] == wid)
         time.sleep(.4)
         requests_before = cli("status").get("native_size_requests")
@@ -103,6 +119,15 @@ def main():
             requests_after = cli("status")["native_size_requests"]
             assert requests_after == requests_before, (requests_before, requests_after)
             print("PASS: focus/scroll issued zero native size requests", flush=True)
+    except Exception:
+        if fixture.poll() is None and wid is not None and session_active():
+            probe = subprocess.run([str(HELPER), "--geometry-fixture", str(wid), str(fixture.pid)],
+                                   capture_output=True, text=True, timeout=3)
+            print("Fixture AX diagnostic:", probe.stdout, probe.stderr, flush=True)
+            print(json.dumps(dict(fixture=command("state"),
+                                  windows=[w for w in cli("windows") if w["pid"] == fixture.pid],
+                                  daemon=cli("status"))), flush=True)
+        raise
     finally:
         if fixture.poll() is None:
             fixture.stdin.write('{"op":"quit"}\n')

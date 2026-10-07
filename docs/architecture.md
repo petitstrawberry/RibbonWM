@@ -10,7 +10,7 @@ Each placement contains an absolute frame and its intersection with the owning m
 
 All retained native Space contexts remain in compositor frames. Switching native Space changes the selected layout without restoring or resizing windows in the old Space; macOS controls visibility. Off-Space animation is frozen and resumes on return. Existing sizes and compositor snapshots remain leased until normal exit, window removal or watchdog expiry. Contexts live in memory only.
 
-`Scroll` supports an analytical critically damped spring and timed quadratic easing. The service uses PaperWM's 0.25-second ease-in-out curve and configurable usable-width ratios (0.38195, 0.5, 0.61804). Retargeting starts from the displayed position. AX batches retain committed placements for unchanged windows and temporarily hide changed surfaces until their owners settle. Animation time excludes AX stalls. Native multi-window transactions and display synchronization are not implemented; applying updates sequentially and briefly hiding a changed surface can still produce a blink.
+`Scroll` supports an analytical critically damped spring and timed quadratic easing. The service uses PaperWM's 0.25-second ease-in-out curve and configurable usable-width ratios (0.38195, 0.5, 0.61804). Retargeting starts from the displayed position. Native size acceptance and compositor placement have separate state. Resize settlement is polled on subsequent frames; every row of an affected column retains its committed presentation until the column is ready. Independent columns can animate while that settlement is pending. Ordinary focus and scrolling do not request native size changes. The initial AX write/acceptance and explicit detach/restore paths remain synchronous; this is not yet a fully nonblocking geometry pipeline or a display-synchronized native transaction.
 
 The live preset uses PaperWM-like insertion to the right of native focus, natural initial widths, 20-point horizontal/vertical margins, centering of compact strips, and minimal scrolling to reveal focus. Per-edge padding overrides the symmetric margins; asymmetric padding also changes the usable center. Near-full-width columns center. Signed offsets permit a single column to sit in the middle. Changes to the strip bounds clamp the target while allowing the displayed offset to animate; removing a column to the left adjusts both offsets by its width plus gap, retaining the surviving selection's visual position. Recently selected adjacent windows guide selection after closing the selected window. Stacks start at equal heights; explicit or observed row resizing stores weights and allocates the remaining height to other rows, with a 100-point minimum when setting a row. Balance removes those overrides. This is a smaller allocator than PaperWM's.
 
@@ -28,9 +28,9 @@ Protocol 2 advertises an optional `sticky` capability. Sticky uses WindowServer 
 
 The daemon uses a separate same-user socket, `/tmp/ribbonwm-UID/wm.sock`. Status queries do not take the backend controller lease. Live frames heartbeat every 50 ms even at rest. On an ordinary exit the daemon settles current visible geometry within each monitor, then finishes compositor leases with full clips at those frames. **A killed process can leave AX sizes changed:** the Dock watchdog only knows the compositor snapshot. Recovery journaling is required before crash restoration can be considered complete.
 
-The live daemon accepts explicitly selected IDs, or opt-in `--all`. It excludes minimized and nonzero-layer windows, and helper surfaces narrower or shorter than 100 points at discovery. Preexisting sticky standard windows are tracked outside the tiling engine. `--exclude-app` matches bundle IDs or app names, with an optional trailing prefix wildcard, before any AX query. New live candidates must be AX standard windows with settable position and size; their presentation and logical sizes must agree, with the same translation-only constraint used by the payload. This postpones enrollment during opening animations and skips scaled/rotated/sheared windows without stopping the daemon. Origins may differ, as observed in Chrome. Per-app AX observers coalesce creation, destruction, focus, movement, resizing and minimization notifications. Rust reconciles inventory on those flags, with a 100-ms fallback; failed observer registrations retry every second. App metadata is filtered before registering any AX observer. Native focus is observed on notification with a 100-ms fallback, only for already-managed, non-excluded app PIDs. NSWorkspace notifications are serviced through a bounded main run-loop iteration because Rust owns the loop. Repeated observations are idempotent, and observations during Space changes update selection without revealing it, preserving saved manual scroll. Fullscreen suspends active resizing and focus in its monitor. A change in viewport, scale or display topology exits live mode and attempts restoration. Mission Control detection and automatic resume after topology changes are not implemented. AX accepted sizes are validated; minimum-size negotiation remains unimplemented.
+The live daemon accepts explicitly selected IDs, or opt-in `--all`. It excludes minimized and nonzero-layer windows, and helper surfaces narrower or shorter than 100 points at discovery. Preexisting sticky standard windows are tracked outside the tiling engine. `--exclude-app` matches bundle IDs or app names, with an optional trailing prefix wildcard, before any AX query. New live candidates must be AX standard windows with settable position and size; their presentation and logical sizes must agree, with the same translation-only constraint used by the payload. This postpones enrollment during opening animations and skips scaled/rotated/sheared windows without stopping the daemon. Origins may differ, as observed in Chrome. Per-app AX observers coalesce creation, destruction, focus, movement, resizing and minimization notifications. Rust reconciles inventory on those flags, with a 100-ms fallback; failed observer registrations retry every second. App metadata is filtered before registering any AX observer. Native focus is observed on notification with a 100-ms fallback, only for already-managed, non-excluded app PIDs. NSWorkspace notifications are serviced through a bounded main run-loop iteration because Rust owns the loop. Repeated observations are idempotent, and observations during Space changes update selection without revealing it, preserving saved manual scroll. Fullscreen suspends active resizing and focus in its monitor. A change in viewport, scale or display topology exits live mode and attempts restoration. Mission Control temporarily releases clipping through the backend overview operation and pauses layout work. Automatic resume after display topology changes is not implemented. AX accepted sizes are validated; minimum-size negotiation remains unimplemented.
 
-AX element handles are cached after resolving window IDs and guarded by the current owner PID, so cleanup can access windows in inactive native Spaces. Resizing converts the requested outer WindowServer rectangle to AX geometry using the measured per-window inset. Original AX geometry is saved independently from the presented compositor snapshot. Current AX values suppress redundant writes; the owner's AXEnhancedUserInterface flag is temporarily disabled and restored around resize work, following yabai's behavior. Each accepted-size poll is bounded to 0.25 seconds. If an owner ignores a small change (at most 32 points per axis), one bounded inward resize of 40 points is attempted before requesting the exact target again. The final accepted size must match within two points; this does not accept an app's minimum-size constraint as success. Re-anchoring after size acceptance avoids overwriting a pending owner resize. Waiting or reordering alone did not fix the observed small full-height resize failure. Stable WindowServer size/transform is then checked for at most 0.5 seconds. AppKit may constrain the logical anchor, so ordinary resizing accepts a stable position inside the intended display; Dock independently applies the desired visual position. Restoration waits for the original size before reapplying and validating the exact original position. An owner that refuses the requested size is restored best-effort and left floating; other windows and the daemon continue. Minimum-size negotiation is not implemented. Normal exit handles SIGINT/SIGTERM and restores AX geometry before releasing compositor state. SIGKILL restoration remains incomplete.
+AX element handles are cached after resolving window IDs and guarded by the current owner PID, so cleanup can access windows in inactive native Spaces. Resizing converts the requested outer WindowServer rectangle to AX geometry using the measured per-window inset. Original AX geometry is saved independently from the presented compositor snapshot. Current AX values suppress redundant writes; the owner's AXEnhancedUserInterface flag is temporarily disabled and restored around resize work, following yabai's behavior. Each accepted-size poll is bounded to 0.25 seconds. A refused size is reported without forcing an intermediate smaller size. A changed owner inset can trigger one remeasurement/retry; a persistent refusal leaves the window floating. The final accepted size must match within two points; this does not accept an app's minimum-size constraint as success. Re-anchoring after size acceptance avoids overwriting a pending owner resize. Waiting or reordering alone did not fix the observed small full-height resize failure. Stable WindowServer size/transform is then checked for at most 0.5 seconds. AppKit may constrain the logical anchor, so ordinary resizing accepts a stable position inside the intended display; Dock independently applies the desired visual position. Restoration waits for the original size before reapplying and validating the exact original position. An owner that refuses the requested size is restored best-effort and left floating; other windows and the daemon continue. Minimum-size negotiation is not implemented. Normal exit handles SIGINT/SIGTERM and restores AX geometry before releasing compositor state. SIGKILL restoration remains incomplete.
 
 App/user resizing is detected by comparing the native inventory against each window's last accepted managed size, not its startup geometry. A pending WM command takes precedence over an older native sample. Observed width changes update the whole column without activating the window; stacked height changes update row weights. A single row fills the usable height again. While the left mouse button is held, AX writes, scroll animation and monitor reassignment are postponed. Interactive payload frames maintain the lease and clip the owner's current surface to its retained monitor viewport, without setting its transform. Releasing the mouse resumes placement. This conservative pause applies to all managed windows, including ordinary mouse selections. Modifier-based reordering is not implemented. The initial geometry remains separately available in `status.original_geometry` for diagnostics and graceful restoration.
 
@@ -56,14 +56,15 @@ Optional `enableDockInjection` installs a root LaunchDaemon that selects the con
 
 ## Native interaction and attached surfaces
 
-At rest, fully visible tiles settle their physical outer frame to their displayed
-frame. Partly clipped columns retain compositor scrolling; physical placement
-never crosses a monitor merely to emulate scroll. Geometry writes stop when a
+Scrolling and focus update the compositor frame without rebasing physical
+geometry at rest. Partly clipped columns retain compositor scrolling; physical
+placement never crosses a monitor merely to emulate scroll. Geometry writes stop when a
 mouse press begins. A capture uses the last committed display position as its
 grab anchor. If physical and displayed geometry already agree, AppKit owns the
 entire drag; otherwise one initial offset correction removes the stale
 translation, after which interactive frames update clips without overwriting
-the owner's transform. Releasing a drag schedules native anchoring again.
+the owner's transform. Releasing a drag invalidates older inventory and reconciles accepted dimensions;
+it does not itself schedule a native position or size write.
 
 The Dock payload resolves `SLSCopyAssociatedWindows` with query-iterator parent
 IDs. Only descendants with the same owner PID join a root's lease. Attached
@@ -72,3 +73,33 @@ from that root, share its monitor clipping, and participate in overview and
 finish/detach. Their lifecycle is separate from layout columns. The
 `window_groups` capability prevents a new controller from silently using a
 backend that only transforms the root surface.
+
+## Discovery and settlement scheduling
+
+AX creation/move/resize callbacks retain their window IDs. A worker queries full
+Space/sticky/surface metadata only for notified and retained windows; a cheap
+summary scan provides fallback discovery at least every 250 ms. A four-worker
+AX probe pool publishes each application's result independently within an
+inventory batch. An incomplete membership query may still admit valid new
+windows but cannot prove that retained siblings closed. Generation invalidation
+rejects both partial and final results sampled before a geometry transaction.
+The next inventory batch still waits for the current batch to finish; bounded
+per-app AX calls do not yet provide a total batch deadline.
+
+Native resizing issues the owner's size/anchor writes, then returns a settlement
+handle. The main loop polls it once per frame without a sleep loop. A changed or
+invalid sample resets the 50 ms stability interval; the overall settlement has a
+500 ms deadline. Polls still contain AX reads with 10 ms per-call timeouts. Only
+one native resize is in flight. Floating/sticky requests are queued while it is
+pending, with the target resolved when the command arrives; layout/focus/status
+commands remain available. Stacked rows publish their new layout together.
+`status.presented_windows` distinguishes enrollment from completed native sizing
+and a committed presentation. It is a compositor submission acknowledgement,
+not a measurement of when the physical display scanned out the frame.
+
+An inactive or locked console session suspends mutations, observation, and
+reconciliation while maintaining the existing backend lease. On return the
+inventory generation is invalidated and discovery resumes. Locked-session AX
+placeholders are not interpreted as vanished windows. A pending acknowledged
+resize is cancelled without automatically rebasing it after unlock or a mouse
+press. Real lock/unlock interaction still requires runtime verification.

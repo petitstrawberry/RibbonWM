@@ -1,4 +1,4 @@
-use crate::geometry::NativeSizes;
+use crate::geometry::{NativeSizes, SizeSettlement};
 use crate::ipc::{self, Request, SocketLease};
 use crate::modes::{ModeKind, WindowMode};
 use anyhow::{Context, Result, bail};
@@ -242,24 +242,37 @@ struct InventorySnapshot {
     members: BTreeMap<i32, BTreeSet<WindowId>>,
 }
 impl InventorySnapshot {
-    fn collect(options: &Options, known: &BTreeMap<WindowId, i32>) -> Result<Self> {
-        let windows = ribbon_macos::windows()?;
-        Ok(Self::probe(
-            windows,
-            options,
-            known,
-            ribbon_macos::probe_application,
-        ))
-    }
-    fn probe(
-        windows: Vec<Window>,
+    fn metadata(
         options: &Options,
         known: &BTreeMap<WindowId, i32>,
-        mut probe: impl FnMut(i32, &[u32]) -> Result<ribbon_macos::ApplicationProbe>,
-    ) -> Self {
+        changed: BTreeSet<WindowId>,
+    ) -> Result<Vec<Window>> {
+        if !changed.is_empty() {
+            let ids: BTreeSet<_> = changed.into_iter().chain(known.keys().copied()).collect();
+            return ribbon_macos::window_details(&ids.into_iter().collect::<Vec<_>>());
+        }
+        let summaries = ribbon_macos::window_summaries()?;
+        let ids: Vec<_> = summaries
+            .iter()
+            .filter(|w| {
+                !app_excluded(w, &options.exclude_apps)
+                    && (known.contains_key(&w.id)
+                        || (normal_window_candidate(w)
+                            && (options.all || options.selected.contains(&w.id.0))))
+            })
+            .map(|w| w.id)
+            .collect();
+        let windows = ribbon_macos::window_details(&ids)?;
+        Ok(windows)
+    }
+    fn targets(
+        windows: &[Window],
+        options: &Options,
+        known: &BTreeMap<WindowId, i32>,
+    ) -> BTreeMap<i32, Vec<u32>> {
         let mut targets: BTreeMap<i32, Vec<u32>> =
             known.values().map(|pid| (*pid, Vec::new())).collect();
-        for w in &windows {
+        for w in windows {
             if !known.contains_key(&w.id)
                 && normal_window_candidate(w)
                 && !app_excluded(w, &options.exclude_apps)
@@ -272,6 +285,25 @@ impl InventorySnapshot {
                 targets.entry(w.pid).or_default().push(w.id.0);
             }
         }
+        targets
+    }
+    fn record(&mut self, pid: i32, probe: ribbon_macos::ApplicationProbe) {
+        // Unknown membership must never withdraw previously managed siblings.
+        if let Some(members) = probe.members {
+            self.members.insert(pid, members.into_iter().collect());
+        }
+        for ready in probe.ready {
+            self.ready.insert(ready.id, (pid, ready.geometry));
+        }
+    }
+    #[cfg(test)]
+    fn probe(
+        windows: Vec<Window>,
+        options: &Options,
+        known: &BTreeMap<WindowId, i32>,
+        mut probe: impl FnMut(i32, &[u32]) -> Result<ribbon_macos::ApplicationProbe>,
+    ) -> Self {
+        let targets = Self::targets(&windows, options, known);
         let mut snapshot = Self {
             windows,
             ..Self::default()
@@ -280,46 +312,162 @@ impl InventorySnapshot {
             for (pid, candidates) in targets {
                 // A failed AX query is unknown membership, never an empty app.
                 if let Ok(probe) = probe(pid, &candidates) {
-                    snapshot
-                        .members
-                        .insert(pid, probe.members.into_iter().collect());
-                    for ready in probe.ready {
-                        snapshot.ready.insert(ready.id, (pid, ready.geometry));
-                    }
+                    snapshot.record(pid, probe);
                 }
             }
         }
         snapshot
     }
 }
+type ProbeResult = (i32, Result<ribbon_macos::ApplicationProbe>);
+struct ProbePool {
+    jobs: Option<mpsc::Sender<(i32, Vec<u32>)>>,
+    completed: mpsc::Receiver<ProbeResult>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+impl ProbePool {
+    fn new(
+        probe: impl Fn(i32, &[u32]) -> Result<ribbon_macos::ApplicationProbe> + Send + Sync + 'static,
+    ) -> Self {
+        let probe = Arc::new(probe);
+        let (jobs, jobs_rx) = mpsc::channel::<(i32, Vec<u32>)>();
+        let jobs_rx = Arc::new(Mutex::new(jobs_rx));
+        let (completed, result) = mpsc::channel();
+        let workers = (0..4)
+            .map(|_| {
+                let jobs_rx = Arc::clone(&jobs_rx);
+                let completed = completed.clone();
+                let probe = Arc::clone(&probe);
+                std::thread::spawn(move || {
+                    loop {
+                        let job = jobs_rx.lock().expect("probe queue poisoned").recv();
+                        let Ok((pid, candidates)) = job else {
+                            break;
+                        };
+                        if completed.send((pid, probe(pid, &candidates))).is_err() {
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect();
+        Self {
+            jobs: Some(jobs),
+            completed: result,
+            workers,
+        }
+    }
+}
+impl Drop for ProbePool {
+    fn drop(&mut self) {
+        self.jobs.take();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
 /// Blocking AX discovery and retained-window membership queries live here,
 /// away from rendering, input, and the main-thread observer callbacks.
 struct WindowInventory {
     request: Option<mpsc::SyncSender<u64>>,
-    result: mpsc::Receiver<(u64, Result<InventorySnapshot>)>,
+    result: mpsc::Receiver<(u64, Result<InventorySnapshot>, bool)>,
     worker: Option<std::thread::JoinHandle<()>>,
     pending: bool,
     generation: u64,
     dirty: bool,
     known: Arc<Mutex<BTreeMap<WindowId, i32>>>,
+    changed: Arc<Mutex<BTreeSet<WindowId>>>,
 }
 impl WindowInventory {
     fn start(options: Options) -> Self {
         let known = Arc::new(Mutex::new(BTreeMap::new()));
         let worker_known = Arc::clone(&known);
+        let changed = Arc::new(Mutex::new(BTreeSet::new()));
+        let worker_changed = Arc::clone(&changed);
         let (request, requests) = mpsc::sync_channel(1);
         let (results, result) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            while let Ok(generation) = requests.recv() {
+            let probes = ProbePool::new(ribbon_macos::probe_application);
+            let mut last_full = Instant::now() - Duration::from_secs(1);
+            'requests: while let Ok(generation) = requests.recv() {
                 let known = worker_known
                     .lock()
                     .expect("inventory tracking poisoned")
                     .clone();
-                if results
-                    .send((generation, InventorySnapshot::collect(&options, &known)))
-                    .is_err()
-                {
-                    break;
+                let mut changed = std::mem::take(
+                    &mut *worker_changed.lock().expect("inventory notices poisoned"),
+                );
+                // Never let a stream of move events starve fallback discovery.
+                if last_full.elapsed() >= Duration::from_millis(250) {
+                    changed.clear();
+                }
+                if changed.is_empty() {
+                    last_full = Instant::now();
+                }
+                let windows = match InventorySnapshot::metadata(&options, &known, changed) {
+                    Ok(windows) => windows,
+                    Err(error) => {
+                        if results.send((generation, Err(error), true)).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let targets = if options.dry_run {
+                    BTreeMap::new()
+                } else {
+                    InventorySnapshot::targets(&windows, &options, &known)
+                };
+                let count = targets.len();
+                if count == 0 {
+                    if results
+                        .send((
+                            generation,
+                            Ok(InventorySnapshot {
+                                windows,
+                                ..Default::default()
+                            }),
+                            true,
+                        ))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+                let mut targets: Vec<_> = targets.into_iter().collect();
+                // New candidates precede background retained-window checks.
+                targets.sort_by_key(|(pid, ids)| (ids.is_empty(), *pid));
+                for target in targets {
+                    if probes
+                        .jobs
+                        .as_ref()
+                        .expect("probe pool stopped")
+                        .send(target)
+                        .is_err()
+                    {
+                        break 'requests;
+                    }
+                }
+                for index in 0..count {
+                    let Ok((pid, probe)) = probes.completed.recv() else {
+                        break 'requests;
+                    };
+                    let mut snapshot = InventorySnapshot {
+                        windows: windows.clone(),
+                        ..Default::default()
+                    };
+                    if let Ok(probe) = probe {
+                        snapshot.record(pid, probe);
+                    }
+                    // Publish a ready application immediately. The UI never
+                    // waits for another app's timeout before enrolling it.
+                    if results
+                        .send((generation, Ok(snapshot), index + 1 == count))
+                        .is_err()
+                    {
+                        break 'requests;
+                    }
                 }
             }
         });
@@ -331,6 +479,7 @@ impl WindowInventory {
             generation: 0,
             dirty: false,
             known,
+            changed,
         }
     }
     fn track(&self, geometry: &GeometryLease) {
@@ -355,8 +504,8 @@ impl WindowInventory {
     }
     fn poll(&mut self) -> Result<Option<InventorySnapshot>> {
         let snapshot = match self.result.try_recv() {
-            Ok((generation, result)) => {
-                self.pending = false;
+            Ok((generation, result, complete)) => {
+                self.pending = !complete;
                 if generation == self.generation {
                     match result {
                         Ok(windows) => Some(windows),
@@ -648,6 +797,7 @@ fn synchronize(
                 engine.relocate_window(&display.id, w.id)?;
             }
             if !options.dry_run
+                && sizes.pending.as_ref().is_none_or(|job| job.window != w.id)
                 && w.onscreen
                 && let Some(surface) = w.surface_bounds.filter(|r| r.valid())
                 && let Some(&(pid, width, height)) = sizes.get(&w.id)
@@ -676,7 +826,9 @@ fn synchronize(
                         let _ = engine.resize_row(&plan.monitor, w.id, surface.height);
                         accepted.2 = surface.height;
                     }
-                    sizes.insert(w.id, accepted);
+                    if accepted != (pid, width, height) {
+                        sizes.insert(w.id, accepted);
+                    }
                 }
             }
             continue;
@@ -787,16 +939,8 @@ fn sticky_leases(geometry: &GeometryLease) -> Vec<StickyWindow> {
         })
         .collect()
 }
-fn set_mode(
-    engine: &mut Engine,
-    geometry: &mut GeometryLease,
-    backend: Option<&Backend>,
-    sizes: &mut NativeSizes,
-    change: (Option<WindowId>, ModeKind, Option<bool>),
-    dry_run: bool,
-) -> Result<()> {
-    let (window, kind, enabled) = change;
-    let id = window
+fn mode_window(window: Option<WindowId>, geometry: &GeometryLease) -> Result<WindowId> {
+    window
         .or_else(|| {
             let pid = ribbon_macos::frontmost_pid();
             geometry
@@ -806,7 +950,18 @@ fn set_mode(
                 .then(|| ribbon_macos::focused_window(pid))
                 .flatten()
         })
-        .context("No focused tracked window; pass --window ID")?;
+        .context("No focused tracked window; pass --window ID")
+}
+fn set_mode(
+    engine: &mut Engine,
+    geometry: &mut GeometryLease,
+    backend: Option<&Backend>,
+    sizes: &mut NativeSizes,
+    change: (Option<WindowId>, ModeKind, Option<bool>),
+    dry_run: bool,
+) -> Result<()> {
+    let (window, kind, enabled) = change;
+    let id = mode_window(window, geometry)?;
     let original = geometry
         .originals
         .get(&id)
@@ -940,9 +1095,11 @@ fn handle(
         Request::Status {} => {
             let pid = ribbon_macos::frontmost_pid();
             let native_focused_window = geometry.dragged.or_else(|| {
-                (!dry_run && geometry.originals.values().any(|w| w.pid == pid))
-                    .then(|| ribbon_macos::focused_window(pid))
-                    .flatten()
+                (!dry_run
+                    && ribbon_macos::session_active()
+                    && geometry.originals.values().any(|w| w.pid == pid))
+                .then(|| ribbon_macos::focused_window(pid))
+                .flatten()
             });
             let original_geometry: BTreeMap<_, _> = geometry
                 .originals
@@ -950,7 +1107,7 @@ fn handle(
                 .map(|(id, w)| (*id, json!({"pid":w.pid,"bounds":w.bounds})))
                 .collect();
             return Ok(
-                json!({"ok":true,"mode":if dry_run{"dry_run"}else{"live"},"state":engine,"original_geometry":original_geometry,"window_modes":geometry.modes,"native_focused_window":native_focused_window,"mouse_hold":geometry.dragged,"native_size_requests":sizes.requests,"native_overview":!dry_run&&ribbon_macos::mission_control_active(),"placements":engine.placements()}),
+                json!({"ok":true,"mode":if dry_run{"dry_run"}else{"live"},"state":engine,"original_geometry":original_geometry,"window_modes":geometry.modes,"native_focused_window":native_focused_window,"mouse_hold":geometry.dragged,"native_size_requests":sizes.requests,"session_active":dry_run||ribbon_macos::session_active(),"native_overview":!dry_run&&ribbon_macos::session_active()&&ribbon_macos::mission_control_active(),"placements":engine.placements()}),
             );
         }
         Request::Quit {} => *quit = true,
@@ -1156,10 +1313,14 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
     let mut sizes = NativeSizes::default();
     let events = (!options.dry_run).then(ribbon_macos::EventSource::default);
     let mut watching = BTreeSet::new();
-    if let Some(source) = &events {
+    if let Some(source) = &events
+        && ribbon_macos::session_active()
+    {
         refresh_observers(source, &mut watching, &options)?;
     }
-    let initial_overview = !options.dry_run && ribbon_macos::mission_control_active();
+    let initial_overview = !options.dry_run
+        && ribbon_macos::session_active()
+        && ribbon_macos::mission_control_active();
     update_contexts(&mut engine, &displays)?;
     if options.dry_run && !initial_overview {
         synchronize(
@@ -1204,7 +1365,9 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
     let mut inventory = WindowInventory::start(options.clone());
     inventory.request()?;
     let mut mouse = MouseCapture::default();
+    let mut deferred = std::collections::VecDeque::new();
     let mut overview = false;
+    let mut session_active = true;
     let mut overview_resume = Instant::now();
     eprintln!(
         "RibbonWM {}: {} windows; socket {}",
@@ -1215,9 +1378,42 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
     let frame_result = (|| -> Result<()> {
         'frames: while running.load(Ordering::Relaxed) && !quit {
             let start = Instant::now();
-            let notifications = events.as_ref().map_or(0, ribbon_macos::EventSource::drain);
+            let active = options.dry_run || ribbon_macos::session_active();
+            if active != session_active {
+                inventory.invalidate();
+                inventory
+                    .changed
+                    .lock()
+                    .expect("inventory notices poisoned")
+                    .clear();
+                mouse = MouseCapture::default();
+                geometry.dragged = None;
+                if let Some(input) = &mut input {
+                    input.cancel();
+                }
+                sizes.cancel_settlement();
+                session_active = active;
+                last_inventory = start - Duration::from_secs(1);
+                last_tick = start;
+            }
+            let notifications = if session_active {
+                events.as_ref().map_or(0, ribbon_macos::EventSource::drain)
+            } else {
+                0
+            };
             inventory.track(&geometry);
-            let in_overview = !options.dry_run && ribbon_macos::mission_control_active();
+            if let Some(source) = &events {
+                inventory
+                    .changed
+                    .lock()
+                    .expect("inventory notices poisoned")
+                    .extend(source.changed_windows());
+            }
+            let in_overview = if session_active {
+                !options.dry_run && ribbon_macos::mission_control_active()
+            } else {
+                overview
+            };
             if in_overview && !overview {
                 if let Some(backend) = &backend {
                     backend.overview()?;
@@ -1226,6 +1422,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                     input.cancel();
                 }
                 inventory.invalidate();
+                sizes.cancel_settlement();
                 overview = true;
             } else if !in_overview && overview {
                 overview = false;
@@ -1234,7 +1431,10 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                 last_frame.clear();
                 mouse = MouseCapture::default();
             }
-            let suspended = overview || start < overview_resume;
+            let suspended = !session_active || overview || start < overview_resume;
+            if ribbon_macos::left_mouse_down() {
+                sizes.cancel_settlement();
+            }
             let previous_drag = geometry.dragged;
             geometry.dragged = if options.dry_run || suspended {
                 None
@@ -1247,6 +1447,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                 inventory.invalidate();
             }
             if !options.dry_run
+                && session_active
                 && engine.settings.gesture_scroll
                 && input.is_none()
                 && start.duration_since(last_input_attempt) >= Duration::from_secs(5)
@@ -1260,7 +1461,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                 }
             }
             if let Some(source) = &mut input {
-                let blocked = gesture_blocked(&options, &mut gesture_frontmost);
+                let blocked = suspended || gesture_blocked(&options, &mut gesture_frontmost);
                 if let Err(e) = source.update(&engine.settings, gesture_targets(&engine, blocked)) {
                     eprintln!("Gestures suspended: {e:#}");
                     input = None;
@@ -1268,13 +1469,48 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
             }
             // At most eight clients per frame. Each client's total read deadline is bounded.
             for _ in 0..8 {
-                match socket.listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let response = ipc::receive(&mut stream)
-                            .and_then(|r| {
+                let next = if sizes.pending.is_none() && !deferred.is_empty() {
+                    Ok(deferred.pop_front().expect("queued geometry command"))
+                } else {
+                    socket.listener.accept().map(|(mut stream, _)| {
+                        let request = ipc::receive(&mut stream);
+                        (stream, request)
+                    })
+                };
+                match next {
+                    Ok((mut stream, mut request)) => {
+                        if !suspended
+                            && sizes.pending.is_some()
+                            && request
+                                .as_ref()
+                                .is_ok_and(|r| matches!(r, Request::SetMode { .. }))
+                        {
+                            if deferred.len() >= 32 {
+                                let _ = ipc::respond(
+                                    &mut stream,
+                                    &json!({"ok":false,"error":"Too many pending native geometry commands"}),
+                                );
+                                continue;
+                            }
+                            if let Ok(Request::SetMode { window, .. }) = &mut request {
+                                match mode_window(*window, &geometry) {
+                                    Ok(id) => *window = Some(id),
+                                    Err(error) => {
+                                        let _ = ipc::respond(
+                                            &mut stream,
+                                            &json!({"ok":false,"error":error.to_string()}),
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                            deferred.push_back((stream, request));
+                            continue;
+                        }
+                        let response = request.and_then(|r| {
                                 if suspended && !matches!(r, Request::Status {} | Request::Quit {})
                                 {
-                                    bail!("Window operations are paused during Mission Control");
+                                    bail!("Window operations are paused while the session is locked/inactive or Mission Control is open");
                                 }
                                 if geometry.dragged.is_some()
                                     && !matches!(r, Request::Status {} | Request::Quit {})
@@ -1285,7 +1521,8 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                                 if native_geometry {
                                     inventory.invalidate();
                                 }
-                                handle(
+                                let status = matches!(r, Request::Status {});
+                                let mut response = handle(
                                     &mut engine,
                                     r,
                                     options.dry_run,
@@ -1293,7 +1530,21 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                                     backend.as_ref(),
                                     &mut sizes,
                                     &mut quit,
-                                )
+                                )?;
+                                if status {
+                                    let plans = engine.placements();
+                                    let owners = geometry.originals.iter().map(|(id,w)| (*id,w.pid)).collect();
+                                    let waiting = sizes.unsettled_columns(&engine, &plans, &owners);
+                                    let ready: Vec<_> = plans.iter().filter(|p| {
+                                        !waiting.contains(&p.window) && committed.iter().any(|c|
+                                            c.window == p.window && c.native_space == p.native_space &&
+                                            (c.frame.width-p.frame.width).abs() <= 2.0 &&
+                                            (c.frame.height-p.frame.height).abs() <= 2.0)
+                                    }).map(|p| p.window).collect();
+                                    response["presented_windows"] = json!(ready);
+                                    response["native_size_pending"] = json!(sizes.pending.as_ref().map(|p| p.window));
+                                }
+                                Ok(response)
                             })
                             .unwrap_or_else(|e| json!({"ok":false,"error":e.to_string()}));
                         if let Err(e) = ipc::respond(&mut stream, &response) {
@@ -1372,6 +1623,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                     })
                 }) {
                     inventory.invalidate();
+                    sizes.cancel_settlement();
                 }
                 displays = next;
                 // Activate the native context before processing focus/destruction,
@@ -1515,25 +1767,16 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                 // focus and mouse release change compositor placement, never
                 // erase accepted dimensions to trigger an AX position rebase.
                 let mut geometry_changed = false;
-                // Hold the previously committed layout through the entire AX resize
-                // batch. Do not publish half of a newly split column between owners.
-                let pending = plans
-                    .iter()
-                    .filter(|p| {
-                        engine
-                            .monitors
-                            .get(&p.monitor)
-                            .is_some_and(|m| !m.suspended && m.native_space == p.native_space)
-                    })
-                    .any(|p| {
-                        geometry
-                            .originals
-                            .get(&p.window)
-                            .is_some_and(|w| sizes.needs_resize(p.window, w.pid, p.frame))
-                    });
+                // Publish every row of a resized column together. Waiting on
+                // that column does not stop animations on independent columns.
+                let waiting = sizes.unsettled_columns(&engine, &plans, &owners);
+                let pending = !waiting.is_empty();
                 let mut held = plans.clone();
                 if pending {
                     for p in &mut held {
+                        if !waiting.contains(&p.window) {
+                            continue;
+                        }
                         let w = geometry
                             .originals
                             .get(&p.window)
@@ -1543,7 +1786,12 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                             .find(|old| {
                                 old.window == p.window && old.native_space == p.native_space
                             })
-                            .filter(|_| sizes.get(&p.window).is_some_and(|s| s.0 == w.pid))
+                            .filter(|_| {
+                                sizes.get(&p.window).is_some_and(|s| s.0 == w.pid)
+                                    || sizes.pending.as_ref().is_some_and(|job| {
+                                        job.window == p.window && job.size.0 == w.pid
+                                    })
+                            })
                         {
                             *p = previous.clone();
                         } else {
@@ -1561,7 +1809,6 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                         &monitor_viewports(&engine),
                     )?;
                 }
-                let mut lease_tick = Instant::now();
                 for p in &plans {
                     let m = engine.monitors.get(&p.monitor).context("Missing monitor")?;
                     if m.suspended || m.native_space != p.native_space {
@@ -1572,44 +1819,82 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                         .get(&p.window)
                         .context("Missing original geometry")?;
                     let size = (w.pid, p.frame.width, p.frame.height);
-                    if sizes.needs_resize(p.window, w.pid, p.frame) {
-                        // Record before writing: even a failed AX request may have partially changed geometry.
-                        geometry.resized.insert(p.window);
-                        let viewport = engine
-                            .monitors
-                            .get(&p.monitor)
-                            .context("Missing monitor")?
-                            .viewport;
-                        sizes.requests = sizes.requests.saturating_add(1);
-                        let resized = ribbon_macos::resize_window_observed(
-                            p.window,
-                            w.pid,
-                            if p.clip == Some(p.frame) {
-                                p.frame
-                            } else {
-                                resize_anchor(viewport, w.bounds, size.1, size.2)
-                            },
-                            || {
-                                if ribbon_macos::left_mouse_down() {
-                                    bail!("Native mouse interaction began during geometry update");
+                    if sizes.needs_resize(p.window, w.pid, p.frame)
+                        || sizes
+                            .pending
+                            .as_ref()
+                            .is_some_and(|job| job.window == p.window)
+                    {
+                        let (resized, accepted_size) = if let Some(job) = &mut sizes.pending {
+                            if job.window != p.window {
+                                continue;
+                            }
+                            let result = job.transaction.poll();
+                            if matches!(result, Ok(false)) {
+                                continue;
+                            }
+                            let job = sizes.pending.take().expect("active settlement");
+                            (result.map(|_| ()), job.size)
+                        } else {
+                            // Snapshot before the first write. AX acknowledges
+                            // size here; compositor settling is polled on later frames.
+                            geometry.resized.insert(p.window);
+                            let viewport = engine.monitors[&p.monitor].viewport;
+                            sizes.requests = sizes.requests.saturating_add(1);
+                            let begun = ribbon_macos::begin_resize_window(
+                                p.window,
+                                w.pid,
+                                if p.clip == Some(p.frame) {
+                                    p.frame
+                                } else {
+                                    resize_anchor(viewport, w.bounds, size.1, size.2)
+                                },
+                                || {
+                                    if !ribbon_macos::session_active()
+                                        || ribbon_macos::left_mouse_down()
+                                    {
+                                        bail!(
+                                            "Session suspended or native mouse interaction began during geometry update"
+                                        );
+                                    }
+                                    backend.frame_with_sticky_in_viewports(
+                                        &held,
+                                        &owners,
+                                        &sticky_leases(&geometry),
+                                        &monitor_viewports(&engine),
+                                    )
+                                },
+                            );
+                            match begun {
+                                Ok(transaction) => {
+                                    sizes.pending = Some(SizeSettlement {
+                                        window: p.window,
+                                        size,
+                                        transaction,
+                                    });
+                                    inventory.invalidate();
+                                    continue;
                                 }
-                                backend.frame_with_sticky_in_viewports(
-                                    &held,
-                                    &owners,
-                                    &sticky_leases(&geometry),
-                                    &monitor_viewports(&engine),
-                                )
-                            },
-                        );
+                                Err(error) => (Err(error), size),
+                            }
+                        };
                         inventory.invalidate();
                         if let Err(e) = resized {
-                            if ribbon_macos::left_mouse_down() {
+                            if !ribbon_macos::session_active() || ribbon_macos::left_mouse_down() {
                                 last_frame.clear();
                                 continue 'frames;
                             }
                             if ribbon_macos::window_owner(p.window) != w.pid {
                                 forget_closed(&mut engine, &mut geometry, p.window)?;
                                 sizes.remove(&p.window);
+                                continue 'frames;
+                            }
+                            if sizes.retry_once(p.window) {
+                                eprintln!(
+                                    "Retrying changed owner geometry for {}: {e:#}",
+                                    p.window.0
+                                );
+                                last_frame.clear();
                                 continue 'frames;
                             }
                             eprintln!(
@@ -1644,19 +1929,11 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                             committed.retain(|old| old.window != p.window);
                             continue 'frames;
                         }
-                        sizes.insert(p.window, size);
+                        sizes.insert(p.window, accepted_size);
                         geometry_changed = true;
-                        // A slow owner must not expire the restoration lease. The
-                        // heartbeat holds old placements until all owners are ready.
-                        if lease_tick.elapsed() >= Duration::from_millis(250) {
-                            backend.frame_with_sticky_in_viewports(
-                                &held,
-                                &owners,
-                                &sticky_leases(&geometry),
-                                &monitor_viewports(&engine),
-                            )?;
-                            lease_tick = Instant::now();
-                        }
+                        // Give deferred native commands a turn before starting
+                        // another owner, even during a large creation burst.
+                        break;
                     }
                 }
                 if geometry_changed {
@@ -1664,6 +1941,18 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                     // displayed position rather than jumping over that stalled time.
                     last_tick = Instant::now();
                 }
+                let waiting = sizes.unsettled_columns(&engine, &plans, &owners);
+                let plans: Vec<_> = plans
+                    .into_iter()
+                    .zip(held)
+                    .map(|(plan, previous)| {
+                        if waiting.contains(&plan.window) {
+                            previous
+                        } else {
+                            plan
+                        }
+                    })
+                    .collect();
                 // Focus/native selection metadata does not change compositor geometry.
                 let frame = serde_json::to_vec(
                     &plans
@@ -1702,6 +1991,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
         }
         Ok(())
     })();
+    sizes.cancel_settlement();
     if let Some(backend) = &backend {
         // An error path must not move another controller's windows while
         // launchd retries us. Cleanup needs ownership as much as placement.
@@ -2048,6 +2338,41 @@ mod tests {
     }
 
     #[test]
+    fn blocked_application_does_not_hold_ready_application_results() {
+        let (started, begin) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let wait = Mutex::new(wait);
+        let pool = ProbePool::new(move |pid, _| {
+            if pid == 1 {
+                started.send(()).unwrap();
+                // Deadline also prevents a broken pool from hanging the suite.
+                wait.lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+            }
+            Ok(ribbon_macos::ApplicationProbe {
+                members: Some(Vec::new()),
+                ready: Vec::new(),
+            })
+        });
+        let jobs = pool.jobs.as_ref().unwrap();
+        jobs.send((1, vec![1])).unwrap();
+        begin.recv_timeout(Duration::from_secs(1)).unwrap();
+        jobs.send((2, vec![2])).unwrap();
+        let ready = pool.completed.recv_timeout(Duration::from_secs(1));
+        release.send(()).unwrap();
+        assert_eq!(ready.unwrap().0, 2);
+        assert_eq!(
+            pool.completed
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .0,
+            1
+        );
+    }
+
+    #[test]
     fn inventory_does_not_adopt_geometry_sampled_before_a_completed_ax_write() {
         let (request, requests) = mpsc::sync_channel(1);
         let (results, result) = mpsc::channel();
@@ -2059,18 +2384,25 @@ mod tests {
             generation: 0,
             dirty: false,
             known: Arc::new(Mutex::new(BTreeMap::new())),
+            changed: Arc::new(Mutex::new(BTreeSet::new())),
         };
         inventory.request().unwrap();
         let old = requests.recv().unwrap();
         inventory.invalidate(); // A WM resize completes while CG is reading.
         results
-            .send((old, Ok(InventorySnapshot::default())))
+            .send((old, Ok(InventorySnapshot::default()), false))
+            .unwrap();
+        assert!(inventory.poll().unwrap().is_none());
+        assert!(inventory.pending);
+        assert!(requests.try_recv().is_err());
+        results
+            .send((old, Ok(InventorySnapshot::default()), true))
             .unwrap();
         assert!(inventory.poll().unwrap().is_none());
         let current = requests.recv().unwrap();
         assert_ne!(old, current);
         results
-            .send((current, Ok(InventorySnapshot::default())))
+            .send((current, Ok(InventorySnapshot::default()), true))
             .unwrap();
         assert!(inventory.poll().unwrap().is_some());
 
@@ -2080,7 +2412,13 @@ mod tests {
         inventory.request().unwrap();
         assert!(requests.try_recv().is_err());
         results
-            .send((pending, Ok(InventorySnapshot::default())))
+            .send((pending, Ok(InventorySnapshot::default()), false))
+            .unwrap();
+        assert!(inventory.poll().unwrap().is_some()); // Fast application is immediately visible.
+        assert!(inventory.pending); // Other applications are still in flight.
+        assert!(requests.try_recv().is_err()); // No duplicate batch.
+        results
+            .send((pending, Ok(InventorySnapshot::default()), true))
             .unwrap();
         assert!(inventory.poll().unwrap().is_some());
         assert_eq!(requests.recv().unwrap(), pending);
@@ -2089,7 +2427,11 @@ mod tests {
         // A transient native JSON/query failure must not stop the controller
         // or replace its layout with an empty inventory.
         results
-            .send((pending, Err(anyhow::anyhow!("invalid native rectangle"))))
+            .send((
+                pending,
+                Err(anyhow::anyhow!("invalid native rectangle")),
+                true,
+            ))
             .unwrap();
         assert!(inventory.poll().unwrap().is_none());
         assert!(!inventory.pending);
@@ -2097,7 +2439,7 @@ mod tests {
         inventory.request().unwrap();
         assert_eq!(requests.recv().unwrap(), pending);
         results
-            .send((pending, Ok(InventorySnapshot::default())))
+            .send((pending, Ok(InventorySnapshot::default()), true))
             .unwrap();
         assert!(inventory.poll().unwrap().is_some());
     }
@@ -2194,6 +2536,19 @@ mod tests {
         );
         assert!(unknown.members.is_empty()); // Timeout must not mean every window closed.
         assert!(unknown.ready.is_empty());
+        let partial =
+            InventorySnapshot::probe(vec![window.clone()], &options, &BTreeMap::new(), |_, _| {
+                Ok(ribbon_macos::ApplicationProbe {
+                    members: None,
+                    ready: vec![ribbon_macos::WindowProbe {
+                        id: window.id,
+                        geometry: window.bounds,
+                    }],
+                })
+            });
+        assert!(partial.members.is_empty());
+        assert_eq!(partial.ready[&window.id], (window.pid, window.bounds));
+
         let physical = window.bounds;
         window.surface_bounds = Some(physical);
         window.bounds = Rect {
