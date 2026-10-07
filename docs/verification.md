@@ -534,3 +534,18 @@ blocked request, cancellation joining the worker, and propagation of AX errors.
 An owned floating fixture passed three calibrated native-anchor/AX-resize cycles
 through this worker path, with five to nine progress callbacks per operation.
 Rust tests and Clippy pass. Live width comparison remains pending for this change.
+
+
+The AX-worker change was deployed. Of six width changes, three recorded no gap
+error above three points; the others recorded one or two bad samples (four
+coherent bad samples total). Maximum instantaneous gap remained 500 points for
+a 500-point width change. This short publication mismatch is still unresolved;
+geometry sampling is not display-synchronized visual acceptance. The service
+was retained after owned fixtures closed.
+
+Permission readiness also exposed a remaining defect: despite the exact binary
+being approved, a pre-approval service stayed untrusted. A fresh launchd doctor
+using that exact executable reported both permissions granted, while the older
+service did not. The service had zero managed leases and was relaunched once,
+then started immediately. This must not be reported as seamless permission
+resumption; refreshing stale permission state remains necessary.
