@@ -16,6 +16,8 @@ assert os.environ.get('IN_NIX_SHELL')
 assert cli('status')['mode']=='live'
 anchored=os.environ.get('RIBBONWM_QA_ANCHOR')=='1'
 prefix='manual-drag-anchored' if anchored else 'manual-drag'
+prefix=os.environ.get('RIBBONWM_QA_TRACE_PREFIX',prefix)
+assert prefix and all(c.isalnum() or c in '-_' for c in prefix)
 p=subprocess.Popen([str(HELPER),'--fixture',json.dumps(dict(regular=True,geometry_test=True,anchor_idle=anchored,backdrops=[],lifetime=150,target=dict(x=300,y=150)))],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True,bufsize=1)
 replies=queue.Queue()
 def read():

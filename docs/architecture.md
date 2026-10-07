@@ -140,3 +140,9 @@ update. AppKit then adopts that already prepared origin before changing size.
 This avoids letting an AX position write temporarily add the difference between
 physical and presented origins. Preparation refuses pointer ownership and an
 origin outside the retained viewport; it does not resize or change Space membership.
+
+AX position/size requests run on a worker while the calling layout thread keeps
+publishing observed geometry through its progress callback. The worker never
+mutates layout or invokes the callback. Cancellation stops publication, joins
+the in-flight request before releasing AX values, and prevents later geometry
+writes. No WindowServer update suspension spans an AX wait.

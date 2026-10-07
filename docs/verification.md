@@ -517,3 +517,20 @@ A follow-up prepares the physical resize origin while preserving presentation.
 The owned native test verifies unchanged surface size, attached-child offsets,
 unchanged presentation after AppKit adopts the prepared origin, and rejection of
 an origin outside the retained viewport. Live comparison is still pending.
+
+
+The resize-origin preparation was deployed. A six-width live run recorded one
+bad sample per width. A follow-up sampler reads both surfaces twice in opposite
+order: some gaps persisted across both reads, so they cannot all be dismissed
+as mixed reads. Those transitions still require fixing; this is not a visual
+smoothness pass. Six titlebar press intervals on the production-controlled
+fixture recorded 0–1 point displacement while the pointer stayed within two
+points of its press, with no fixture-side anchor correction. The user reported
+that this drag test felt better. Unrelated clicks were excluded.
+
+The next change keeps presentation callbacks running while an AX request awaits
+the owner application. Tests cover caller-thread callback execution during a
+blocked request, cancellation joining the worker, and propagation of AX errors.
+An owned floating fixture passed three calibrated native-anchor/AX-resize cycles
+through this worker path, with five to nine progress callbacks per operation.
+Rust tests and Clippy pass. Live width comparison remains pending for this change.

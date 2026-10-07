@@ -27,6 +27,9 @@ static NSDictionary *surfaceState(SkyLight sky,uint32_t wid,BOOL includeOrder) {
         @"clip_error":@(ec),@"clip_bounds":@[finiteNumber(clip.origin.x),finiteNumber(clip.origin.y),finiteNumber(clip.size.width),finiteNumber(clip.size.height)],
         @"frame":@{@"x":finiteNumber(b.origin.x),@"y":finiteNumber(b.origin.y),@"width":finiteNumber(b.size.width),@"height":finiteNumber(b.size.height)}};
 }
+static int observeFixtureResize(void *context) {
+    unsigned *count=context;(*count)++;return 0;
+}
 static NSDictionary *windowState(SkyLight sky,uint32_t wid) {return surfaceState(sky,wid,YES);}
 static NSDictionary *associatedState(SkyLight sky,uint32_t wid) {
     void *h=dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",RTLD_NOW);
@@ -245,7 +248,16 @@ int main(int argc,char **argv) {@autoreleasepool {
                 uint32_t wid=value.unsignedIntValue;if(ribbon_window_owner(wid)!=pid)return 1;
                 NSMutableDictionary *row=[surfaceState(sky,wid,NO) mutableCopy];row[@"wid"]=value;[rows addObject:row];
             }
-            reply(@{@"event":@"frame-sample",@"time":@(ribbon_input_time()),@"windows":rows});usleep(4000);
+            // Read both surfaces again, in reverse order. A mismatch identifies
+            // a sample that crossed an owner resize or compositor publication.
+            BOOL coherent=YES;
+            for(NSUInteger index=rows.count;index>0;index--) {
+                NSDictionary *first=rows[index-1];uint32_t wid=[first[@"wid"] unsignedIntValue];
+                if(ribbon_window_owner(wid)!=pid)return 1;
+                NSMutableDictionary *again=[surfaceState(sky,wid,NO) mutableCopy];again[@"wid"]=first[@"wid"];
+                if(![again isEqual:first])coherent=NO;
+            }
+            reply(@{@"event":@"frame-sample",@"time":@(ribbon_input_time()),@"coherent":@(coherent),@"windows":rows});usleep(4000);
         }}return 0;
     }
     if(argc==5&&!strcmp(argv[1],"--trace-window")) {
@@ -428,9 +440,10 @@ int main(int argc,char **argv) {@autoreleasepool {
                     v[i]=[data[i] doubleValue];if(!isfinite(v[i])||fabs(v[i])>100000)return 1;
                 }
                 if(v[2]<=0||v[3]<=0||v[6]<=0||v[7]<=0)return 1;
-                void *pending=NULL;
+                void *pending=NULL;unsigned progressCount=0;
                 result=ribbon_resize_begin((uint32_t)wid,(int)pid,(RibbonRect){frame.origin.x,frame.origin.y,width,height},
-                    (RibbonRect){v[0],v[1],v[2],v[3]},(RibbonRect){v[4],v[5],v[6],v[7]},NULL,NULL,&pending);
+                    (RibbonRect){v[0],v[1],v[2],v[3]},(RibbonRect){v[4],v[5],v[6],v[7]},observeFixtureResize,&progressCount,&pending);
+                reply(@{@"resize_progress_callbacks":@(progressCount)});
                 if(!result){do {result=ribbon_settlement_poll(pending);if(!result)usleep(5000);}while(!result);if(result==1)result=0;}
                 if(pending)ribbon_settlement_release(pending);
             } else result=ribbon_resize_window((uint32_t)wid,(int)pid,(RibbonRect){frame.origin.x,frame.origin.y,width,height});

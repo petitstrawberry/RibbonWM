@@ -2,11 +2,27 @@
 // successful-but-null rectangle sentinel. No AX access or user windows.
 #import "query.m"
 #include <assert.h>
+#include <pthread.h>
 static NSArray *decode(char *raw) {
     assert(raw);NSData *data=[[NSString stringWithUTF8String:raw] dataUsingEncoding:NSUTF8StringEncoding];
     NSArray *rows=[NSJSONSerialization JSONObjectWithData:data options:0 error:nil];ribbon_free(raw);assert(rows);return rows;
 }
+typedef struct { pthread_t caller; unsigned count; BOOL fail; } ProgressCheck;
+static int checkProgress(void *context) {
+    ProgressCheck *check=context;assert(pthread_equal(pthread_self(),check->caller));
+    check->count++;return check->fail;
+}
 int main(int argc,char **argv) { @autoreleasepool {
+    ProgressCheck progress={.caller=pthread_self()};
+    __block BOOL completed=NO;
+    assert(geometryRequest(^{ usleep(30000);completed=YES;return (AXError)kAXErrorSuccess; },checkProgress,&progress)==0);
+    assert(completed&&progress.count>1);
+    progress.count=0;progress.fail=YES;completed=NO;
+    assert(geometryRequest(^{ usleep(30000);completed=YES;return (AXError)kAXErrorSuccess; },checkProgress,&progress)==kAXErrorFailure);
+    assert(completed&&progress.count==1);
+    progress.count=0;progress.fail=NO;
+    assert(geometryRequest(^{ return (AXError)kAXErrorInvalidUIElement; },checkProgress,&progress)==kAXErrorInvalidUIElement);
+    puts("PASS: blocked AX requests keep caller-thread presentation live, cancellation joins the request, and AX errors propagate");
     // Stable geometry must be observed after the last owner/size change; a
     // timeout or invalid intervening sample cannot be counted as settlement.
     RibbonSettlement settlement={.deadline=2};

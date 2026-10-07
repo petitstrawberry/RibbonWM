@@ -70,10 +70,10 @@ try:
             # Actual surface width and its clip both matter: clipping a wider
             # surface to a future width can hide content during acceptance.
             error=(-b['transform'][4])-(-a['transform'][4])-a['frame']['width']-gap
-            errors.append(dict(time=s['time'],gap_error=error,width=a['frame']['width'],clip=a['clip_bounds']))
+            errors.append(dict(time=s['time'],gap_error=error,width=a['frame']['width'],clip=a['clip_bounds'],coherent=s.get('coherent',False)))
         assert len(errors)>5, 'Too few intermediate samples'
         bad=[v for v in errors if abs(v['gap_error'])>3]
-        report.append(dict(width=step['width'],samples=len(errors),max_gap_error=max(abs(v['gap_error']) for v in errors),bad_samples=len(bad)))
+        report.append(dict(width=step['width'],samples=len(errors),max_gap_error=max(abs(v['gap_error']) for v in errors),bad_samples=len(bad),coherent_samples=sum(v['coherent'] for v in errors),coherent_bad_samples=sum(v['coherent'] for v in bad)))
     print(json.dumps(report,indent=2),flush=True)
     (ROOT/'docs/live-width-frames-trace.jsonl').write_text(''.join(json.dumps(s)+'\n' for s in samples))
 finally:

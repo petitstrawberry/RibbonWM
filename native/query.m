@@ -348,11 +348,30 @@ static int settleWindow(AXUIElementRef window,uint32_t wid,RibbonRect rect,Ribbo
     } while(!result);
     ribbon_settlement_release(state);return result==1?0:result;
 }
+// AX is an RPC into an application's event loop. Keep publishing observed
+// surface geometry while that RPC is outstanding, rather than blocking the
+// compositor until the application replies. The callback stays on its caller's
+// thread; the worker is joined before captured AX values can be released.
+static AXError geometryRequest(AXError (^request)(void),RibbonGeometryProgress progress,void *context) {
+    if(!progress)return request();
+    dispatch_semaphore_t done=dispatch_semaphore_create(0);
+    __block AXError result=kAXErrorFailure;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE,0),^{ @autoreleasepool {
+        result=request();dispatch_semaphore_signal(done);
+    }});
+    BOOL cancelled=NO;
+    while(dispatch_semaphore_wait(done,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_MSEC))) {
+        if(!cancelled&&progress(context))cancelled=YES;
+    }
+    if(!cancelled&&progress(context))cancelled=YES;
+    return cancelled?kAXErrorFailure:result;
+}
 static AXError acceptedSize(AXUIElementRef window,CGSize expected,CGSize *accepted,RibbonGeometryProgress progress,void *context) {
     double deadline=NSProcessInfo.processInfo.systemUptime+0.25;
     for(;;) {
         if(progress&&progress(context))return kAXErrorFailure;
-        CFTypeRef actual=NULL;AXError error=AXUIElementCopyAttributeValue(window,kAXSizeAttribute,&actual);
+        __block CFTypeRef actual=NULL;
+        AXError error=geometryRequest(^{ return AXUIElementCopyAttributeValue(window,kAXSizeAttribute,&actual); },progress,context);
         if(!error&&(!actual||!AXValueGetValue(actual,kAXValueCGSizeType,accepted)))error=kAXErrorFailure;
         if(actual)CFRelease(actual);
         if(error)return error;
@@ -388,12 +407,18 @@ static int resizeWindow(uint32_t wid,int expected_pid,RibbonRect target,BOOL log
     // Anchor it inside its monitor before sizing; the compositor owns the visual position.
     CGPoint position=CGPointMake(rect.x,rect.y);AXValueRef p=AXValueCreate(kAXValueCGPointType,&position);
     AXError error=0;
-    if(fabs(ax.x-position.x)>2||fabs(ax.y-position.y)>2)error=AXUIElementSetAttributeValue(w,kAXPositionAttribute,p);
+    if(fabs(ax.x-position.x)>2||fabs(ax.y-position.y)>2)error=geometryRequest(^{
+        if(ribbon_left_mouse_down()||!ribbon_session_active())return (AXError)kAXErrorCannotComplete;
+        return AXUIElementSetAttributeValue(w,kAXPositionAttribute,p);
+    },progress,context);
     CFRelease(p);
     if(!error&&progress&&progress(context))error=kAXErrorFailure;
     CGSize size=CGSizeMake(rect.width,rect.height);AXValueRef value=AXValueCreate(kAXValueCGSizeType,&size);
     if(!error&&ribbon_left_mouse_down())error=kAXErrorCannotComplete;
-    if(!error&&(fabs(ax.width-size.width)>2||fabs(ax.height-size.height)>2))error=AXUIElementSetAttributeValue(w,kAXSizeAttribute,value);
+    if(!error&&(fabs(ax.width-size.width)>2||fabs(ax.height-size.height)>2))error=geometryRequest(^{
+        if(ribbon_left_mouse_down()||!ribbon_session_active())return (AXError)kAXErrorCannotComplete;
+        return AXUIElementSetAttributeValue(w,kAXSizeAttribute,value);
+    },progress,context);
     CFRelease(value);
     CGSize accepted=CGSizeZero;
     if(!error)error=acceptedSize(w,size,&accepted,progress,context);
@@ -404,7 +429,10 @@ static int resizeWindow(uint32_t wid,int expected_pid,RibbonRect target,BOOL log
     RibbonRect after={0};
     if(!error)error=axGeometry(w,&after);
     p=AXValueCreate(kAXValueCGPointType,&position);
-    if(!error&&(fabs(after.x-position.x)>2||fabs(after.y-position.y)>2))error=AXUIElementSetAttributeValue(w,kAXPositionAttribute,p);
+    if(!error&&(fabs(after.x-position.x)>2||fabs(after.y-position.y)>2))error=geometryRequest(^{
+        if(ribbon_left_mouse_down()||!ribbon_session_active())return (AXError)kAXErrorCannotComplete;
+        return AXUIElementSetAttributeValue(w,kAXPositionAttribute,p);
+    },progress,context);
     CFRelease(p);
     if(error)fprintf(stderr,"Window %u AX resize failed (%d): requested=(%.1f,%.1f), accepted=(%.1f,%.1f)\n",wid,error,size.width,size.height,accepted.width,accepted.height);
     if(!error&&pending) {
