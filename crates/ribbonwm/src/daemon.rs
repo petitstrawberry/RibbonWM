@@ -1892,39 +1892,55 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                             geometry.resized.insert(p.window);
                             let viewport = engine.monitors[&p.monitor].viewport;
                             sizes.requests = sizes.requests.saturating_add(1);
-                            let begun = ribbon_macos::begin_resize_window(
-                                p.window,
-                                w.pid,
-                                if p.clip == Some(p.frame) {
-                                    p.frame
-                                } else {
-                                    resize_anchor(viewport, w.bounds, size.1, size.2)
-                                },
-                                ribbon_macos::FrameCalibration {
-                                    logical: *geometry
-                                        .logical_originals
-                                        .get(&p.window)
-                                        .context("Missing native frame calibration")?,
-                                    surface: w.surface_bounds.unwrap_or(w.bounds),
-                                },
-                                || {
-                                    if !ribbon_macos::session_active()
-                                        || ribbon_macos::left_mouse_down()
-                                    {
-                                        bail!(
-                                            "Session suspended or native mouse interaction began during geometry update"
-                                        );
-                                    }
-                                    let held =
-                                        sizes.presentation(&engine, &plans, &owners, measure);
-                                    backend.frame_with_sticky_in_viewports(
-                                        &held,
-                                        &owners,
-                                        &sticky_leases(&geometry),
-                                        &monitor_viewports(&engine),
-                                    )
-                                },
-                            );
+                            let begun = (|| {
+                                let physical = measure(p.window, w.pid)?;
+                                let mut anchor = resize_anchor(
+                                    viewport,
+                                    physical,
+                                    physical.width.max(size.1),
+                                    physical.height.max(size.2),
+                                );
+                                anchor.width = size.1;
+                                anchor.height = size.2;
+                                let held = sizes.presentation(&engine, &plans, &owners, measure);
+                                backend.prepare_resize(
+                                    &held,
+                                    &owners,
+                                    &sticky_leases(&geometry),
+                                    &monitor_viewports(&engine),
+                                    p.window,
+                                    anchor,
+                                )?;
+                                ribbon_macos::begin_resize_window(
+                                    p.window,
+                                    w.pid,
+                                    anchor,
+                                    ribbon_macos::FrameCalibration {
+                                        logical: *geometry
+                                            .logical_originals
+                                            .get(&p.window)
+                                            .context("Missing native frame calibration")?,
+                                        surface: w.surface_bounds.unwrap_or(w.bounds),
+                                    },
+                                    || {
+                                        if !ribbon_macos::session_active()
+                                            || ribbon_macos::left_mouse_down()
+                                        {
+                                            bail!(
+                                                "Session suspended or native mouse interaction began during geometry update"
+                                            );
+                                        }
+                                        let held =
+                                            sizes.presentation(&engine, &plans, &owners, measure);
+                                        backend.frame_with_sticky_in_viewports(
+                                            &held,
+                                            &owners,
+                                            &sticky_leases(&geometry),
+                                            &monitor_viewports(&engine),
+                                        )
+                                    },
+                                )
+                            })();
                             match begun {
                                 Ok(transaction) => {
                                     sizes.pending = Some(SizeSettlement {

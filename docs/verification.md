@@ -505,3 +505,15 @@ Loading this candidate into the existing Dock process started a zero-lease
 listener without restarting Dock. Native active-controller/non-socket handover
 regressions still pass. The exact original early-return branch was not recorded,
 so no narrower root-cause claim is made.
+
+
+The writer-policy candidate was deployed and the service resumed in the same
+process after its permission gate. Six live width changes reduced the duration
+of intermediate gap errors, but still recorded 1–5 mismatching samples per step
+and errors up to 482 points. These are independently sampled geometry values,
+not display-synchronized video frames; this is not a smoothness pass.
+
+A follow-up prepares the physical resize origin while preserving presentation.
+The owned native test verifies unchanged surface size, attached-child offsets,
+unchanged presentation after AppKit adopts the prepared origin, and rejection of
+an origin outside the retained viewport. Live comparison is still pending.

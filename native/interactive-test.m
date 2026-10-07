@@ -174,6 +174,27 @@ int main(void) { @autoreleasepool {
     sky.getBounds(sky.connection(),wid,&parentBounds);
     check(parentBounds.origin.x==240&&parentBounds.origin.y==260,
         "clipped window never anchors into the adjacent display");
+    [update removeObjectForKey:@"anchor"];
+    update[@"native_frame"]=rectangle(180,220,600,400);
+    check([frame(request)[@"ok"] boolValue],"resize origin prepared while presentation stays clipped");
+    sky.getBounds(sky.connection(),wid,&parentBounds);
+    sky.getTransform(sky.connection(),wid,&released);
+    check(parentBounds.origin.x==180&&parentBounds.origin.y==220&&parentBounds.size.width==400,
+        "resize preparation moves physical origin without resizing");
+    check(released.tx==-950&&released.ty==-260,"resize preparation preserves presented origin");
+    sky.getBounds(sky.connection(),childID,&childBounds);
+    check(fabs(childBounds.origin.x-parentBounds.origin.x-dx)<1&&fabs(childBounds.origin.y-parentBounds.origin.y-dy)<1,
+        "resize preparation moves physical child origins together");
+    CGFloat screenHeight=NSScreen.screens.firstObject.frame.size.height;
+    [window setFrameOrigin:NSMakePoint(180,screenHeight-220-window.frame.size.height)];
+    sky.getTransform(sky.connection(),wid,&released);
+    check(fabs(released.tx+950)<1&&fabs(released.ty+260)<1,
+        "AppKit catching up to prepared origin preserves presentation");
+    update[@"native_frame"]=rectangle(1100,220,600,400);
+    check(![frame(request)[@"ok"] boolValue],"resize origin outside retained monitor rejected");
+    sky.getBounds(sky.connection(),wid,&parentBounds);
+    check(parentBounds.origin.x==180&&parentBounds.origin.y==220,"invalid resize preparation leaves physical origin unchanged");
+    [update removeObjectForKey:@"native_frame"];
     actualDisableUpdates=sky.disableUpdates;actualEnableUpdates=sky.enableUpdates;
     sky.disableUpdates=countDisableUpdates;sky.enableUpdates=countEnableUpdates;
     actualSetTransform=sky.setTransform;sky.setTransform=failTransform;

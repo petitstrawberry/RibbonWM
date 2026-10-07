@@ -27,6 +27,10 @@ pub struct StickyWindow {
     pub pid: i32,
     pub enabled: bool,
 }
+enum NativePosition<'a> {
+    Settled(&'a BTreeSet<WindowId>),
+    Resize(WindowId, Rect),
+}
 #[derive(Serialize)]
 struct Update {
     wid: u32,
@@ -40,6 +44,8 @@ struct Update {
     #[serde(skip_serializing_if = "Option::is_none")]
     clip_viewport: Option<Rect>,
     anchor: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    native_frame: Option<Rect>,
 }
 #[derive(Serialize)]
 struct Request<'a> {
@@ -106,7 +112,8 @@ impl Backend {
                 && status.capabilities.iter().any(|c| c == "finish")
                 && status.capabilities.iter().any(|c| c == "pointer_drag")
                 && status.capabilities.iter().any(|c| c == "window_groups")
-                && status.capabilities.iter().any(|c| c == "native_anchor"),
+                && status.capabilities.iter().any(|c| c == "native_anchor")
+                && status.capabilities.iter().any(|c| c == "resize_anchor"),
         );
         if !matches!(status.version, 1 | 2) || status.uid != uid() {
             bail!("Unexpected payload version or user");
@@ -165,7 +172,7 @@ impl Backend {
     pub fn require_live_version(&self) -> Result<()> {
         if self.version.get() != 2 || !self.interactive.get() || !self.lifecycle.get() {
             bail!(
-                "Reload the Dock backend with nix develop -c sh scripts/load-backend.sh (protocol 2, interactive_clip, overview, finish, pointer_drag, window_groups and native_anchor required)"
+                "Reload the Dock backend with nix develop -c sh scripts/load-backend.sh (protocol 2, interactive_clip, overview, finish, pointer_drag, window_groups, native_anchor and resize_anchor required)"
             );
         }
         Ok(())
@@ -212,7 +219,25 @@ impl Backend {
             stickies,
             None,
             Some(viewports),
-            Some(anchors),
+            Some(NativePosition::Settled(anchors)),
+        )
+    }
+    pub fn prepare_resize(
+        &self,
+        placements: &[Placement],
+        owners: &BTreeMap<WindowId, i32>,
+        stickies: &[StickyWindow],
+        viewports: &BTreeMap<String, Rect>,
+        window: WindowId,
+        anchor: Rect,
+    ) -> Result<()> {
+        self.send_frame(
+            placements,
+            owners,
+            stickies,
+            None,
+            Some(viewports),
+            Some(NativePosition::Resize(window, anchor)),
         )
     }
     pub fn interactive_frame(
@@ -240,7 +265,7 @@ impl Backend {
         stickies: &[StickyWindow],
         viewports: Option<(&BTreeMap<String, Rect>, WindowId, Option<Rect>)>,
         clip_viewports: Option<&BTreeMap<String, Rect>>,
-        anchors: Option<&BTreeSet<WindowId>>,
+        native: Option<NativePosition<'_>>,
     ) -> Result<()> {
         self.require_live_version()?;
         if placements.len() > 128 {
@@ -271,7 +296,8 @@ impl Backend {
                                 .filter(|(_, id, _)| *id == p.window)
                                 .and_then(|(_, _, f)| f),
                             clip_viewport: clip_viewports.and_then(|v| v.get(&p.monitor).copied()),
-                            anchor: anchors.is_some_and(|ids| ids.contains(&p.window)),
+                            anchor: matches!(&native, Some(NativePosition::Settled(ids)) if ids.contains(&p.window)),
+                            native_frame: match native { Some(NativePosition::Resize(id, frame)) if id == p.window => Some(frame), _ => None },
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
@@ -306,6 +332,7 @@ impl Backend {
                 drag_frame: None,
                 clip_viewport: None,
                 anchor: false,
+                native_frame: None,
             }]),
             None,
             None,
@@ -325,6 +352,7 @@ impl Backend {
                     drag_frame: None,
                     clip_viewport: None,
                     anchor: false,
+                    native_frame: None,
                 })
             })
             .collect::<Result<Vec<_>>>()?;

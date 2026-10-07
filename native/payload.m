@@ -245,6 +245,8 @@ static NSDictionary *frame(NSDictionary *r) {
         CGRect viewport;
         if(u[@"viewport"]&&!rect(u[@"viewport"],&viewport))return error(@"Invalid interactive viewport");
         if(u[@"clip_viewport"]&&!rect(u[@"clip_viewport"],&viewport))return error(@"Invalid group viewport");
+        CGRect nativeFrame;
+        if(u[@"native_frame"]&&(!rect(u[@"native_frame"],&nativeFrame)||u[@"viewport"]||[u[@"anchor"] boolValue]||!u[@"clip_viewport"]||!CGRectContainsPoint(viewport,nativeFrame.origin)))return error(@"Invalid resize anchor");
         CGRect dragFrame;
         if(u[@"drag_frame"]&&(!u[@"viewport"]||!rect(u[@"drag_frame"],&dragFrame)))return error(@"Invalid pointer drag frame");
         [ids addObject:@((uint32_t)v)];
@@ -295,6 +297,14 @@ static NSDictionary *frame(NSDictionary *r) {
         }
         CGRect observed;
         if(!sky.getBounds(sky.connection(),wid,&observed)&&validSurfaceBounds(observed))w.nativeBounds=observed;
+        if(u[@"native_frame"] && [u[@"group_root"] unsignedIntValue]==wid) {
+            if(CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState,kCGMouseButtonLeft))return error(@"Native input owns geometry");
+            CGRect nativeFrame,viewport;rect(u[@"native_frame"],&nativeFrame);rect(u[@"clip_viewport"],&viewport);
+            if(!CGRectContainsPoint(viewport,nativeFrame.origin))return error(@"Resize anchor outside monitor");
+            CGPoint point=nativeFrame.origin;
+            if(sky.moveWithGroup(sky.connection(),wid,&point))return error(@"Cannot prepare native resize anchor");
+            if(!sky.getBounds(sky.connection(),wid,&observed)&&validSurfaceBounds(observed))w.nativeBounds=observed;
+        }
         if([u[@"anchor"] boolValue] && [u[@"group_root"] unsignedIntValue]==wid && !u[@"viewport"] &&
             !CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState,kCGMouseButtonLeft) &&
             fabs(w.nativeBounds.size.width-f.size.width)<=2 && fabs(w.nativeBounds.size.height-f.size.height)<=2) {
@@ -411,7 +421,7 @@ static NSDictionary *handle(id r) {
         }
         return @{@"ok":@YES,@"leases":leases,@"idle_seconds":@(NSProcessInfo.processInfo.systemUptime-lastUpdate)};
     }
-    if([r[@"op"] isEqual:@"hello"])return @{@"ok":@YES,@"version":@2,@"capabilities":hasStickyAPI?@[@"sticky",@"interactive_clip",@"overview",@"finish",@"pointer_drag",@"window_groups",@"native_anchor"]:@[@"interactive_clip",@"overview",@"finish",@"pointer_drag",@"window_groups",@"native_anchor"],@"build":buildName?:@"",@"pid":@(getpid()),@"uid":@(getuid()),@"controlled":@(controlledCount())};
+    if([r[@"op"] isEqual:@"hello"])return @{@"ok":@YES,@"version":@2,@"capabilities":hasStickyAPI?@[@"sticky",@"interactive_clip",@"overview",@"finish",@"pointer_drag",@"window_groups",@"native_anchor",@"resize_anchor"]:@[@"interactive_clip",@"overview",@"finish",@"pointer_drag",@"window_groups",@"native_anchor",@"resize_anchor"],@"build":buildName?:@"",@"pid":@(getpid()),@"uid":@(getuid()),@"controlled":@(controlledCount())};
     NSString *session=r[@"session"];
     if(![session isKindOfClass:NSString.class]||session.length==0||session.length>128)return error(@"Invalid session");
     if(controller&&![controller isEqual:session])return error(@"Another controller holds the lease");

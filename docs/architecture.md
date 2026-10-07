@@ -132,3 +132,11 @@ It is not re-measured from an AppKit origin left behind by a native group move:
 that would interpret the scroll displacement as a titlebar/chrome inset. The
 snapshot assumes stable client-frame decoration during a lease; applications
 that change their chrome need separate calibration lifecycle verification.
+
+
+Before AX resize, the payload prepares the physical origin inside the retained
+monitor while preserving the current presentation and clip in the same bounded
+update. AppKit then adopts that already prepared origin before changing size.
+This avoids letting an AX position write temporarily add the difference between
+physical and presented origins. Preparation refuses pointer ownership and an
+origin outside the retained viewport; it does not resize or change Space membership.
