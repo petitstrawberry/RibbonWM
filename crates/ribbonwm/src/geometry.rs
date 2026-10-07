@@ -15,6 +15,42 @@ pub struct SizeSettlement {
     pub transaction: ribbon_macos::PendingResize,
 }
 impl NativeSizes {
+    /// Commit the owner's final mouse geometry before a layout frame can issue
+    /// another size request. Inventory snapshots may predate mouse-up.
+    pub fn finish_user_resize(
+        &mut self,
+        engine: &mut Engine,
+        window: WindowId,
+        pid: i32,
+        surface: Rect,
+    ) -> anyhow::Result<()> {
+        if !surface.valid() || !(100.0..=10000.0).contains(&surface.width) {
+            return Ok(());
+        }
+        let Some(plan) = engine.placements().into_iter().find(|p| {
+            p.window == window
+                && !engine.monitors[&p.monitor].suspended
+                && engine.monitors[&p.monitor].native_space == p.native_space
+        }) else {
+            return Ok(());
+        };
+        let Some(&(owner, width, height)) = self.get(&window) else {
+            return Ok(());
+        };
+        if owner != pid {
+            return Ok(());
+        }
+        if (surface.width - width).abs() > 2.0 {
+            engine.observe_width(window, surface.width)?;
+        }
+        if (surface.height - height).abs() > 2.0 {
+            // A single tiled row retains full height. Stacked rows can adopt
+            // the owner's height without changing their column's total height.
+            let _ = engine.resize_row(&plan.monitor, window, surface.height);
+        }
+        self.insert(window, (pid, surface.width, surface.height));
+        Ok(())
+    }
     pub fn needs_resize(&self, id: WindowId, pid: i32, frame: Rect) -> bool {
         self.get(&id).is_none_or(|&(owner, width, height)| {
             owner != pid || (width - frame.width).abs() > 2.0 || (height - frame.height).abs() > 2.0
@@ -28,17 +64,57 @@ impl NativeSizes {
         plans: &[Placement],
         owners: &BTreeMap<WindowId, i32>,
     ) -> BTreeSet<WindowId> {
+        self.waiting_columns(
+            engine,
+            plans,
+            owners,
+            true,
+            self.pending.as_ref().map(|p| (p.window, p.size)),
+        )
+    }
+    /// AX acceptance and temporal settlement are different milestones. Once
+    /// the owner has accepted a size, displaying the old width would leave a
+    /// hole beside it until the settlement timer expires.
+    pub fn unaccepted_columns(
+        &self,
+        engine: &Engine,
+        plans: &[Placement],
+        owners: &BTreeMap<WindowId, i32>,
+    ) -> BTreeSet<WindowId> {
+        self.waiting_columns(
+            engine,
+            plans,
+            owners,
+            false,
+            self.pending.as_ref().map(|p| (p.window, p.size)),
+        )
+    }
+    fn waiting_columns(
+        &self,
+        engine: &Engine,
+        plans: &[Placement],
+        owners: &BTreeMap<WindowId, i32>,
+        settling: bool,
+        pending: Option<(WindowId, (i32, f64, f64))>,
+    ) -> BTreeSet<WindowId> {
         let mut waiting: BTreeSet<_> = plans
             .iter()
             .filter(|p| {
-                owners
-                    .get(&p.window)
-                    .is_some_and(|&pid| self.needs_resize(p.window, pid, p.frame))
+                owners.get(&p.window).is_some_and(|&pid| {
+                    self.needs_resize(p.window, pid, p.frame)
+                        && (settling
+                            || !pending.is_some_and(|(window, size)| {
+                                window == p.window
+                                    && size.0 == pid
+                                    && (size.1 - p.frame.width).abs() <= 2.0
+                                    && (size.2 - p.frame.height).abs() <= 2.0
+                            }))
+                })
             })
             .map(|p| p.window)
             .collect();
-        if let Some(job) = &self.pending {
-            waiting.insert(job.window);
+        if settling && let Some((window, _)) = pending {
+            waiting.insert(window);
         }
         for monitor in engine.monitors.values().filter(|m| !m.suspended) {
             for column in &monitor.layout().columns {
@@ -85,6 +161,42 @@ impl NativeSizes {
     }
 }
 
+/// Place neighbours using the widths actually being presented in this frame,
+/// not future widths that an owner has yet to accept. Scroll remains shared by
+/// every column, including a held column, and other contexts remain independent.
+pub fn reflow_presented_columns(engine: &Engine, desired: &[Placement], shown: &mut [Placement]) {
+    for monitor in engine.monitors.values() {
+        for layout in monitor.contexts.values() {
+            let Some(first) = layout.columns.first().and_then(|c| c.windows.first()) else {
+                continue;
+            };
+            let Some(mut x) = desired
+                .iter()
+                .find(|p| p.window == *first)
+                .map(|p| p.frame.x)
+            else {
+                continue;
+            };
+            for column in &layout.columns {
+                let width = shown
+                    .iter()
+                    .filter(|p| column.windows.contains(&p.window))
+                    .map(|p| p.frame.width)
+                    .reduce(f64::max)
+                    .unwrap_or(column.width);
+                for p in shown
+                    .iter_mut()
+                    .filter(|p| column.windows.contains(&p.window))
+                {
+                    p.frame.x = x;
+                    p.clip = p.frame.intersection(monitor.viewport);
+                }
+                x += width + engine.settings.gap;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,6 +211,139 @@ mod tests {
             }
         }
         writes
+    }
+    #[test]
+    fn mouse_release_adopts_final_width_before_the_next_size_request() {
+        let mut engine = Engine::new(Settings::default()).unwrap();
+        engine
+            .update_monitor(
+                "main",
+                Rect {
+                    x: 0.0,
+                    y: 30.0,
+                    width: 1500.0,
+                    height: 900.0,
+                },
+                NativeSpaceId(1),
+                false,
+            )
+            .unwrap();
+        engine.add_window("main", WindowId(1), Some(800.0)).unwrap();
+        let mut sizes = NativeSizes::default();
+        frame(&engine, &mut sizes);
+        let original = engine.placements()[0].frame;
+        for width in [940.0, 620.0, 1020.0, 520.0] {
+            let final_frame = Rect { width, ..original };
+            // The release sample is newer than the last asynchronous inventory.
+            sizes
+                .finish_user_resize(&mut engine, WindowId(1), 42, final_frame)
+                .unwrap();
+            assert_eq!(engine.placements()[0].frame.width, width);
+            assert!(
+                frame(&engine, &mut sizes).is_empty(),
+                "release must not undo a user resize with an AX write"
+            );
+        }
+        sizes
+            .finish_user_resize(&mut engine, WindowId(1), 99, original)
+            .unwrap();
+        assert_eq!(
+            engine.placements()[0].frame.width,
+            520.0,
+            "a reused ID cannot change the owner's size"
+        );
+        engine
+            .update_monitor(
+                "main",
+                Rect {
+                    x: 0.0,
+                    y: 30.0,
+                    width: 1500.0,
+                    height: 900.0,
+                },
+                NativeSpaceId(2),
+                false,
+            )
+            .unwrap();
+        sizes
+            .finish_user_resize(&mut engine, WindowId(1), 42, original)
+            .unwrap();
+        assert_eq!(
+            sizes.get(&WindowId(1)).unwrap().1,
+            520.0,
+            "inactive native Space is untouched"
+        );
+    }
+    #[test]
+    fn resizing_columns_never_publish_future_neighbour_spacing() {
+        for width in [500.0, 1100.0] {
+            let mut engine = Engine::new(Settings::default()).unwrap();
+            for (name, x) in [("main", 0.0), ("other", 1500.0)] {
+                engine
+                    .update_monitor(
+                        name,
+                        Rect {
+                            x,
+                            y: 30.0,
+                            width: 1500.0,
+                            height: 900.0,
+                        },
+                        NativeSpaceId(1),
+                        false,
+                    )
+                    .unwrap();
+            }
+            for id in 1..=3 {
+                engine
+                    .add_window("main", WindowId(id), Some(800.0))
+                    .unwrap();
+            }
+            engine
+                .add_window("other", WindowId(4), Some(700.0))
+                .unwrap();
+            engine.focus_window(WindowId(1)).unwrap();
+            engine.tick(2.0);
+            let mut sizes = NativeSizes::default();
+            frame(&engine, &mut sizes);
+            let committed = engine.placements();
+            let owners = (1..=4).map(|id| (WindowId(id), 42)).collect();
+            engine.apply("main", &Action::Resize { width }).unwrap();
+            engine
+                .apply("main", &Action::Scroll { delta: 100.0 })
+                .unwrap();
+            let desired = engine.placements();
+            let mut shown = desired.clone();
+            shown[0] = committed[0].clone();
+            reflow_presented_columns(&engine, &desired, &mut shown);
+            for pair in shown[..3].windows(2) {
+                assert!(
+                    (pair[1].frame.x - pair[0].frame.x - pair[0].frame.width - engine.settings.gap)
+                        .abs()
+                        < 1e-6
+                );
+            }
+            assert_eq!(shown[0].frame.x, desired[0].frame.x); // Held column shares scrolling.
+            assert_eq!(shown[3].frame, desired[3].frame); // Independent monitor.
+            assert_eq!(shown[0].frame.width, 800.0);
+            let pending = Some((WindowId(1), (42, width, desired[0].frame.height)));
+            assert!(
+                sizes
+                    .waiting_columns(&engine, &desired, &owners, false, pending)
+                    .is_empty()
+            );
+            assert_eq!(
+                sizes.waiting_columns(&engine, &desired, &owners, true, pending),
+                BTreeSet::from([WindowId(1)])
+            );
+            // Acceptance publishes the width and its neighbours together;
+            // the transaction can still be under temporal observation.
+            shown.clone_from(&desired);
+            reflow_presented_columns(&engine, &desired, &mut shown);
+            assert_eq!(shown[0].frame.width, width);
+            assert!(
+                (shown[1].frame.x - shown[0].frame.x - width - engine.settings.gap).abs() < 1e-6
+            );
+        }
     }
     #[test]
     fn stacked_rows_wait_together_without_holding_independent_columns() {

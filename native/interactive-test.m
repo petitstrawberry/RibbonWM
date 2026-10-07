@@ -11,6 +11,14 @@ static CGError (*actualGetBounds)(int,uint32_t,CGRect *);
 static uint32_t nullBoundsID;
 static CGError (*actualSetTransform)(int,uint32_t,CGAffineTransform);
 static unsigned transformWrites;
+static CGError (*actualDisableUpdates)(int);
+static CGError (*actualEnableUpdates)(int);
+static unsigned disabledUpdates,enabledUpdates;
+static CGError countDisableUpdates(int cid) { disabledUpdates++;return actualDisableUpdates(cid); }
+static CGError countEnableUpdates(int cid) { enabledUpdates++;return actualEnableUpdates(cid); }
+static CGError failTransform(int cid,uint32_t wid,CGAffineTransform transform) {
+    (void)cid;(void)wid;(void)transform;return kCGErrorFailure;
+}
 static CGError countTransformWrites(int cid,uint32_t wid,CGAffineTransform transform) {
     transformWrites++;return actualSetTransform(cid,wid,transform);
 }
@@ -139,6 +147,43 @@ int main(void) { @autoreleasepool {
     sky.getTransform(sky.connection(),childID,&childTransform);
     check(fabs(childTransform.tx+lastNative.origin.x)<1&&fabs(childTransform.ty+lastNative.origin.y)<1,
         "null bounds release uses last observed finite native position");
+    update[@"anchor"]=@YES;
+    update[@"frame"]=rectangle(240,260,400,400);
+    update[@"clip"]=rectangle(240,260,400,400);
+    check([frame(request)[@"ok"] boolValue],"settled frame aligns native position without AX resize");
+    sky.getBounds(sky.connection(),wid,&parentBounds);
+    sky.getTransform(sky.connection(),wid,&released);
+    check(parentBounds.origin.x==240&&parentBounds.origin.y==260&&parentBounds.size.width==400&&parentBounds.size.height==400,
+        "idle anchor changes native origin only");
+    check(released.tx==-240&&released.ty==-260,"idle native and presentation coordinates agree");
+    [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+    NSRect ownerFrame=window.frame;
+    printf("owner frame after anchor=(%g,%g,%g,%g)\n",ownerFrame.origin.x,ownerFrame.origin.y,ownerFrame.size.width,ownerFrame.size.height);
+    sky.getBounds(sky.connection(),childID,&childBounds);
+    check(fabs(childBounds.origin.x-parentBounds.origin.x-dx)<1&&fabs(childBounds.origin.y-parentBounds.origin.y-dy)<1,
+        "native anchor moves the attached group together");
+    update[@"viewport"]=rectangle(100,100,900,700);
+    update[@"frame"]=rectangle(300,300,400,400);
+    check([frame(request)[@"ok"] boolValue],"interactive frame ignores a native anchor request");
+    sky.getBounds(sky.connection(),wid,&parentBounds);
+    check(parentBounds.origin.x==240&&parentBounds.origin.y==260,"mouse ownership suppresses native anchor writes");
+    [update removeObjectForKey:@"viewport"];
+    update[@"frame"]=rectangle(950,260,400,400);
+    update[@"clip"]=rectangle(950,260,50,400);
+    check([frame(request)[@"ok"] boolValue],"clipped placement accepts the presentation frame");
+    sky.getBounds(sky.connection(),wid,&parentBounds);
+    check(parentBounds.origin.x==240&&parentBounds.origin.y==260,
+        "clipped window never anchors into the adjacent display");
+    actualDisableUpdates=sky.disableUpdates;actualEnableUpdates=sky.enableUpdates;
+    sky.disableUpdates=countDisableUpdates;sky.enableUpdates=countEnableUpdates;
+    actualSetTransform=sky.setTransform;sky.setTransform=failTransform;
+    check(![frame(request)[@"ok"] boolValue],"failed compositor write is reported");
+    sky.setTransform=actualSetTransform;
+    check(disabledUpdates==1&&enabledUpdates==1,"failed frame always reenables display updates");
+    check([frame(request)[@"ok"] boolValue],"next frame succeeds after a failed write");
+    check(disabledUpdates==2&&enabledUpdates==2,"successful frame also balances display updates");
+    sky.disableUpdates=actualDisableUpdates;sky.enableUpdates=actualEnableUpdates;
+    check(!restoreAll(),"anchored fixture releases its lease");
     [window removeChildWindow:child];
     [child close];[window close];return 0;
 } }

@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use ribbon_core::{Placement, Rect, WindowId};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -39,6 +39,7 @@ struct Update {
     drag_frame: Option<Rect>,
     #[serde(skip_serializing_if = "Option::is_none")]
     clip_viewport: Option<Rect>,
+    anchor: bool,
 }
 #[derive(Serialize)]
 struct Request<'a> {
@@ -104,7 +105,8 @@ impl Backend {
             status.capabilities.iter().any(|c| c == "overview")
                 && status.capabilities.iter().any(|c| c == "finish")
                 && status.capabilities.iter().any(|c| c == "pointer_drag")
-                && status.capabilities.iter().any(|c| c == "window_groups"),
+                && status.capabilities.iter().any(|c| c == "window_groups")
+                && status.capabilities.iter().any(|c| c == "native_anchor"),
         );
         if !matches!(status.version, 1 | 2) || status.uid != uid() {
             bail!("Unexpected payload version or user");
@@ -163,7 +165,7 @@ impl Backend {
     pub fn require_live_version(&self) -> Result<()> {
         if self.version.get() != 2 || !self.interactive.get() || !self.lifecycle.get() {
             bail!(
-                "Reload the Dock backend with nix develop -c sh scripts/load-backend.sh (protocol 2, interactive_clip, overview, finish, pointer_drag and window_groups required)"
+                "Reload the Dock backend with nix develop -c sh scripts/load-backend.sh (protocol 2, interactive_clip, overview, finish, pointer_drag, window_groups and native_anchor required)"
             );
         }
         Ok(())
@@ -185,7 +187,7 @@ impl Backend {
         owners: &BTreeMap<WindowId, i32>,
         stickies: &[StickyWindow],
     ) -> Result<()> {
-        self.send_frame(placements, owners, stickies, None, None)
+        self.send_frame(placements, owners, stickies, None, None, None)
     }
     pub fn frame_with_sticky_in_viewports(
         &self,
@@ -194,7 +196,24 @@ impl Backend {
         stickies: &[StickyWindow],
         viewports: &BTreeMap<String, Rect>,
     ) -> Result<()> {
-        self.send_frame(placements, owners, stickies, None, Some(viewports))
+        self.send_frame(placements, owners, stickies, None, Some(viewports), None)
+    }
+    pub fn settled_frame(
+        &self,
+        placements: &[Placement],
+        owners: &BTreeMap<WindowId, i32>,
+        stickies: &[StickyWindow],
+        viewports: &BTreeMap<String, Rect>,
+        anchors: &BTreeSet<WindowId>,
+    ) -> Result<()> {
+        self.send_frame(
+            placements,
+            owners,
+            stickies,
+            None,
+            Some(viewports),
+            Some(anchors),
+        )
     }
     pub fn interactive_frame(
         &self,
@@ -211,6 +230,7 @@ impl Backend {
             stickies,
             Some((viewports, window, drag_frame)),
             Some(viewports),
+            None,
         )
     }
     fn send_frame(
@@ -220,6 +240,7 @@ impl Backend {
         stickies: &[StickyWindow],
         viewports: Option<(&BTreeMap<String, Rect>, WindowId, Option<Rect>)>,
         clip_viewports: Option<&BTreeMap<String, Rect>>,
+        anchors: Option<&BTreeSet<WindowId>>,
     ) -> Result<()> {
         self.require_live_version()?;
         if placements.len() > 128 {
@@ -250,6 +271,7 @@ impl Backend {
                                 .filter(|(_, id, _)| *id == p.window)
                                 .and_then(|(_, _, f)| f),
                             clip_viewport: clip_viewports.and_then(|v| v.get(&p.monitor).copied()),
+                            anchor: anchors.is_some_and(|ids| ids.contains(&p.window)),
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
@@ -283,6 +305,7 @@ impl Backend {
                 viewport: None,
                 drag_frame: None,
                 clip_viewport: None,
+                anchor: false,
             }]),
             None,
             None,
@@ -301,6 +324,7 @@ impl Backend {
                     viewport: None,
                     drag_frame: None,
                     clip_viewport: None,
+                    anchor: false,
                 })
             })
             .collect::<Result<Vec<_>>>()?;

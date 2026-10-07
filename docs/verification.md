@@ -440,3 +440,37 @@ inactive Space; native-focus tests require the newly chosen offscreen window to
 be fully visible in the first placement without an intervening animation tick.
 These checks do not yet establish actual Dock animation smoothness. Deployment
 and physical Mission Control acceptance must be recorded separately.
+
+
+### Geometry handoff investigation (2026-10-07)
+
+The overview correction `0c9c872` was activated and its matching service/payload
+verified. Subsequent recordings still showed serious drag and width-transition
+failures; that deployment is not a general visual acceptance pass.
+
+A manual owned-window trace reproduced a stationary-pointer grab jumping from
+(1088,57) to (1618,-168), then being corrected on a later WM frame. Its physical
+origin before the grab was (558,282). The jump was exactly the stale physical /
+presentation offset being applied again by the owner. Correcting after that
+first move cannot prevent the already displayed bad frame.
+
+An owned-window-only experiment aligned native and displayed origins while
+idle, without resizing. In five subsequent titlebar press intervals, the maximum
+displacement while the pointer remained within two points of its press was
+0–1 point, versus up to about 1005 points in the baseline sample. The experiment
+used the fixture's own connection, not a newly deployed Dock payload. It does
+not establish clipped-window behavior, arbitrary application compatibility,
+release-animation smoothness, or Mission Control quality. AppKit's cached frame
+can remain stale after a native group move, so matching WindowServer coordinates
+alone was not treated as sufficient evidence.
+
+The candidate adds settled, fully visible native group anchoring, batches native
+presentation writes, and adopts the final owner size at mouse release before
+issuing layout writes. Neighbour spacing now follows held presentation widths
+rather than future requested widths, and accepted size changes no longer wait
+for the temporal stability timer before presentation. 77 Rust tests, Clippy,
+and the native owned-surface tests pass. Regressions include unchanged dimensions
+and child offsets during anchoring, refusing anchors for clipped/interactive
+windows, balancing display-update suspension after an injected failure, and no
+AX resize request when accepting a completed user width change. Candidate
+production deployment and intermediate-frame width validation remain pending.

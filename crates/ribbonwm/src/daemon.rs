@@ -1494,6 +1494,13 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                 // Discard inventory taken before the owner's final mouse-up
                 // transaction before reconciling its accepted dimensions.
                 inventory.invalidate();
+                if !suspended
+                    && let Some(id) = previous_drag
+                    && let Some(owner) = geometry.originals.get(&id)
+                    && let Ok((surface, _)) = ribbon_macos::window_drag_geometry(id, owner.pid)
+                {
+                    sizes.finish_user_resize(&mut engine, id, owner.pid, surface)?;
+                }
             }
             if !options.dry_run
                 && session_active
@@ -1819,7 +1826,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                 let mut geometry_changed = false;
                 // Publish every row of a resized column together. Waiting on
                 // that column does not stop animations on independent columns.
-                let waiting = sizes.unsettled_columns(&engine, &plans, &owners);
+                let waiting = sizes.unaccepted_columns(&engine, &plans, &owners);
                 let pending = !waiting.is_empty();
                 let mut held = plans.clone();
                 if pending {
@@ -1850,6 +1857,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                             p.clip = p.frame.intersection(engine.monitors[&p.monitor].viewport);
                         }
                     }
+                    crate::geometry::reflow_presented_columns(&engine, &plans, &mut held);
                     // Drag captures already took the interactive-only branch
                     // above. Save originals before AX changes the transform.
                     backend.frame_with_sticky_in_viewports(
@@ -1994,9 +2002,10 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                     // displayed position rather than jumping over that stalled time.
                     last_tick = Instant::now();
                 }
-                let waiting = sizes.unsettled_columns(&engine, &plans, &owners);
-                let plans: Vec<_> = plans
-                    .into_iter()
+                let waiting = sizes.unaccepted_columns(&engine, &plans, &owners);
+                let mut shown: Vec<_> = plans
+                    .iter()
+                    .cloned()
                     .zip(held)
                     .map(|(plan, previous)| {
                         if waiting.contains(&plan.window) {
@@ -2006,6 +2015,8 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                         }
                     })
                     .collect();
+                crate::geometry::reflow_presented_columns(&engine, &plans, &mut shown);
+                let plans = shown;
                 // Focus/native selection metadata does not change compositor geometry.
                 let frame = serde_json::to_vec(
                     &plans
@@ -2017,11 +2028,29 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                     || frame != last_frame
                     || start.duration_since(last_send) >= Duration::from_millis(50)
                 {
-                    backend.frame_with_sticky_in_viewports(
+                    let anchors = plans
+                        .iter()
+                        .filter(|p| {
+                            let m = &engine.monitors[&p.monitor];
+                            !reconciling_overview
+                                && sizes.pending.is_none()
+                                && !m.suspended
+                                && m.native_space == p.native_space
+                                && p.clip == Some(p.frame)
+                                && (m.layout().scroll.position - m.layout().scroll.target).abs()
+                                    < 0.01
+                                && owners
+                                    .get(&p.window)
+                                    .is_some_and(|&pid| !sizes.needs_resize(p.window, pid, p.frame))
+                        })
+                        .map(|p| p.window)
+                        .collect();
+                    backend.settled_frame(
                         &plans,
                         &owners,
                         &sticky_leases(&geometry),
                         &monitor_viewports(&engine),
+                        &anchors,
                     )?;
                     last_frame = frame;
                     committed = plans;

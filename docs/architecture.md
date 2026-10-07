@@ -56,15 +56,22 @@ Optional `enableDockInjection` installs a root LaunchDaemon that selects the con
 
 ## Native interaction and attached surfaces
 
-Scrolling and focus update the compositor frame without rebasing physical
-geometry at rest. Partly clipped columns retain compositor scrolling; physical
+Scrolling and focus update the compositor frame. Once scrolling and native size
+settlement finish, fully visible roots align their physical origin with their
+presented origin using a native group move, without an AX size write. This
+prevents the stale physical/display offset from being added to the next native
+drag. Partly clipped columns retain compositor scrolling; physical
 placement never crosses a monitor merely to emulate scroll. Geometry writes stop when a
 mouse press begins. A capture uses the last committed display position as its
 grab anchor. If physical and displayed geometry already agree, AppKit owns the
 entire drag; otherwise one initial offset correction removes the stale
 translation, after which interactive frames update clips without overwriting
-the owner's transform. Releasing a drag invalidates older inventory and reconciles accepted dimensions;
-it does not itself schedule a native position or size write.
+the owner's transform. Releasing a drag invalidates older inventory and reads the final native size
+before normal layout resumes. This prevents the previous width from being
+written back while asynchronous discovery catches up. Native anchoring is
+disabled while the mouse is held, during overview reconciliation, on inactive
+Spaces, and for partly clipped windows. A bounded payload display-update block
+publishes group moves, transforms, and clips together, with no AX calls inside it.
 
 The Dock payload resolves `SLSCopyAssociatedWindows` with query-iterator parent
 IDs. Only descendants with the same owner PID join a root's lease. Attached

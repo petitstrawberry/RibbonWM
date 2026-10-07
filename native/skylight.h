@@ -12,6 +12,9 @@ typedef struct {
     CGError (*newRegion)(const CGRect *, CFTypeRef *);
     CGError (*releaseRegion)(CFTypeRef);
     CGError (*getBounds)(int, uint32_t, CGRect *);
+    CGError (*moveWithGroup)(int, uint32_t, CGPoint *);
+    CGError (*disableUpdates)(int);
+    CGError (*enableUpdates)(int);
 } SkyLight;
 
 static bool loadSkyLight(SkyLight *s) {
@@ -26,6 +29,9 @@ static bool loadSkyLight(SkyLight *s) {
     LOAD(newRegion, "CGSNewRegionWithRect");
     LOAD(releaseRegion, "CGSReleaseRegion");
     LOAD(getBounds, "SLSGetWindowBounds");
+    LOAD(moveWithGroup, "SLSMoveWindowWithGroup");
+    LOAD(disableUpdates, "SLSDisableUpdate");
+    LOAD(enableUpdates, "SLSReenableUpdate");
 #undef LOAD
     return true;
 }

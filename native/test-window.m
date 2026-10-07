@@ -92,6 +92,25 @@ static NSDictionary *associatedState(SkyLight sky,uint32_t wid) {
 @property NSRunningApplication *previous;
 @end
 @implementation Fixture
+- (void)anchorNative {
+    if(ribbon_left_mouse_down()||self.target.alphaValue==0)return;
+    uint32_t wid=(uint32_t)self.target.windowNumber;CGRect bounds;CGAffineTransform t;
+    if(self.sky.getBounds(self.sky.connection(),wid,&bounds)||self.sky.getTransform(self.sky.connection(),wid,&t))return;
+    if(t.a!=1||t.d!=1||t.b!=0||t.c!=0)return;
+    CGRect shown=CGRectMake(-t.tx,-t.ty,bounds.size.width,bounds.size.height);
+    BOOL visible=NO;
+    for(NSScreen *screen in NSScreen.screens) {
+        CGRect display=CGDisplayBounds([screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue]);
+        if(CGRectContainsRect(display,shown))visible=YES;
+    }
+    if(!visible||(fabs(bounds.origin.x-shown.origin.x)<=1&&fabs(bounds.origin.y-shown.origin.y)<=1))return;
+    if(self.sky.disableUpdates(self.sky.connection()))return;
+    CGPoint point=shown.origin;
+    CGError error=self.sky.moveWithGroup(self.sky.connection(),wid,&point);
+    if(!error)error=self.sky.setTransform(self.sky.connection(),wid,t);
+    self.sky.enableUpdates(self.sky.connection());
+    reply(@{@"event":@"native-anchor",@"error":@(error),@"x":@(point.x),@"y":@(point.y)});
+}
 - (void)stop {
     [self.target close];for(NSWindow *panel in self.backdrops)[panel close];
     if(NSApp.active)[self.previous activateWithOptions:0];
@@ -181,6 +200,8 @@ static NSDictionary *associatedState(SkyLight sky,uint32_t wid) {
     self.target.alphaValue=0;self.target.ignoresMouseEvents=YES;
     TestView *view=[[TestView alloc] initWithFrame:NSMakeRect(0,0,400,400)];view.target=YES;view.surface=@"target";self.target.contentView=view;
     [self.target orderFrontRegardless];[self.target displayIfNeeded];
+    if([self.configuration[@"anchor_idle"] boolValue])
+        [NSTimer scheduledTimerWithTimeInterval:0.016 target:self selector:@selector(anchorNative) userInfo:nil repeats:YES];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,200*NSEC_PER_MSEC),dispatch_get_main_queue(),^{
         reply(@{@"ready":@YES,@"pid":@(getpid()),@"wid":@(self.target.windowNumber)});
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{

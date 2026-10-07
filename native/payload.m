@@ -254,6 +254,10 @@ static NSDictionary *frame(NSDictionary *r) {
     for(NSDictionary *u in updates)[ids addObject:u[@"wid"]];
     NSMutableSet *allIDs=[ids mutableCopy];[allIDs unionSet:stickyIDs];
     if(allIDs.count>512)return error(@"At most 512 surfaces including children");
+    // Publish clips, transforms, and idle native anchors as one display update.
+    // No AX calls or application waits belong inside this bounded transaction.
+    if(sky.disableUpdates(sky.connection()))return error(@"Cannot begin frame update");
+    @try {
     if(restoreSticky(stickyIDs))return error(@"Could not restore removed sticky lease");
     for(NSDictionary *u in stickies) {
         if(ownerPID([u[@"wid"] unsignedIntValue])!=[u[@"pid"] intValue])continue;
@@ -291,6 +295,21 @@ static NSDictionary *frame(NSDictionary *r) {
         }
         CGRect observed;
         if(!sky.getBounds(sky.connection(),wid,&observed)&&validSurfaceBounds(observed))w.nativeBounds=observed;
+        if([u[@"anchor"] boolValue] && [u[@"group_root"] unsignedIntValue]==wid && !u[@"viewport"] &&
+            !CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState,kCGMouseButtonLeft) &&
+            fabs(w.nativeBounds.size.width-f.size.width)<=2 && fabs(w.nativeBounds.size.height-f.size.height)<=2) {
+            CGRect viewport,visible;
+            // Only fully visible, settled roots can become native anchors.
+            // Offscreen columns must never migrate to a neighbouring display.
+            if(rect(u[@"clip_viewport"],&viewport)&&rect(u[@"clip"],&visible)&&
+                CGRectContainsRect(viewport,f)&&CGRectEqualToRect(visible,f)&&
+                (fabs(w.nativeBounds.origin.x-f.origin.x)>1||fabs(w.nativeBounds.origin.y-f.origin.y)>1)) {
+                CGPoint point=f.origin;
+                CGError moved=sky.moveWithGroup(sky.connection(),wid,&point);
+                if(moved)return error(@"Cannot align settled native position");
+                if(!sky.getBounds(sky.connection(),wid,&observed)&&validSurfaceBounds(observed))w.nativeBounds=observed;
+            }
+        }
         CGRect local=CGRectZero;
         BOOL interactive=u[@"viewport"]!=nil;
         BOOL pointerDrag=u[@"drag_frame"]!=nil;
@@ -324,6 +343,7 @@ static NSDictionary *frame(NSDictionary *r) {
     lastUpdate=NSProcessInfo.processInfo.systemUptime;
     if(controlledCount()==0)controller=nil;
     return @{@"ok":@YES,@"controlled":@(controlledCount())};
+    } @finally { sky.enableUpdates(sky.connection()); }
 }
 static NSDictionary *overview(void) {
     for(RibbonSavedWindowV4 *w in saved.allValues) {
@@ -391,7 +411,7 @@ static NSDictionary *handle(id r) {
         }
         return @{@"ok":@YES,@"leases":leases,@"idle_seconds":@(NSProcessInfo.processInfo.systemUptime-lastUpdate)};
     }
-    if([r[@"op"] isEqual:@"hello"])return @{@"ok":@YES,@"version":@2,@"capabilities":hasStickyAPI?@[@"sticky",@"interactive_clip",@"overview",@"finish",@"pointer_drag",@"window_groups"]:@[@"interactive_clip",@"overview",@"finish",@"pointer_drag",@"window_groups"],@"build":buildName?:@"",@"pid":@(getpid()),@"uid":@(getuid()),@"controlled":@(controlledCount())};
+    if([r[@"op"] isEqual:@"hello"])return @{@"ok":@YES,@"version":@2,@"capabilities":hasStickyAPI?@[@"sticky",@"interactive_clip",@"overview",@"finish",@"pointer_drag",@"window_groups",@"native_anchor"]:@[@"interactive_clip",@"overview",@"finish",@"pointer_drag",@"window_groups",@"native_anchor"],@"build":buildName?:@"",@"pid":@(getpid()),@"uid":@(getuid()),@"controlled":@(controlledCount())};
     NSString *session=r[@"session"];
     if(![session isKindOfClass:NSString.class]||session.length==0||session.length>128)return error(@"Invalid session");
     if(controller&&![controller isEqual:session])return error(@"Another controller holds the lease");
