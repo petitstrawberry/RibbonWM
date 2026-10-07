@@ -79,7 +79,8 @@ Known unresolved issues include:
   and leased levels, but cannot restore application sizes after SIGKILL.
 - Gesture conflicts with application scrolling and macOS Spaces.
 
-Cross-monitor window transfer, BSP operations, full yabai rule/signal
+Mouse-driven window swapping, cross-monitor window transfer (including dragging),
+BSP operations, full yabai rule/signal
 compatibility and persistent layout state are not implemented. A configured
 `frame_rate = 120` is a scheduling target; measurements do not establish sustained
 120 fps or display-synchronized rendering.
