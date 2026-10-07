@@ -567,3 +567,15 @@ parent/child restoration, idempotence, owner/controller checks, and restoring
 a pre-existing modal level. Centering is covered for a monitor above/left of
 the primary display and for an oversized surface. Dock service deployment and
 its live float/center transitions remain pending for this change.
+
+
+The floating change was deployed through nix-darwin. Permission was checked
+using the new executable in a fresh launchd context before replacing the
+service; the new service then passed readiness without a permission relaunch.
+On the currently connected built-in display, the production Dock backend passed
+three float/unfloat cycles and a sticky→float→unfloat→unsticky cycle on an owned
+regular AppKit fixture. All four floats had native outer frame (556,57,400,901),
+floating level3, and matching AppKit/native/presentation coordinates. Unfloat
+restored level0 and rejoined tiling, while sticky-only preserved level0. Owned
+fixtures closed and the service remained live. This run does not add runtime
+multi-monitor coverage beyond the negative-origin layout tests.
