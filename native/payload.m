@@ -334,9 +334,10 @@ static NSDictionary *overview(void) {
         CGError er=sky.newRegion(&full,&region);
         CGError ec=er?er:sky.setClip(sky.connection(),w.wid,region);
         if(region)sky.releaseRegion(region);
-        CGAffineTransform native=CGAffineTransformMakeTranslation(-b.origin.x,-b.origin.y);
-        CGError et=ec?ec:sky.setTransform(sky.connection(),w.wid,native);
-        if(ec||et)return error(@"Cannot expose full window");
+        // Dock may already be animating this surface when overview is observed.
+        // Expose its full contents without replacing Dock's current transform
+        // with the owner's (possibly stale) physical resize anchor.
+        if(ec)return error(@"Cannot expose full window");
     }
     lastUpdate=NSProcessInfo.processInfo.systemUptime;
     return @{@"ok":@YES};

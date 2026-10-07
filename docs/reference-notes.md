@@ -25,8 +25,10 @@ PaperWM and OmniWM source is used as design research; no GPL source is copied in
 RibbonWM's independent implementation records native PID/window transitions,
 reveals an application on return even when its column was already selected, and
 retains the offset for automatic selection on a native Space change. Mission
-Control return requests one explicit reveal. Its Dock compositor also restores
-cached committed placements immediately during the reconciliation hold, rather
-than leaving windows at their common physical resize anchors for 200 ms. Those
+Control return requests one explicit reveal. The first follow-up restored cached placements during the reconciliation hold,
+but subsequent user video exposed an old-layout flash. The transition correction
+now resolves native selection before the first resumed frame and reserves that
+hold for AX geometry reconciliation. Overview entry exposes full clips without
+replacing transforms already controlled by Dock animation. Those
 transform/clip details are specific to RibbonWM; the other projects' behavior
 is not runtime evidence for this backend.

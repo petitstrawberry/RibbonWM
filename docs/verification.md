@@ -410,3 +410,33 @@ LaunchAgent arguments no longer excluded ChatGPT. Status reported one presented
 window. The width/move measurements above apply to `4bab26b`, not this later
 release. Physical Mission Control exit and Dock selection behavior have not yet
 been verified against the installed follow-up.
+
+
+### Mission Control transition correction (2026-10-07)
+
+The next two user recordings disproved visual acceptance of the preceding
+follow-up: entry/exit jumped, and selecting a different application first showed
+the old tiled strip before revealing the selection. A read-only Dock observer
+recorded five native overview enter/exit cycles. Each had one active/inactive
+transition; no repeated false exit was observed in this sample. This does not
+prove event ordering on every system.
+
+Two concrete write-order defects were corrected. Overview entry previously
+replaced every retained surface transform with its physical anchor, even though
+Dock could already be animating it. Entry now only exposes the full clip and
+retains the lease, leaving both root and child transforms untouched. Exit no
+longer replays the previous committed strip before a 200 ms total pause. It
+refreshes native context and focus on the first resumed frame, completes only
+the selected context's scroll immediately, then publishes that layout. The
+200 ms hold applies to AX size writes and inventory adoption, not selection.
+No second horizontal reveal animation follows Dock's animation.
+
+75 Rust tests and Clippy pass. The native owned-surface regression installs an
+in-flight scale/translation before calling overview, verifies zero transform
+writes for the entire family, full 400×400 clipping, and exact preservation of
+the transform. Native lifecycle/null-bounds and query/settlement tests also pass.
+Core tests cover clearing stale easing without settling another monitor or
+inactive Space; native-focus tests require the newly chosen offscreen window to
+be fully visible in the first placement without an intervening animation tick.
+These checks do not yet establish actual Dock animation smoothness. Deployment
+and physical Mission Control acceptance must be recorded separately.

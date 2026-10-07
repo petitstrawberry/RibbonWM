@@ -1228,6 +1228,23 @@ impl Engine {
         w.remember_focus();
         Ok(())
     }
+    /// Complete only this native context's scroll when a system animation has
+    /// already brought its selected window forward (for example Mission Control).
+    pub fn settle_scroll(&mut self, monitor: &str) -> Result<(), LayoutError> {
+        let m = self
+            .monitors
+            .get_mut(monitor)
+            .ok_or(LayoutError::UnknownMonitor)?;
+        if !m.suspended {
+            let s = &mut m.layout_mut().scroll;
+            *s = Scroll {
+                position: s.target,
+                target: s.target,
+                ..Scroll::default()
+            };
+        }
+        Ok(())
+    }
     pub fn tick(&mut self, dt: f64) {
         for m in self.monitors.values_mut().filter(|m| !m.suspended) {
             let viewport = m.viewport;

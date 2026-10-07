@@ -849,6 +849,42 @@ fn timed_animation_finishes_in_a_quarter_second_at_multiple_refresh_rates() {
     }
 }
 #[test]
+fn system_selection_settles_only_its_context_and_clears_old_easing() {
+    let mut e = engine();
+    e.settings.animation_curve = AnimationCurve::EaseInOut;
+    e.update_monitor("right", rect(1200.0, 1200.0), NativeSpaceId(8), false)
+        .unwrap();
+    for id in 1..=3 {
+        add(&mut e, id);
+    }
+    for id in 4..=6 {
+        e.add_window("right", WindowId(id), Some(800.0)).unwrap();
+    }
+    e.tick(0.04);
+    let other = e.monitors["right"].layout().scroll;
+    e.focus_window(WindowId(1)).unwrap();
+    e.settle_scroll("left").unwrap();
+    let selected = e.monitors["left"].layout().scroll;
+    assert_eq!(selected.position, selected.target);
+    assert_eq!(selected.velocity, 0.0);
+    assert_eq!(e.monitors["right"].layout().scroll.position, other.position);
+    assert_eq!(e.monitors["right"].layout().scroll.target, other.target);
+    e.tick(0.01);
+    assert_eq!(
+        e.monitors["left"].layout().scroll.position,
+        selected.position
+    );
+    e.update_monitor("left", rect(0.0, 1200.0), NativeSpaceId(9), false)
+        .unwrap();
+    e.settle_scroll("left").unwrap();
+    assert_eq!(
+        e.monitors["left"].contexts[&NativeSpaceId(3)]
+            .scroll
+            .position,
+        selected.position
+    );
+}
+#[test]
 fn timed_animation_retargets_from_the_displayed_position_without_overshoot() {
     let mut scroll = Scroll {
         target: 1000.0,

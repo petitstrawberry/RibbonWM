@@ -89,13 +89,18 @@ int main(void) { @autoreleasepool {
     check(CGAffineTransformEqualToTransform(original,released),"original transform restored exactly");
     update[@"clip"]=NSNull.null;
     check([frame(request)[@"ok"] boolValue],"fully hidden surface leased");
+    CGAffineTransform dock=CGAffineTransformMake(1.5,0,0,1.5,-180,-160);
+    check(!sky.setTransform(sky.connection(),wid,dock),"simulate Dock entering overview before notification");
+    actualSetTransform=sky.setTransform;transformWrites=0;sky.setTransform=countTransformWrites;
     check([overview()[@"ok"] boolValue],"overview removes hidden clip without dropping the lease");
+    sky.setTransform=actualSetTransform;
+    check(transformWrites==0,"overview never overwrites root or attached Dock animation transforms");
     CFTypeRef full=NULL;CGRect fullBounds=CGRectZero;
     check(!sky.copyClip(sky.connection(),wid,&full)&&!regionBounds(full,&fullBounds),"read exposed full clip");
     sky.releaseRegion(full);
     check(fullBounds.size.width==400&&fullBounds.size.height==400&&saved.count==2,"overview exposes complete real surface and retains snapshot");
     sky.getTransform(sky.connection(),wid,&released);
-    check(CGAffineTransformEqualToTransform(original,released),"overview returns native transform");
+    check(CGAffineTransformEqualToTransform(dock,released),"overview preserves the in-flight Dock transform");
     update[@"clip"]=rectangle(200,200,400,400);
     check([frame(request)[@"ok"] boolValue],"layout resumes after overview");
     NSMutableDictionary *bad=[update mutableCopy];bad[@"pid"]=@(getpid()+1);
@@ -111,10 +116,11 @@ int main(void) { @autoreleasepool {
     [window setFrameOrigin:NSMakePoint(350,350)];
     [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
     sky.getBounds(sky.connection(),wid,&parentBounds);
+    CGAffineTransform beforeOverview;sky.getTransform(sky.connection(),wid,&beforeOverview);
     check([overview()[@"ok"] boolValue],"overview accepts owner geometry changed during the lease");
     sky.getTransform(sky.connection(),wid,&released);
-    check(fabs(released.tx+parentBounds.origin.x)<1&&fabs(released.ty+parentBounds.origin.y)<1,
-        "overview uses current native position rather than an obsolete absolute snapshot");
+    check(CGAffineTransformEqualToTransform(beforeOverview,released),
+        "overview does not jump to a physical anchor after an owner move");
     check([finish(request)[@"ok"] boolValue]&&saved.count==0,"release moved family without stale child snapshots");
     check([frame(request)[@"ok"] boolValue],"lease before child withdrawal");
     [window removeChildWindow:child];[child orderOut:nil];

@@ -232,6 +232,18 @@ int main(int argc,char **argv) {@autoreleasepool {
         }}
         return 0;
     }
+    if(argc==3&&!strcmp(argv[1],"--overview-trace")) {
+        double seconds=strtod(argv[2],NULL);
+        if(!isfinite(seconds)||seconds<=0||seconds>180)return 1;
+        double until=ribbon_input_time()+seconds;int previous=-1;
+        while(ribbon_input_time()<until) {@autoreleasepool {
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode,0,true);
+            int active=ribbon_mission_control_active();
+            if(active!=previous)reply(@{@"time":@(ribbon_input_time()),@"active":@(active)});
+            previous=active;usleep(4000);
+        }}
+        return 0;
+    }
     if(argc==2&&!strcmp(argv[1],"--overview-state")) {reply(@{@"active":@(ribbon_mission_control_active())});return 0;}
     if(argc==2&&!strcmp(argv[1],"--overview-exit")) {
         if(!ribbon_mission_control_active())return 1;

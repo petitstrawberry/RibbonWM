@@ -19,9 +19,13 @@ static CFMachPortRef mouseTap;
 static CFRunLoopSourceRef mouseSource;
 static RibbonMouseState mouseState;
 static double lastMouseTapAttempt;
+static void traceOverview(const char *source,int value) {
+    if(getenv("RIBBONWM_TRACE_OVERVIEW"))
+        fprintf(stderr,"overview %.6f %s %d\n",NSProcessInfo.processInfo.systemUptime,source,value);
+}
 static void overviewConnectionEvent(uint32_t type,void *data,size_t size,void *context,int cid) {
     (void)data;(void)size;(void)context;(void)cid;
-    if(type==1204) {__atomic_store_n(&overviewSignal,1,__ATOMIC_RELEASE);__atomic_store_n(&overviewActive,1,__ATOMIC_RELEASE);}
+    if(type==1204) {traceOverview("connection-enter",1);__atomic_store_n(&overviewSignal,1,__ATOMIC_RELEASE);__atomic_store_n(&overviewActive,1,__ATOMIC_RELEASE);}
 }
 static void observeOverviewConnection(void) {
     static dispatch_once_t once;
@@ -62,6 +66,7 @@ RibbonMouseState ribbon_mouse_state(void) {
 static void overviewNotification(AXObserverRef observer,AXUIElementRef element,CFStringRef name,void *context) {
     (void)observer;(void)element;(void)context;
     BOOL active=!CFEqual(name,CFSTR("AXExposeExit"));
+    traceOverview([(__bridge NSString *)name UTF8String],active);
     __atomic_store_n(&overviewActive,active,__ATOMIC_RELEASE);
     if(active)overviewBegan=NSProcessInfo.processInfo.systemUptime;
 }
@@ -89,6 +94,7 @@ int ribbon_mission_control_active(void) { @autoreleasepool {
         for(NSDictionary *row in (__bridge NSArray *)rows)
             if([row[(id)kCGWindowOwnerPID] intValue]==dockPID&&[row[(id)kCGWindowLayer] intValue]==18&&!row[(id)kCGWindowName]){found=YES;break;}
         if(rows)CFRelease(rows);
+        if(found!=__atomic_load_n(&overviewActive,__ATOMIC_ACQUIRE))traceOverview("layer-differs",found);
         if(found||now-overviewBegan>0.4)__atomic_store_n(&overviewActive,found,__ATOMIC_RELEASE);
     }
     return __atomic_load_n(&overviewActive,__ATOMIC_ACQUIRE);

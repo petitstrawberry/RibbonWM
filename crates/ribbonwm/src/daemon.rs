@@ -595,6 +595,14 @@ impl NativeFocus {
         // The first valid selection in a new Space retains its saved viewport.
         if reveal && (selected_in_overview || (changed && !space_selection)) {
             let _ = engine.focus_window(id);
+            if selected_in_overview {
+                // Dock has already animated to this selection. Publish it in
+                // the first resumed frame, without a second horizontal trip.
+                if let Some((monitor, _)) = engine.window_context(id) {
+                    let monitor = monitor.to_owned();
+                    let _ = engine.settle_scroll(&monitor);
+                }
+            }
         } else {
             let _ = engine.observe_focus(id, false);
         }
@@ -1465,29 +1473,14 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                 inventory.invalidate();
                 last_frame.clear();
                 mouse = MouseCapture::default();
+                last_focus = start - Duration::from_millis(100);
+                last_inventory = start - Duration::from_millis(100);
             }
-            // Overview released transforms to expose full real windows. Once
-            // macOS exits, restore the last committed presentation immediately,
-            // even while AX/inventory reconciliation is held for 200 ms. Waiting
-            // with only heartbeats exposes all owners at their physical anchors.
-            if session_active
-                && !overview
-                && start < overview_resume
-                && let Some(backend) = &backend
-            {
-                let owners = geometry
-                    .originals
-                    .iter()
-                    .map(|(id, w)| (*id, w.pid))
-                    .collect();
-                backend.frame_with_sticky_in_viewports(
-                    &committed,
-                    &owners,
-                    &sticky_leases(&geometry),
-                    &monitor_viewports(&engine),
-                )?;
-            }
-            let suspended = !session_active || overview || start < overview_resume;
+            // Delay stale AX geometry reconciliation, not native selection.
+            // Replaying `committed` here exposes the old app for 200 ms before
+            // revealing the window that the user actually chose in overview.
+            let reconciling_overview = start < overview_resume;
+            let suspended = !session_active || overview;
             if ribbon_macos::left_mouse_down() {
                 sizes.cancel_settlement();
             }
@@ -1564,7 +1557,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                             continue;
                         }
                         let response = request.and_then(|r| {
-                                if suspended && !matches!(r, Request::Status {} | Request::Quit {})
+                                if (suspended || reconciling_overview) && !matches!(r, Request::Status {} | Request::Quit {})
                                 {
                                     bail!("Window operations are paused while the session is locked/inactive or Mission Control is open");
                                 }
@@ -1636,6 +1629,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                 || (!animating
                     && start.duration_since(last_watch_refresh) >= Duration::from_secs(1)))
                 && geometry.dragged.is_none()
+                && !reconciling_overview
                 && let Some(source) = &events
             {
                 refresh_observers(source, &mut watching, &options)?;
@@ -1706,7 +1700,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                     }
                 }
             }
-            if let Some(windows) = inventory.poll()? {
+            if !reconciling_overview && let Some(windows) = inventory.poll()? {
                 let reveal = !input
                     .as_ref()
                     .is_some_and(ribbon_macos::input::InputSource::active);
@@ -1866,6 +1860,9 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                     )?;
                 }
                 for p in &plans {
+                    if reconciling_overview {
+                        break;
+                    }
                     let m = engine.monitors.get(&p.monitor).context("Missing monitor")?;
                     if m.suspended || m.native_space != p.native_space {
                         continue;
@@ -2173,10 +2170,26 @@ mod tests {
         focus.reveal_selection = true;
         focus.update(&mut e, 42, Some(WindowId(1)), true);
         assert_eq!(e.monitors["main"].layout().scroll.target, revealed);
+        assert_eq!(e.monitors["main"].layout().scroll.position, revealed);
+        assert_eq!(e.monitors["main"].layout().scroll.velocity, 0.0);
         e.tick(2.0);
         e.apply("main", &Action::Scroll { delta: 700.0 }).unwrap();
         focus.update(&mut e, 42, Some(WindowId(1)), true);
         assert_eq!(e.monitors["main"].layout().scroll.target, manual);
+        // Selecting a different offscreen window must make the very first
+        // resumed placement visible, without waiting for a subsequent tick.
+        focus.reveal_selection = true;
+        focus.update(&mut e, 42, Some(WindowId(3)), true);
+        let selected = e
+            .placements()
+            .into_iter()
+            .find(|p| p.window == WindowId(3))
+            .unwrap();
+        assert_eq!(selected.clip, Some(selected.frame));
+        assert_eq!(
+            e.monitors["main"].layout().scroll.position,
+            e.monitors["main"].layout().scroll.target
+        );
     }
     #[test]
     fn failed_initial_frame_never_releases_unowned_geometry() {
