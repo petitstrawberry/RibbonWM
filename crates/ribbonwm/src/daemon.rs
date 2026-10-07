@@ -469,6 +469,25 @@ fn resize_anchor(viewport: Rect, original: Rect, width: f64, height: f64) -> Rec
         height,
     }
 }
+fn native_anchor_needed(surface: Rect, planned: Rect) -> bool {
+    // A pending native resize must be observed before any position-only
+    // rebase, otherwise stale layout dimensions undo the user's border drag.
+    (surface.width - planned.width).abs() <= 2.0
+        && (surface.height - planned.height).abs() <= 2.0
+        && ((surface.x - planned.x).abs() > 2.0 || (surface.y - planned.y).abs() > 2.0)
+}
+fn release_candidates(
+    plans: Vec<Placement>,
+    committed: &[Placement],
+    resized: &BTreeSet<WindowId>,
+) -> Vec<Placement> {
+    plans
+        .into_iter()
+        .filter(|p| {
+            resized.contains(&p.window) || committed.iter().any(|old| old.window == p.window)
+        })
+        .collect()
+}
 fn released_frame(engine: &Engine, monitor: &str, mut frame: Rect, index: usize) -> Rect {
     let viewport = engine.monitors[monitor].viewport;
     let inner = Rect {
@@ -1037,6 +1056,9 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
     } else {
         let backend = Backend::connect()?;
         backend.require_live_version()?;
+        // Fail before recording or changing any AX geometry if another
+        // controller still owns the Dock lease.
+        backend.heartbeat()?;
         Some(backend)
     };
     let mut geometry = GeometryLease {
@@ -1133,6 +1155,9 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
             };
             if let Some(id) = previous_drag.filter(|_| geometry.dragged.is_none()) {
                 anchor_attempts.remove(&id);
+                // Discard inventory taken before the owner's final mouse-up
+                // transaction before reconciling its accepted dimensions.
+                inventory.invalidate();
             }
             if !options.dry_run
                 && engine.settings.gesture_scroll
@@ -1429,8 +1454,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                             .insert(p.window, (p.frame, start + Duration::from_millis(100)));
                         if let Ok((surface, _)) =
                             ribbon_macos::window_drag_geometry(p.window, w.pid)
-                            && ((surface.x - p.frame.x).abs() > 2.0
-                                || (surface.y - p.frame.y).abs() > 2.0)
+                            && native_anchor_needed(surface, p.frame)
                         {
                             anchor_attempts
                                 .insert(p.window, (p.frame, start + Duration::from_secs(1)));
@@ -1636,13 +1660,20 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
         Ok(())
     })();
     if let Some(backend) = &backend {
+        // An error path must not move another controller's windows while
+        // launchd retries us. Cleanup needs ownership as much as placement.
+        if let Err(error) = backend.heartbeat() {
+            geometry.resized.clear();
+            frame_result?;
+            return Err(error.context("Cannot release geometry without the Dock lease"));
+        }
         let owners = geometry
             .originals
             .iter()
             .map(|(id, w)| (*id, w.pid))
             .collect();
-        let mut released = engine.placements();
-        let held = engine.placements();
+        let mut released = release_candidates(engine.placements(), &committed, &geometry.resized);
+        let held = released.clone();
         for (index, p) in released.iter_mut().enumerate() {
             let Some(w) = geometry.originals.get(&p.window) else {
                 continue;
@@ -1709,6 +1740,69 @@ fn gesture_targets(engine: &Engine, blocked: bool) -> Vec<ribbon_macos::input::T
 mod tests {
     use super::*;
     use ribbon_core::{NativeSpaceId, Rect};
+
+    #[test]
+    fn position_rebase_cannot_undo_an_unobserved_native_resize() {
+        let plan = Rect {
+            x: 548.0,
+            y: 54.0,
+            width: 1464.0,
+            height: 1362.0,
+        };
+        let moved = Rect {
+            x: 625.0,
+            y: 80.0,
+            ..plan
+        };
+        assert!(native_anchor_needed(moved, plan));
+        assert!(!native_anchor_needed(
+            Rect {
+                width: 1550.0,
+                ..moved
+            },
+            plan
+        ));
+        assert!(!native_anchor_needed(
+            Rect {
+                height: 1386.0,
+                ..moved
+            },
+            plan
+        ));
+        assert!(!native_anchor_needed(plan, plan));
+    }
+
+    #[test]
+    fn failed_initial_frame_never_releases_unowned_geometry() {
+        let mut engine = Engine::new(Settings::default()).unwrap();
+        engine
+            .update_monitor(
+                "test",
+                Rect {
+                    x: 0.0,
+                    y: 30.0,
+                    width: 2560.0,
+                    height: 1410.0,
+                },
+                NativeSpaceId(1),
+                false,
+            )
+            .unwrap();
+        for id in 1..=3 {
+            engine.add_window("test", WindowId(id), None).unwrap();
+        }
+        let plans = engine.placements();
+        // The first backend frame was rejected before any geometry write.
+        assert!(release_candidates(plans.clone(), &[], &BTreeSet::new()).is_empty());
+        // A later failure releases a committed tile and a partial AX write,
+        // but not a newly discovered window that was never controlled.
+        let released =
+            release_candidates(plans.clone(), &plans[..1], &BTreeSet::from([WindowId(2)]));
+        assert_eq!(
+            released.iter().map(|p| p.window).collect::<Vec<_>>(),
+            vec![WindowId(1), WindowId(2)]
+        );
+    }
 
     #[test]
     fn native_drag_gets_one_offset_correction_then_yields_to_its_owner() {

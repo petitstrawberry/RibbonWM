@@ -190,7 +190,13 @@ static NSArray *expandFamilies(NSArray *roots) {
             id clip=(u[@"clip"]==NSNull.null||CGRectIsNull(c)||CGRectIsEmpty(c))?NSNull.null:rectObject(c);
             NSMutableDictionary *derived=[@{@"wid":child,@"pid":@(pid),@"group_root":@(root),
                 @"frame":rectObject(f),@"clip":clip} mutableCopy];
-            if(u[@"viewport"]) {derived[@"viewport"]=u[@"viewport"];derived[@"drag_frame"]=rectObject(f);}
+            if(u[@"viewport"]) {
+                derived[@"viewport"]=u[@"viewport"];
+                // The owner moves its parent/child group during a native drag.
+                // Only propagate Rust's one-shot grab correction; otherwise
+                // observe each child's actual transform and update clipping.
+                if(u[@"drag_frame"])derived[@"drag_frame"]=rectObject(f);
+            }
             if(hasViewport)derived[@"clip_viewport"]=rectObject(viewport);
             [updates addObject:derived];if(updates.count>512)return nil;
         }

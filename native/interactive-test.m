@@ -9,6 +9,11 @@ static NSDictionary *rectangle(double x,double y,double width,double height) {
 }
 static CGError (*actualGetBounds)(int,uint32_t,CGRect *);
 static uint32_t nullBoundsID;
+static CGError (*actualSetTransform)(int,uint32_t,CGAffineTransform);
+static unsigned transformWrites;
+static CGError countTransformWrites(int cid,uint32_t wid,CGAffineTransform transform) {
+    transformWrites++;return actualSetTransform(cid,wid,transform);
+}
 static CGError transientNullBounds(int cid,uint32_t wid,CGRect *bounds) {
     if(wid==nullBoundsID){*bounds=CGRectNull;return 0;}
     return actualGetBounds(cid,wid,bounds);
@@ -39,6 +44,13 @@ int main(void) { @autoreleasepool {
     NSDictionary *request=@{@"session":@"owned-interactive-test",@"updates":@[update]};
     check([frame(request)[@"ok"] boolValue],"normal placement accepted");
     check(saved.count==2&&saved[@(childID)].root==wid,"only an explicit attached surface joins its root lease");
+    actualSetTransform=sky.setTransform;transformWrites=0;sky.setTransform=countTransformWrites;
+    check(![handle(@{@"op":@"heartbeat",@"session":@"other-controller"})[@"ok"] boolValue],
+        "another controller fails ownership preflight");
+    check(![handle(@{@"op":@"finish",@"session":@"other-controller",@"updates":@[]})[@"ok"] boolValue],
+        "another controller cannot release the active lease");
+    sky.setTransform=actualSetTransform;
+    check(transformWrites==0&&saved.count==2,"rejected controller performs no compositor writes");
     CGAffineTransform childTransform;sky.getTransform(sky.connection(),childID,&childTransform);
     check(fabs(childTransform.tx+200+dx)<1&&fabs(childTransform.ty+200+dy)<1,
         "attached surface keeps its native offset at the transformed parent");
@@ -48,7 +60,12 @@ int main(void) { @autoreleasepool {
         double x=850+i*20;
         CGAffineTransform owner=CGAffineTransformMakeTranslation(-x,-220);
         check(!sky.setTransform(sky.connection(),wid,owner),"owner moves surface during hold");
+        check(!sky.setTransform(sky.connection(),childID,CGAffineTransformMakeTranslation(-x-dx,-220-dy)),
+            "owner moves the attached surface with its parent");
+        actualSetTransform=sky.setTransform;transformWrites=0;sky.setTransform=countTransformWrites;
         check([frame(request)[@"ok"] boolValue],"interactive lease accepted");
+        sky.setTransform=actualSetTransform;
+        check(transformWrites==0,"native drag writes no parent or child transform");
         CGAffineTransform actual;sky.getTransform(sky.connection(),wid,&actual);
         check(CGAffineTransformEqualToTransform(owner,actual),"interactive frame preserves owner's transform");
         CFTypeRef clip=NULL;CGRect bounds=CGRectZero;

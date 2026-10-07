@@ -117,7 +117,8 @@ pub fn run(user: String, config: PathBuf, exclude_apps: Vec<String>) -> Result<(
         }
         let status = ribbon_macos::backend::Backend::connect().and_then(|b| b.status());
         let backend = status.as_ref().is_ok_and(|s| {
-            s.version == 2
+            s.controlled == 0
+                && s.version == 2
                 && s.capabilities.iter().any(|c| c == "sticky")
                 && s.capabilities.iter().any(|c| c == "interactive_clip")
                 && s.capabilities.iter().any(|c| c == "overview")
@@ -135,7 +136,9 @@ pub fn run(user: String, config: PathBuf, exclude_apps: Vec<String>) -> Result<(
                 std::env::current_exe()?.display()
             );
             if !backend {
-                eprintln!("Backend preflight: {status:?}; expected {expected:?}");
+                eprintln!(
+                    "Backend preflight: {status:?}; expected {expected:?}; waiting for an available controller lease"
+                );
             }
             last_readiness = Some((accessibility, backend));
         }

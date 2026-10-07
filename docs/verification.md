@@ -256,3 +256,29 @@ bounds and clears the lease. Ordinary attached-window withdrawal also passes.
 The payload provides a read-only `diagnostics` operation with per-surface owner
 and bounds availability so a further failure can be identified rather than
 inferred. Live drag and Mission Control smoothness remain unverified.
+
+### Native-drag ownership and rejected startup
+
+Compared yabai commit `dd845723416f5fe92af49fad5ebab00369e07edd`, specifically
+`WINDOW_MOVED`, `WINDOW_RESIZED`, `MOUSE_DOWN/UP/DRAGGED` in
+`src/event_loop.c`. Its ordinary native drag skips layout flushing for the
+held window; explicit modifier-driven moves use a separate path. RibbonWM's
+interactive parent already yielded after its initial offset correction, but its
+derived child updates still wrote absolute transforms on every frame. Those
+children now yield too. The native test moves an owned parent/child pair through
+a clipped viewport and counts zero payload transform writes during the native
+drag, while preserving the bounded clip. The one-shot correction remains tested.
+
+A separate actual-desktop failure revealed repeated startup attempts performing
+AX cleanup even though the Dock lease belonged to the previous controller.
+Readiness now waits for an empty lease, the daemon checks ownership before
+discovering windows, and release checks ownership again and only considers
+committed/AX-touched windows. A Rust regression covers rejected initial placement
+and a later partial geometry write; native tests check foreign-controller
+preflight/release rejection with zero compositor writes. These checks do not
+establish physical drag smoothness on the user's desktop.
+
+The release of a mouse hold also invalidates older inventory, and a native
+position rebase is allowed only while observed size matches the planned size.
+A regression checks that an unobserved border resize cannot be overwritten by
+a position-only anchoring attempt.
