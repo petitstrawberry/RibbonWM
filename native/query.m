@@ -169,14 +169,9 @@ uint32_t ribbon_ax_window_id(const void *element) {
 }
 static AXUIElementRef findAXWindow(uint32_t wid,int expected_pid,pid_t *pid) {
     resolve();if(!axWindowId)return NULL;
-    // IncludingWindow alone omits windows on an inactive native Space. Resolve
-    // the exact ID from the all-Spaces inventory so release can restore them.
-    CFArrayRef list=CGWindowListCopyWindowInfo(kCGWindowListOptionAll|kCGWindowListExcludeDesktopElements,kCGNullWindowID);
-    if(!list)return NULL;
-    for(NSDictionary *info in (__bridge NSArray *)list) {
-        if([info[(id)kCGWindowNumber] unsignedIntValue]==wid) {*pid=[info[(id)kCGWindowOwnerPID] intValue];break;}
-    }
-    CFRelease(list);
+    // Exact WindowServer ownership works across Spaces without enumerating
+    // every desktop window for every AX operation.
+    *pid=ribbon_window_owner(wid);
     if(*pid!=expected_pid)return NULL;
     // AXWindowID lookup can stop resolving while its native Space is inactive.
     // Retain the already resolved AX element; guard it against current WS ownership.
@@ -206,6 +201,44 @@ static AXError axGeometry(AXUIElementRef window,RibbonRect *rect) {
     if(!error)*rect=(RibbonRect){point.x,point.y,size.width,size.height};
     return error;
 }
+// Read-only discovery/membership probe. Runs on the inventory worker and
+// deliberately does not touch the main-thread AX cache or observer tables.
+char *ribbon_probe_application(int pid,const uint32_t *candidates,size_t count) { @autoreleasepool {
+    resolve();if(pid<=0||!axWindowId||count>512)return NULL;
+    AXUIElementRef app=AXUIElementCreateApplication(pid);CFTypeRef windows=NULL;
+    AXUIElementSetMessagingTimeout(app,0.05);
+    AXError error=AXUIElementCopyAttributeValue(app,kAXWindowsAttribute,&windows);CFRelease(app);
+    if(error||!windows||CFGetTypeID(windows)!=CFArrayGetTypeID()){if(windows)CFRelease(windows);return NULL;}
+    NSMutableArray *members=[NSMutableArray array],*ready=[NSMutableArray array];
+    SkyLight sky;BOOL hasSky=loadSkyLight(&sky);
+    for(id object in (__bridge NSArray *)windows) {
+        AXUIElementRef w=(__bridge AXUIElementRef)object;uint32_t wid=0;
+        AXUIElementSetMessagingTimeout(w,0.05);
+        // An incomplete enumeration cannot prove that an old window closed.
+        if(axWindowId(w,&wid)||!wid){CFRelease(windows);return NULL;}
+        [members addObject:@(wid)];BOOL candidate=NO;
+        for(size_t i=0;i<count;i++)if(candidates[i]==wid){candidate=YES;break;}
+        if(!candidate||ribbon_window_owner(wid)!=pid)continue;
+        CFTypeRef subrole=NULL;Boolean size=0,position=0;
+        AXError sub=AXUIElementCopyAttributeValue(w,kAXSubroleAttribute,&subrole);
+        BOOL standard=!sub&&subrole&&CFEqual(subrole,kAXStandardWindowSubrole);
+        if(subrole)CFRelease(subrole);
+        if(!standard||AXUIElementIsAttributeSettable(w,kAXSizeAttribute,&size)||!size||
+            AXUIElementIsAttributeSettable(w,kAXPositionAttribute,&position)||!position)continue;
+        RibbonRect logical;CGAffineTransform transform;
+        if(axGeometry(w,&logical)||!hasSky||sky.getTransform(sky.connection(),wid,&transform)||
+            !isfinite(transform.a)||!isfinite(transform.b)||!isfinite(transform.c)||!isfinite(transform.d)||
+            fabs(transform.a-1)>1e-6||fabs(transform.b)>1e-6||fabs(transform.c)>1e-6||fabs(transform.d-1)>1e-6||
+            !isfinite(transform.tx)||!isfinite(transform.ty))continue;
+        CGRect r=CGRectMake(logical.x,logical.y,logical.width,logical.height);
+        if(!usableBounds(r))continue;
+        [ready addObject:@{@"id":@(wid),@"geometry":rectJSON(r)}];
+    }
+    CFRelease(windows);
+    NSData *data=[NSJSONSerialization dataWithJSONObject:@{@"members":members,@"ready":ready} options:0 error:nil];
+    if(!data)return NULL;char *result=malloc(data.length+1);if(!result)return NULL;
+    memcpy(result,data.bytes,data.length);result[data.length]=0;return result;
+} }
 int ribbon_window_geometry(uint32_t wid,int expected_pid,RibbonRect *rect) { @autoreleasepool {
     pid_t pid=0;AXUIElementRef window=findAXWindow(wid,expected_pid,&pid);
     if(!window)return kAXErrorInvalidUIElement;
@@ -306,22 +339,8 @@ static int resizeWindow(uint32_t wid,int expected_pid,RibbonRect target,BOOL log
     CFRelease(value);
     CGSize accepted=CGSizeZero;
     if(!error)error=acceptedSize(w,size,&accepted,progress,context);
-    double dw=fabs(accepted.width-size.width),dh=fabs(accepted.height-size.height);
-    if(error==kAXErrorCannotComplete&&accepted.width>=100&&accepted.height>=100&&dw<=32&&dh<=32&&(dw>2||dh>2)) {
-        // Some owners ignore small changes at a maximized edge. Make a bounded
-        // inward resize first, then request the exact size from a valid anchor.
-        // This is not size negotiation: the final size must still match.
-        CGSize inward=CGSizeMake(dw>2?MAX(100,size.width-40):size.width,dh>2?MAX(100,size.height-40):size.height);
-        value=AXValueCreate(kAXValueCGSizeType,&inward);
-        error=AXUIElementSetAttributeValue(w,kAXSizeAttribute,value);CFRelease(value);
-        if(!error)error=acceptedSize(w,inward,&accepted,progress,context);
-        p=AXValueCreate(kAXValueCGPointType,&position);
-        if(!error)error=AXUIElementSetAttributeValue(w,kAXPositionAttribute,p);CFRelease(p);
-        if(!error&&progress&&progress(context))error=kAXErrorFailure;
-        value=AXValueCreate(kAXValueCGSizeType,&size);
-        if(!error)error=AXUIElementSetAttributeValue(w,kAXSizeAttribute,value);CFRelease(value);
-        if(!error)error=acceptedSize(w,size,&accepted,progress,context);
-    }
+    // Do not manufacture a smaller intermediate size to force acceptance.
+    // A refusal is reported as-is; normal focus/scroll never enters this API.
     // Position writes can overwrite an owner-side pending resize with its old
     // frame. Re-anchor only after the new size has actually been accepted.
     RibbonRect after={0};

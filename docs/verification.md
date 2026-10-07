@@ -279,6 +279,36 @@ preflight/release rejection with zero compositor writes. These checks do not
 establish physical drag smoothness on the user's desktop.
 
 The release of a mouse hold also invalidates older inventory, and a native
-position rebase is allowed only while observed size matches the planned size.
+position rebase was allowed only while observed size matched the planned size.
 A regression checks that an unobserved border resize cannot be overwritten by
 a position-only anchoring attempt.
+
+### Geometry and discovery pipeline separation
+
+The subsequent live report exposed a remaining design problem: idle position
+rebasing erased accepted size state and routed focus/scroll completion through
+the AX resize/settling path. That automatic rebase is removed. `NativeSizes`
+tracks accepted dimensions independently of compositor origin; moving focus,
+scrolling, or releasing a move cannot invalidate that ledger. The native resize
+helper no longer forces acceptance by shrinking a window 40 points and growing
+it back. A layout/explicit size change still uses synchronous native sizing;
+this change does not claim that every AX operation is nonblocking.
+
+Read-only AX eligibility/initial geometry and retained-window membership now run
+on the inventory worker using independent AX references. They never touch its
+main-thread observer/cache tables. Exclusions are applied before probing; failed
+or incomplete queries are unknown membership, not evidence of closure. Main
+thread destruction notifications remain immediate, and focus notifications also
+schedule reconciliation. Queries made before geometry writes or a completed
+mouse interaction are discarded. Probes for separate applications are currently
+serial on the worker, so a slow application can still delay another discovery,
+but cannot hold the rendering loop while this discovery query waits.
+
+`scripts/smoke-live-pipeline.py` measures five create/remove cycles against the
+already running service, then samples native dimensions during focus and scroll.
+It never replaces or stops the service. The installed `ff30cf9` baseline measured
+437–637ms creation and 17–37ms removal in the complete run, with constant
+400×1362 native dimensions in 302 samples. Thus that fixture reproduces slow
+creation, but does not reproduce the reported focus-size jitter. Updated runtime
+results must be recorded separately; passing unit tests cannot establish physical
+drag stability.

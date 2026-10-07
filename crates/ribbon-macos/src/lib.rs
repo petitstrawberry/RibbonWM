@@ -1,4 +1,4 @@
-//! macOS integration. All UI entry points run on the calling main thread.
+//! macOS integration. UI writes/observers stay on main; discovery probes are read-only.
 #[cfg(not(target_os = "macos"))]
 compile_error!(
     "ribbon-macos requires macOS; ribbon-core can be tested independently on other platforms"
@@ -68,6 +68,7 @@ unsafe extern "C" {
         progress: extern "C" fn(*mut c_void) -> i32,
         context: *mut c_void,
     ) -> i32;
+    fn ribbon_probe_application(pid: i32, candidates: *const u32, count: usize) -> *mut c_char;
     fn ribbon_window_geometry(wid: u32, pid: i32, rect: *mut Rect) -> i32;
     fn ribbon_window_presentation(wid: u32, pid: i32, rect: *mut Rect, surface: *mut Rect) -> i32;
     fn ribbon_restore_window(wid: u32, pid: i32, rect: Rect) -> i32;
@@ -85,11 +86,7 @@ unsafe extern "C" {
     fn ribbon_watch_application(pid: i32) -> i32;
     fn ribbon_unwatch_application(pid: i32);
     fn ribbon_events() -> u32;
-    fn ribbon_take_closed_windows(
-        windows: *mut ClosedWindow,
-        capacity: usize,
-        refresh: i32,
-    ) -> usize;
+    fn ribbon_take_closed_windows(windows: *mut ClosedWindow, capacity: usize) -> usize;
     fn ribbon_stop_observing();
 }
 
@@ -113,6 +110,31 @@ pub fn windows() -> Result<Vec<Window>> {
 }
 pub fn applications() -> Result<Vec<Application>> {
     query(2)
+}
+#[derive(Debug, Deserialize)]
+pub struct WindowProbe {
+    pub id: WindowId,
+    pub geometry: Rect,
+}
+#[derive(Debug, Deserialize)]
+pub struct ApplicationProbe {
+    pub members: Vec<WindowId>,
+    pub ready: Vec<WindowProbe>,
+}
+/// Caller must filter excluded applications before any AX access. This probe
+/// owns all its AX references and never mutates the main-thread element cache.
+pub fn probe_application(pid: i32, candidates: &[u32]) -> Result<ApplicationProbe> {
+    // SAFETY: read-only input slice lives through this synchronous call; native
+    // returns a separately allocated string released exactly once below.
+    let raw = unsafe { ribbon_probe_application(pid, candidates.as_ptr(), candidates.len()) };
+    if raw.is_null() {
+        bail!("Application {pid} membership probe unavailable");
+    }
+    // SAFETY: a non-null probe result is a NUL-terminated owned JSON buffer.
+    let result = unsafe { serde_json::from_slice(CStr::from_ptr(raw).to_bytes()) };
+    // SAFETY: parsing borrowed the buffer; it is released once after parsing.
+    unsafe { ribbon_free(raw.cast()) };
+    Ok(result?)
 }
 #[derive(Default)]
 pub struct EventSource(std::marker::PhantomData<std::rc::Rc<()>>);
@@ -141,12 +163,10 @@ impl EventSource {
         // SAFETY: bounded main-runloop notification processing, no pointers.
         unsafe { ribbon_events() }
     }
-    pub fn closed_windows(&self, refresh: bool) -> Vec<ClosedWindow> {
+    pub fn closed_windows(&self) -> Vec<ClosedWindow> {
         let mut windows = [ClosedWindow::default(); 256];
         // SAFETY: native writes at most capacity initialized value-only records.
-        let count = unsafe {
-            ribbon_take_closed_windows(windows.as_mut_ptr(), windows.len(), refresh as i32)
-        };
+        let count = unsafe { ribbon_take_closed_windows(windows.as_mut_ptr(), windows.len()) };
         windows[..count].to_vec()
     }
 }

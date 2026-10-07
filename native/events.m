@@ -8,7 +8,6 @@ static NSMutableArray *workspaceObservers;
 static uint32_t pendingEvents;
 static CFMutableDictionaryRef watchedElements;
 static NSMutableDictionary<NSNumber *,NSDictionary *> *closedWindows;
-static double lastMembershipCheck;
 static AXObserverRef dockObserver;
 static AXUIElementRef dockElement;
 static pid_t dockPID;
@@ -171,36 +170,9 @@ void ribbon_unwatch_application(int pid) {
             CFDictionaryRemoveValue(watchedElements,(__bridge const void *)element);
     }
 }
-size_t ribbon_take_closed_windows(RibbonClosedWindow *windows,size_t capacity,int refresh) {
-    // A retained NSWindow can be closed/withdrawn without destroying its AX
-    // element or WindowServer surface. Reconcile successful AX window lists
-    // for the already-authorized observed PIDs; a failed query proves nothing.
-    double now=NSProcessInfo.processInfo.systemUptime;
-    if(refresh&&watchedElements&&now-lastMembershipCheck>=1) {
-        lastMembershipCheck=now;
-        for(NSNumber *pid in observers.allKeys) {
-            AXUIElementRef app=AXUIElementCreateApplication(pid.intValue);
-            AXUIElementSetMessagingTimeout(app,0.05);CFTypeRef members=NULL;
-            AXError error=AXUIElementCopyAttributeValue(app,kAXWindowsAttribute,&members);CFRelease(app);
-            if(!error&&members&&CFGetTypeID(members)==CFArrayGetTypeID()) {
-                NSMutableSet *ids=[NSMutableSet set];
-                for(id member in (__bridge NSArray *)members) {
-                    uint32_t wid=ribbon_ax_window_id((__bridge const void *)member);
-                    if(wid)[ids addObject:@(wid)];
-                }
-                NSDictionary *entries=(__bridge NSDictionary *)watchedElements;
-                for(id element in entries.allKeys) {
-                    NSDictionary *known=entries[element];
-                    if([known[@"pid"] isEqual:pid]&&![ids containsObject:known[@"wid"]]) {
-                        if(!closedWindows)closedWindows=[NSMutableDictionary dictionary];
-                        if(!closedWindows[known[@"wid"]])
-                            closedWindows[known[@"wid"]]=@{@"pid":pid,@"withdrawn":@YES};
-                    }
-                }
-            }
-            if(members)CFRelease(members);
-        }
-    }
+size_t ribbon_take_closed_windows(RibbonClosedWindow *windows,size_t capacity) {
+    // Drain actual destruction notifications only. Blocking AX membership
+    // reconciliation belongs to the Rust inventory worker.
     size_t count=0;
     for(NSNumber *wid in closedWindows.allKeys) {
         if(count==capacity)break;
@@ -226,7 +198,7 @@ uint32_t ribbon_events(void) { @autoreleasepool {
 void ribbon_stop_observing(void) {
     for(NSNumber *pid in observers.allKeys)ribbon_unwatch_application(pid.intValue);
     for(id token in workspaceObservers)[NSWorkspace.sharedWorkspace.notificationCenter removeObserver:token];
-    observers=nil;workspaceObservers=nil;pendingEvents=0;lastMembershipCheck=0;
+    observers=nil;workspaceObservers=nil;pendingEvents=0;
     if(watchedElements)CFRelease(watchedElements);watchedElements=NULL;closedWindows=nil;
     if(dockObserver){CFRunLoopRemoveSource(CFRunLoopGetMain(),AXObserverGetRunLoopSource(dockObserver),kCFRunLoopDefaultMode);CFRelease(dockObserver);dockObserver=NULL;}
     if(dockElement)CFRelease(dockElement);dockElement=NULL;dockPID=0;

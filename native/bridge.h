@@ -23,6 +23,7 @@ typedef struct {
 } RibbonCallbacks;
 int ribbon_demo_run(const RibbonCallbacks *,int test,double seconds,double left,double width);
 char *ribbon_query_json(int kind);
+char *ribbon_probe_application(int pid,const uint32_t *candidates,size_t count);
 void ribbon_free(void *);
 int ribbon_ax_trusted(void);
 void ribbon_wait_for_events(double seconds);
@@ -72,5 +73,5 @@ void ribbon_forget_watched_window(uint32_t wid);
 uint32_t ribbon_events(void);
 typedef struct { uint32_t wid; int32_t pid; int32_t withdrawn; } RibbonClosedWindow;
 uint32_t ribbon_ax_window_id(const void *element);
-size_t ribbon_take_closed_windows(RibbonClosedWindow *windows,size_t capacity,int refresh);
+size_t ribbon_take_closed_windows(RibbonClosedWindow *windows,size_t capacity);
 void ribbon_stop_observing(void);

@@ -1,5 +1,6 @@
 mod compat;
 mod daemon;
+mod geometry;
 mod ipc;
 mod modes;
 mod service;

@@ -1,3 +1,4 @@
+use crate::geometry::NativeSizes;
 use crate::ipc::{self, Request, SocketLease};
 use crate::modes::{ModeKind, WindowMode};
 use anyhow::{Context, Result, bail};
@@ -9,12 +10,13 @@ use ribbon_macos::{
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
 use std::time::{Duration, Instant};
 
+#[derive(Clone)]
 pub struct Options {
     pub selected: Vec<u32>,
     pub all: bool,
@@ -233,23 +235,90 @@ fn drag_frame(
         height: current.height,
     }
 }
-/// Read-only WindowServer metadata runs away from the frame loop. AX, AppKit
-/// notifications, policy and compositor commits stay on the controlling thread.
+#[derive(Default)]
+struct InventorySnapshot {
+    windows: Vec<Window>,
+    ready: BTreeMap<WindowId, (i32, Rect)>,
+    members: BTreeMap<i32, BTreeSet<WindowId>>,
+}
+impl InventorySnapshot {
+    fn collect(options: &Options, known: &BTreeMap<WindowId, i32>) -> Result<Self> {
+        let windows = ribbon_macos::windows()?;
+        Ok(Self::probe(
+            windows,
+            options,
+            known,
+            ribbon_macos::probe_application,
+        ))
+    }
+    fn probe(
+        windows: Vec<Window>,
+        options: &Options,
+        known: &BTreeMap<WindowId, i32>,
+        mut probe: impl FnMut(i32, &[u32]) -> Result<ribbon_macos::ApplicationProbe>,
+    ) -> Self {
+        let mut targets: BTreeMap<i32, Vec<u32>> =
+            known.values().map(|pid| (*pid, Vec::new())).collect();
+        for w in &windows {
+            if !known.contains_key(&w.id)
+                && normal_window_candidate(w)
+                && !app_excluded(w, &options.exclude_apps)
+                && (options.all || options.selected.contains(&w.id.0))
+                && w.surface_bounds.is_none_or(|b| {
+                    (b.width - w.bounds.width).abs() <= 2.0
+                        && (b.height - w.bounds.height).abs() <= 2.0
+                })
+            {
+                targets.entry(w.pid).or_default().push(w.id.0);
+            }
+        }
+        let mut snapshot = Self {
+            windows,
+            ..Self::default()
+        };
+        if !options.dry_run {
+            for (pid, candidates) in targets {
+                // A failed AX query is unknown membership, never an empty app.
+                if let Ok(probe) = probe(pid, &candidates) {
+                    snapshot
+                        .members
+                        .insert(pid, probe.members.into_iter().collect());
+                    for ready in probe.ready {
+                        snapshot.ready.insert(ready.id, (pid, ready.geometry));
+                    }
+                }
+            }
+        }
+        snapshot
+    }
+}
+/// Blocking AX discovery and retained-window membership queries live here,
+/// away from rendering, input, and the main-thread observer callbacks.
 struct WindowInventory {
     request: Option<mpsc::SyncSender<u64>>,
-    result: mpsc::Receiver<(u64, Result<Vec<Window>>)>,
+    result: mpsc::Receiver<(u64, Result<InventorySnapshot>)>,
     worker: Option<std::thread::JoinHandle<()>>,
     pending: bool,
     generation: u64,
     dirty: bool,
+    known: Arc<Mutex<BTreeMap<WindowId, i32>>>,
 }
 impl WindowInventory {
-    fn start() -> Self {
+    fn start(options: Options) -> Self {
+        let known = Arc::new(Mutex::new(BTreeMap::new()));
+        let worker_known = Arc::clone(&known);
         let (request, requests) = mpsc::sync_channel(1);
         let (results, result) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             while let Ok(generation) = requests.recv() {
-                if results.send((generation, ribbon_macos::windows())).is_err() {
+                let known = worker_known
+                    .lock()
+                    .expect("inventory tracking poisoned")
+                    .clone();
+                if results
+                    .send((generation, InventorySnapshot::collect(&options, &known)))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -261,7 +330,15 @@ impl WindowInventory {
             pending: false,
             generation: 0,
             dirty: false,
+            known,
         }
+    }
+    fn track(&self, geometry: &GeometryLease) {
+        *self.known.lock().expect("inventory tracking poisoned") = geometry
+            .originals
+            .iter()
+            .map(|(id, w)| (*id, w.pid))
+            .collect();
     }
     fn request(&mut self) -> Result<()> {
         if !self.pending {
@@ -276,7 +353,7 @@ impl WindowInventory {
         }
         Ok(())
     }
-    fn poll(&mut self) -> Result<Option<Vec<Window>>> {
+    fn poll(&mut self) -> Result<Option<InventorySnapshot>> {
         let snapshot = match self.result.try_recv() {
             Ok((generation, result)) => {
                 self.pending = false;
@@ -469,13 +546,6 @@ fn resize_anchor(viewport: Rect, original: Rect, width: f64, height: f64) -> Rec
         height,
     }
 }
-fn native_anchor_needed(surface: Rect, planned: Rect) -> bool {
-    // A pending native resize must be observed before any position-only
-    // rebase, otherwise stale layout dimensions undo the user's border drag.
-    (surface.width - planned.width).abs() <= 2.0
-        && (surface.height - planned.height).abs() <= 2.0
-        && ((surface.x - planned.x).abs() > 2.0 || (surface.y - planned.y).abs() > 2.0)
-}
 fn release_candidates(
     plans: Vec<Placement>,
     committed: &[Placement],
@@ -514,10 +584,15 @@ fn synchronize(
     geometry: &mut GeometryLease,
     options: &Options,
     displays: &[Display],
-    sizes: &mut BTreeMap<WindowId, (i32, f64, f64)>,
-    snapshot: (Vec<Window>, bool),
+    sizes: &mut NativeSizes,
+    snapshot: (InventorySnapshot, bool),
 ) -> Result<()> {
-    let (mut inventory, reveal_focus) = snapshot;
+    let (snapshot, reveal_focus) = snapshot;
+    let InventorySnapshot {
+        windows: mut inventory,
+        ready,
+        members,
+    } = snapshot;
     for window in &mut inventory {
         window.bounds = window_bounds(window);
     }
@@ -532,6 +607,13 @@ fn synchronize(
     update_contexts(engine, displays)?;
     for id in geometry.originals.keys().copied().collect::<Vec<_>>() {
         let old = geometry.originals.get(&id);
+        if old.is_some_and(|w| members.get(&w.pid).is_some_and(|ids| !ids.contains(&id)))
+            && !inactive_window(engine, geometry, id)
+        {
+            forget_closed(engine, geometry, id)?;
+            sizes.remove(&id);
+            continue;
+        }
         if !inventory
             .iter()
             .any(|w| w.id == id && old.is_none_or(|o| o.pid == w.pid))
@@ -608,15 +690,13 @@ fn synchronize(
         let Some(display) = display_for(&w, displays) else {
             continue;
         };
-        if !options.dry_run && !ribbon_macos::window_manageable(w.id, w.pid) {
-            continue;
-        }
         if !options.dry_run {
-            // The presented CG rectangle can differ from the owner's AX frame.
-            // Save before Dock or AX writes; restore each through its own API.
-            let Ok(logical) = ribbon_macos::window_geometry(w.id, w.pid) else {
+            let Some(&(pid, logical)) = ready.get(&w.id) else {
                 continue;
             };
+            if pid != w.pid || ribbon_macos::window_owner(w.id) != pid {
+                continue;
+            }
             geometry.logical_originals.insert(w.id, logical);
         }
         let width = engine.settings.preserve_window_width.then(|| {
@@ -711,7 +791,7 @@ fn set_mode(
     engine: &mut Engine,
     geometry: &mut GeometryLease,
     backend: Option<&Backend>,
-    sizes: &mut BTreeMap<WindowId, (i32, f64, f64)>,
+    sizes: &mut NativeSizes,
     change: (Option<WindowId>, ModeKind, Option<bool>),
     dry_run: bool,
 ) -> Result<()> {
@@ -853,7 +933,7 @@ fn handle(
     dry_run: bool,
     geometry: &mut GeometryLease,
     backend: Option<&Backend>,
-    sizes: &mut BTreeMap<WindowId, (i32, f64, f64)>,
+    sizes: &mut NativeSizes,
     quit: &mut bool,
 ) -> Result<serde_json::Value> {
     match request {
@@ -870,7 +950,7 @@ fn handle(
                 .map(|(id, w)| (*id, json!({"pid":w.pid,"bounds":w.bounds})))
                 .collect();
             return Ok(
-                json!({"ok":true,"mode":if dry_run{"dry_run"}else{"live"},"state":engine,"original_geometry":original_geometry,"window_modes":geometry.modes,"native_focused_window":native_focused_window,"mouse_hold":geometry.dragged,"native_overview":!dry_run&&ribbon_macos::mission_control_active(),"placements":engine.placements()}),
+                json!({"ok":true,"mode":if dry_run{"dry_run"}else{"live"},"state":engine,"original_geometry":original_geometry,"window_modes":geometry.modes,"native_focused_window":native_focused_window,"mouse_hold":geometry.dragged,"native_size_requests":sizes.requests,"native_overview":!dry_run&&ribbon_macos::mission_control_active(),"placements":engine.placements()}),
             );
         }
         Request::Quit {} => *quit = true,
@@ -1073,25 +1153,32 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
     if displays.is_empty() || displays.iter().any(|d| d.native_space.0 == 0) {
         bail!("Could not resolve current native Space context");
     }
-    let mut sizes: BTreeMap<WindowId, (i32, f64, f64)> = BTreeMap::new();
+    let mut sizes = NativeSizes::default();
     let events = (!options.dry_run).then(ribbon_macos::EventSource::default);
     let mut watching = BTreeSet::new();
     if let Some(source) = &events {
         refresh_observers(source, &mut watching, &options)?;
     }
     let initial_overview = !options.dry_run && ribbon_macos::mission_control_active();
-    if !initial_overview {
+    update_contexts(&mut engine, &displays)?;
+    if options.dry_run && !initial_overview {
         synchronize(
             &mut engine,
             &mut geometry,
             &options,
             &displays,
             &mut sizes,
-            (ribbon_macos::windows()?, true),
+            (
+                InventorySnapshot {
+                    windows: ribbon_macos::windows()?,
+                    ..InventorySnapshot::default()
+                },
+                true,
+            ),
         )?;
     }
     for requested in &options.selected {
-        if !initial_overview && !geometry.originals.contains_key(&WindowId(*requested)) {
+        if !initial_overview && ribbon_macos::window_owner(WindowId(*requested)) == 0 {
             bail!(
                 "Window {requested} is unavailable, minimized, sticky, or outside the current desktop context"
             );
@@ -1110,12 +1197,12 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
     let frame_trace = std::env::var_os("RIBBONWM_FRAME_TRACE").is_some();
     let mut last_frame = Vec::new();
     let mut committed: Vec<Placement> = Vec::new();
-    let mut anchor_attempts: BTreeMap<WindowId, (Rect, Instant)> = BTreeMap::new();
     let mut quit = false;
     let mut input: Option<ribbon_macos::input::InputSource> = None;
     let mut last_input_attempt = last_tick - Duration::from_secs(5);
     let mut gesture_frontmost = (-1, true);
-    let mut inventory = WindowInventory::start();
+    let mut inventory = WindowInventory::start(options.clone());
+    inventory.request()?;
     let mut mouse = MouseCapture::default();
     let mut overview = false;
     let mut overview_resume = Instant::now();
@@ -1129,6 +1216,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
         'frames: while running.load(Ordering::Relaxed) && !quit {
             let start = Instant::now();
             let notifications = events.as_ref().map_or(0, ribbon_macos::EventSource::drain);
+            inventory.track(&geometry);
             let in_overview = !options.dry_run && ribbon_macos::mission_control_active();
             if in_overview && !overview {
                 if let Some(backend) = &backend {
@@ -1153,8 +1241,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
             } else {
                 mouse.update(&engine, &geometry, &committed)
             };
-            if let Some(id) = previous_drag.filter(|_| geometry.dragged.is_none()) {
-                anchor_attempts.remove(&id);
+            if previous_drag.is_some() && geometry.dragged.is_none() {
                 // Discard inventory taken before the owner's final mouse-up
                 // transaction before reconciling its accepted dimensions.
                 inventory.invalidate();
@@ -1251,7 +1338,8 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
             if notifications
                 & (ribbon_macos::EventSource::WINDOWS
                     | ribbon_macos::EventSource::GEOMETRY
-                    | ribbon_macos::EventSource::APPS)
+                    | ribbon_macos::EventSource::APPS
+                    | ribbon_macos::EventSource::FOCUS)
                 != 0
                 || start.duration_since(last_inventory) >= Duration::from_millis(100)
             {
@@ -1293,7 +1381,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                 last_inventory = start;
             }
             if let Some(source) = &events {
-                for closed in source.closed_windows(!animating && geometry.dragged.is_none()) {
+                for closed in source.closed_windows() {
                     let id = WindowId(closed.wid);
                     // Some apps expose AXWindows only on their active Space.
                     // A withdrawn-list entry does not prove an inactive window closed.
@@ -1423,46 +1511,9 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                     std::thread::sleep(frame_duration);
                     continue 'frames;
                 }
-                // At rest, a completely visible window can use its real native
-                // position. This prevents AppKit's first drag transaction from
-                // applying a leftover scroll/drag translation twice, and gives
-                // macOS decorations the same anchor as the displayed surface.
-                // Partially clipped columns remain compositor-scrolled.
-                let mut rebase_only = BTreeSet::new();
-                if !animating && !ribbon_macos::left_mouse_down() {
-                    for p in &plans {
-                        let m = &engine.monitors[&p.monitor];
-                        if m.suspended
-                            || m.native_space != p.native_space
-                            || p.clip != Some(p.frame)
-                        {
-                            continue;
-                        }
-                        let Some(w) = geometry.originals.get(&p.window) else {
-                            continue;
-                        };
-                        if sizes.get(&p.window) != Some(&(w.pid, p.frame.width, p.frame.height)) {
-                            continue;
-                        }
-                        if anchor_attempts
-                            .get(&p.window)
-                            .is_some_and(|(frame, next)| *frame == p.frame && start < *next)
-                        {
-                            continue;
-                        }
-                        anchor_attempts
-                            .insert(p.window, (p.frame, start + Duration::from_millis(100)));
-                        if let Ok((surface, _)) =
-                            ribbon_macos::window_drag_geometry(p.window, w.pid)
-                            && native_anchor_needed(surface, p.frame)
-                        {
-                            anchor_attempts
-                                .insert(p.window, (p.frame, start + Duration::from_secs(1)));
-                            sizes.remove(&p.window);
-                            rebase_only.insert(p.window);
-                        }
-                    }
-                }
+                // Native geometry has a size-only request ledger. Scrolling,
+                // focus and mouse release change compositor placement, never
+                // erase accepted dimensions to trigger an AX position rebase.
                 let mut geometry_changed = false;
                 // Hold the previously committed layout through the entire AX resize
                 // batch. Do not publish half of a newly split column between owners.
@@ -1475,9 +1526,10 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                             .is_some_and(|m| !m.suspended && m.native_space == p.native_space)
                     })
                     .any(|p| {
-                        geometry.originals.get(&p.window).is_some_and(|w| {
-                            sizes.get(&p.window) != Some(&(w.pid, p.frame.width, p.frame.height))
-                        })
+                        geometry
+                            .originals
+                            .get(&p.window)
+                            .is_some_and(|w| sizes.needs_resize(p.window, w.pid, p.frame))
                     });
                 let mut held = plans.clone();
                 if pending {
@@ -1491,10 +1543,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                             .find(|old| {
                                 old.window == p.window && old.native_space == p.native_space
                             })
-                            .filter(|_| {
-                                rebase_only.contains(&p.window)
-                                    || sizes.get(&p.window).is_some_and(|s| s.0 == w.pid)
-                            })
+                            .filter(|_| sizes.get(&p.window).is_some_and(|s| s.0 == w.pid))
                         {
                             *p = previous.clone();
                         } else {
@@ -1523,7 +1572,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                         .get(&p.window)
                         .context("Missing original geometry")?;
                     let size = (w.pid, p.frame.width, p.frame.height);
-                    if sizes.get(&p.window) != Some(&size) {
+                    if sizes.needs_resize(p.window, w.pid, p.frame) {
                         // Record before writing: even a failed AX request may have partially changed geometry.
                         geometry.resized.insert(p.window);
                         let viewport = engine
@@ -1531,6 +1580,7 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                             .get(&p.monitor)
                             .context("Missing monitor")?
                             .viewport;
+                        sizes.requests = sizes.requests.saturating_add(1);
                         let resized = ribbon_macos::resize_window_observed(
                             p.window,
                             w.pid,
@@ -1556,13 +1606,6 @@ fn run_impl(options: Options, permission_confirmed: bool) -> Result<()> {
                             if ribbon_macos::left_mouse_down() {
                                 last_frame.clear();
                                 continue 'frames;
-                            }
-                            if rebase_only.contains(&p.window) {
-                                // A refused position is not a reason to change
-                                // the user's tiled/floating mode or old layout.
-                                sizes.insert(p.window, size);
-                                eprintln!("Native anchor for {} deferred: {e:#}", p.window.0);
-                                continue;
                             }
                             if ribbon_macos::window_owner(p.window) != w.pid {
                                 forget_closed(&mut engine, &mut geometry, p.window)?;
@@ -1740,37 +1783,6 @@ fn gesture_targets(engine: &Engine, blocked: bool) -> Vec<ribbon_macos::input::T
 mod tests {
     use super::*;
     use ribbon_core::{NativeSpaceId, Rect};
-
-    #[test]
-    fn position_rebase_cannot_undo_an_unobserved_native_resize() {
-        let plan = Rect {
-            x: 548.0,
-            y: 54.0,
-            width: 1464.0,
-            height: 1362.0,
-        };
-        let moved = Rect {
-            x: 625.0,
-            y: 80.0,
-            ..plan
-        };
-        assert!(native_anchor_needed(moved, plan));
-        assert!(!native_anchor_needed(
-            Rect {
-                width: 1550.0,
-                ..moved
-            },
-            plan
-        ));
-        assert!(!native_anchor_needed(
-            Rect {
-                height: 1386.0,
-                ..moved
-            },
-            plan
-        ));
-        assert!(!native_anchor_needed(plan, plan));
-    }
 
     #[test]
     fn failed_initial_frame_never_releases_unowned_geometry() {
@@ -2046,15 +2058,20 @@ mod tests {
             pending: false,
             generation: 0,
             dirty: false,
+            known: Arc::new(Mutex::new(BTreeMap::new())),
         };
         inventory.request().unwrap();
         let old = requests.recv().unwrap();
         inventory.invalidate(); // A WM resize completes while CG is reading.
-        results.send((old, Ok(Vec::new()))).unwrap();
+        results
+            .send((old, Ok(InventorySnapshot::default())))
+            .unwrap();
         assert!(inventory.poll().unwrap().is_none());
         let current = requests.recv().unwrap();
         assert_ne!(old, current);
-        results.send((current, Ok(Vec::new()))).unwrap();
+        results
+            .send((current, Ok(InventorySnapshot::default())))
+            .unwrap();
         assert!(inventory.poll().unwrap().is_some());
 
         inventory.request().unwrap();
@@ -2062,7 +2079,9 @@ mod tests {
         inventory.request().unwrap(); // A creation event arrives during a query.
         inventory.request().unwrap();
         assert!(requests.try_recv().is_err());
-        results.send((pending, Ok(Vec::new()))).unwrap();
+        results
+            .send((pending, Ok(InventorySnapshot::default())))
+            .unwrap();
         assert!(inventory.poll().unwrap().is_some());
         assert_eq!(requests.recv().unwrap(), pending);
         assert!(requests.try_recv().is_err());
@@ -2077,7 +2096,9 @@ mod tests {
         assert!(requests.try_recv().is_err());
         inventory.request().unwrap();
         assert_eq!(requests.recv().unwrap(), pending);
-        results.send((pending, Ok(Vec::new()))).unwrap();
+        results
+            .send((pending, Ok(InventorySnapshot::default())))
+            .unwrap();
         assert!(inventory.poll().unwrap().is_some());
     }
 
@@ -2154,6 +2175,25 @@ mod tests {
         };
         let exclusions = vec!["com.openai.*".into(), "ChatGPT*".into()];
         assert!(normal_window_candidate(&window) && !app_excluded(&window, &exclusions));
+        let options = Options {
+            all: true,
+            selected: Vec::new(),
+            dry_run: false,
+            exclude_apps: exclusions.clone(),
+            settings: Settings::default(),
+        };
+        let unknown = InventorySnapshot::probe(
+            vec![window.clone()],
+            &options,
+            &BTreeMap::new(),
+            |pid, ids| {
+                assert_eq!(pid, 1);
+                assert_eq!(ids, &[1]);
+                bail!("owner unresponsive")
+            },
+        );
+        assert!(unknown.members.is_empty()); // Timeout must not mean every window closed.
+        assert!(unknown.ready.is_empty());
         let physical = window.bounds;
         window.surface_bounds = Some(physical);
         window.bounds = Rect {
@@ -2193,6 +2233,11 @@ mod tests {
         assert!(normal_window_candidate(&window) && app_excluded(&window, &exclusions));
         assert!(app_excluded(&window, &["com.openai.codex".into()]));
         assert!(!app_excluded(&window, &["com.openai.chat".into()]));
+        let protected =
+            InventorySnapshot::probe(vec![window], &options, &BTreeMap::new(), |_, _| {
+                panic!("excluded application must never receive an AX probe")
+            });
+        assert!(protected.members.is_empty());
     }
 
     #[test]
